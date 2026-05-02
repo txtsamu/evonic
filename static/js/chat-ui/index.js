@@ -239,11 +239,15 @@ export class ChatUI {
             }
             if (entry.type === 'final') {
                 const meta = entry.metadata || {};
+                const hadStreamingTurn = !!thinkingTurn;
                 if (thinkingTurn) {
                     thinkingTurn.ingest({ event: 'done', data: { thinking_duration: meta.thinking_duration }, seq: 0 });
                     thinkingTurn = null;
                 }
-                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, { metadata: meta });
+                // If we built the timeline from streaming events, don't also render it
+                // from metadata — that would create a duplicate thinking bubble.
+                const msgMeta = hadStreamingTurn ? Object.assign({}, meta, { timeline: [] }) : meta;
+                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, { metadata: msgMeta });
                 continue;
             }
             if (entry.type === 'error') {

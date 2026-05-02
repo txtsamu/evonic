@@ -1152,6 +1152,12 @@ class Turn {
             this._onTrigger('turn:split', { turnId: this.id });
             return;
         }
+
+        if (evtName === 'session_clear') {
+            // Propagate to ChatUI.onTrigger which calls ChatUI.clear()
+            this._onTrigger('session_clear', data);
+            return;
+        }
     }
 
     // ── Timeline entries ──────────────────────────────────────────────────────
@@ -1218,6 +1224,7 @@ class Turn {
     }
 
     _showThinkingRow() {
+        if (this._finalized) return; // don't add a pending row to a completed turn
         this.$timeline.find('.tl-thinking-pending').remove();
         const $pending = $('<div class="tl-thinking-pending border-l-2 border-transparent pl-3 py-0.5 relative">');
         $pending.append(
@@ -1618,11 +1625,15 @@ class ChatUI {
             }
             if (entry.type === 'final') {
                 const meta = entry.metadata || {};
+                const hadStreamingTurn = !!thinkingTurn;
                 if (thinkingTurn) {
                     thinkingTurn.ingest({ event: 'done', data: { thinking_duration: meta.thinking_duration }, seq: 0 });
                     thinkingTurn = null;
                 }
-                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, { metadata: meta });
+                // If we built the timeline from streaming events, don't also render it
+                // from metadata — that would create a duplicate thinking bubble.
+                const msgMeta = hadStreamingTurn ? Object.assign({}, meta, { timeline: [] }) : meta;
+                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, { metadata: msgMeta });
                 continue;
             }
             if (entry.type === 'error') {

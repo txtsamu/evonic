@@ -403,6 +403,7 @@ export class Turn {
     }
 
     _showThinkingRow() {
+        if (this._finalized) return; // don't add a pending row to a completed turn
         this.$timeline.find('.tl-thinking-pending').remove();
         const $pending = $('<div class="tl-thinking-pending border-l-2 border-transparent pl-3 py-0.5 relative">');
         $pending.append(
