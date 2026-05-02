@@ -45,6 +45,18 @@
             <p class="text-lg font-medium">No agents yet</p>
             <p class="text-sm mt-1">Create your first agent to get started.</p>
         </div>
+
+        <!-- Disabled Agents (collapsible, collapsed by default) -->
+        <div id="disabled-agents-section" class="hidden mt-8">
+            <button onclick="toggleDisabledAgents()" class="flex items-center gap-2 w-full text-left px-4 py-3 bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-700/50 transition-colors">
+                <svg id="disabled-chevron" class="w-4 h-4 text-gray-400 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                </svg>
+                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Disabled Agents</span>
+                <span id="disabled-count" class="text-xs text-gray-400 dark:text-gray-500 ml-1"></span>
+            </button>
+            <div id="disabled-agents-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-3 hidden"></div>
+        </div>
     </div>
 
     <!-- ========== WORKPLACES TAB ========== -->
@@ -269,12 +281,16 @@ async function loadAgents() {
 function renderAgents() {
     const grid = document.getElementById('agents-grid');
     const empty = document.getElementById('agents-empty');
+    const disabledSection = document.getElementById('disabled-agents-section');
+    const disabledGrid = document.getElementById('disabled-agents-grid');
+    const disabledCount = document.getElementById('disabled-count');
     const search = document.getElementById('agent-search').value.toLowerCase().trim();
     const filtered = search
         ? agents.filter(a => (a.name || a.id).toLowerCase().includes(search) || (a.description || '').toLowerCase().includes(search))
         : agents;
     if (filtered.length === 0) {
         grid.innerHTML = '';
+        disabledSection.classList.add('hidden');
         empty.classList.remove('hidden');
         empty.querySelector('p:first-of-type').textContent = search ? 'No agents found' : 'No agents yet';
         empty.querySelector('p:last-of-type').textContent = search ? 'Try a different search term.' : 'Create your first agent to get started.';
@@ -282,14 +298,27 @@ function renderAgents() {
     }
     empty.classList.add('hidden');
 
-    // Pin super agent to top
-    const sorted = [...filtered].sort((a, b) => {
+    // Separate enabled and disabled
+    const enabledAgents = [];
+    const disabledAgents = [];
+    for (const a of filtered) {
+        if (a.enabled !== false && a.enabled !== 0) {
+            enabledAgents.push(a);
+        } else {
+            disabledAgents.push(a);
+        }
+    }
+
+    // Pin super agent to top within each group
+    const sortFn = (a, b) => {
         if (a.is_super && !b.is_super) return -1;
         if (!a.is_super && b.is_super) return 1;
         return (a.name || a.id).localeCompare(b.name || b.id);
-    });
+    };
+    enabledAgents.sort(sortFn);
+    disabledAgents.sort(sortFn);
 
-    grid.innerHTML = sorted.map(a => {
+    const renderCard = (a) => {
         const enabled = a.enabled !== false && a.enabled !== 0;
         const superBadge = a.is_super
             ? `<span class="text-xs text-red-500 dark:text-red-400 ml-1">&#9733;</span>`
@@ -342,7 +371,26 @@ function renderAgents() {
                 </div>
             </div>
         </div>`;
-    }).join('');
+    };
+
+    grid.innerHTML = enabledAgents.map(a => renderCard(a)).join('');
+
+    // Show/hide disabled section
+    if (disabledAgents.length === 0) {
+        disabledSection.classList.add('hidden');
+    } else {
+        disabledSection.classList.remove('hidden');
+        disabledCount.textContent = `(${disabledAgents.length})`;
+        disabledGrid.innerHTML = disabledAgents.map(a => renderCard(a)).join('');
+    }
+}
+
+function toggleDisabledAgents() {
+    const grid = document.getElementById('disabled-agents-grid');
+    const chevron = document.getElementById('disabled-chevron');
+    const isHidden = grid.classList.contains('hidden');
+    grid.classList.toggle('hidden');
+    chevron.style.transform = isHidden ? 'rotate(180deg)' : 'rotate(0deg)';
 }
 
 function filterAgents() {
