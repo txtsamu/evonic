@@ -2183,12 +2183,35 @@ async function sendChat() {
             chatUI.removeThinkingIndicator(thinkingId);
             chatUI.appendMessage('error', 'Error: ' + (data.error || 'Unknown error'));
         } else {
-            chatUI.closeStream();
-            chatUI.finalizeThinkingBubble(thinkingId);
-            thinkingId = null; if (_currentTurn) _currentTurn.thinkingId = null;
-            if (data.tool_trace && data.tool_trace.length > 0) {
-                await chatUI.animateToolTrace(data.tool_trace);
+            // Non-buffered success: agent responded immediately.
+            // Create thinking bubble manually (SSE turn_begin may not have fired yet)
+            // and close the SSE afterwards so it doesn't keep reconnecting.
+            if (!thinkingId) {
+                thinkingId = chatUI.showThinkingIndicator();
+                if (_currentTurn) _currentTurn.thinkingId = thinkingId;
             }
+            // Only populate if SSE hasn't already (avoids duplicate entries)
+            if (chatUI.getTimelineEntryCount(thinkingId) === 0) {
+                if (data.tool_trace && data.tool_trace.length > 0) {
+                    for (const t of data.tool_trace) {
+                        chatUI.appendTimelineEntry(thinkingId, {
+                            type: 'tool_call', tool: t.tool, args: t.args || {}, param_types: {}
+                        });
+                        if (t.result) {
+                            chatUI.appendTimelineEntry(thinkingId, {
+                                type: 'tool_result', tool: t.tool, result: t.result, error: !!t.result.error
+                            });
+                        }
+                    }
+                }
+                // Always add a thinking summary so the bubble isn't empty
+                if (chatUI.getTimelineEntryCount(thinkingId) === 0) {
+                    chatUI.appendTimelineEntry(thinkingId, {type: 'thinking', content: data.response || ''});
+                }
+            }
+            chatUI.finalizeThinkingBubble(thinkingId, (data.metadata || {}).thinking_duration);
+            thinkingId = null; if (_currentTurn) _currentTurn.thinkingId = null;
+            chatUI.closeStream();
             chatUI.appendMessage(data.error ? 'error' : 'assistant', data.response);
             await syncLastChatTs();
         }
