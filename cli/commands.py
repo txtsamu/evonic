@@ -2136,7 +2136,7 @@ def update_server(check_only=False, force=False, tag=None, rollback_flag=False):
         return
 
     # Signal running supervisor for immediate check
-    if not is_windows():
+    if not sup.is_windows():
         spid = _get_supervisor_pid()
         if spid and _is_running(spid):
             try:
