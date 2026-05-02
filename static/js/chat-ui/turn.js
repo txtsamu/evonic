@@ -112,6 +112,7 @@ export class Turn {
         this._transports = [];
         this._timerInterval = null;
         this._staleTimeout = null;
+        this._scrollRAF = null;
         this._startTime = Date.now();
         this._finalized = false;
         this._preApprovalPhase = 'thinking';
@@ -191,6 +192,7 @@ export class Turn {
     _clearTimers() {
         if (this._timerInterval) { clearInterval(this._timerInterval); this._timerInterval = null; }
         if (this._staleTimeout)  { clearTimeout(this._staleTimeout);   this._staleTimeout = null; }
+        if (this._scrollRAF)     { cancelAnimationFrame(this._scrollRAF); this._scrollRAF = null; }
     }
 
     // ── State machine ────────────────────────────────────────────────────────
@@ -206,6 +208,7 @@ export class Turn {
         // feeding a completed turn with the next turn's events.
         if (this._finalized) {
             this._log.warn('ingest after finalize ignored', evtName, this.id);
+            console.warn('[turn] ingest ignored (finalized) event=%s turn=%s', evtName, this.id);
             return;
         }
 
@@ -342,6 +345,10 @@ export class Turn {
     // ── Timeline entries ──────────────────────────────────────────────────────
 
     _addTimelineEntry(ev) {
+        const total = this.$timeline.find('.timeline-entry').length;
+        if (total > 0 && total % 10 === 0) {
+            console.warn('[turn] _addTimelineEntry count=%d type=%s turn=%s — possible duplicate replay?', total + 1, ev.type, this.id);
+        }
         // Remove "Thinking..." placeholder when a new event arrives
         this.$timeline.find('.tl-thinking-pending').remove();
 
@@ -452,6 +459,10 @@ export class Turn {
     // ── Approval card ─────────────────────────────────────────────────────────
 
     _addApprovalCard(data) {
+        const entryCount = this.$timeline.find('.timeline-entry').length;
+        const pendingCount = this.$timeline.find('.tl-thinking-pending').length;
+        this._log.warn('approval card shown — timeline entries:', entryCount, 'pending rows:', pendingCount, 'phase:', this.phase, 'finalized:', this._finalized, 'turn:', this.id);
+        console.warn('[approval] card shown. timeline entries=%d pending=%d phase=%s finalized=%s', entryCount, pendingCount, this.phase, this._finalized);
         if (data.approval_id && this.$timeline.find(`[data-approval-id="${CSS.escape(data.approval_id)}"]`).length) return;
 
         const riskLevel = (data.approval_info && data.approval_info.risk_level) || 'medium';
@@ -606,10 +617,16 @@ export class Turn {
     }
 
     _smartScroll() {
-        const c = this._$container[0];
-        if (!c) return;
-        if (c.scrollHeight - c.scrollTop - c.clientHeight < 300) {
-            c.scrollTop = c.scrollHeight;
-        }
+        // Defer the scroll check to the next animation frame to avoid forced synchronous
+        // layout reflows during batch replay (many entries inserted in a tight loop).
+        if (this._scrollRAF) return; // already scheduled for this frame
+        this._scrollRAF = requestAnimationFrame(() => {
+            this._scrollRAF = null;
+            const c = this._$container[0];
+            if (!c) return;
+            if (c.scrollHeight - c.scrollTop - c.clientHeight < 300) {
+                c.scrollTop = c.scrollHeight;
+            }
+        });
     }
 }

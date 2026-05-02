@@ -265,7 +265,7 @@ html.dark #mobile-dropdown .border-b { border-color: #374151; }
     </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/chat-ui.js') }}?v=30"></script>
+<script src="{{ url_for('static', filename='js/chat-ui.js') }}?v=34"></script>
 <script src="{{ url_for('static', filename='js/agent-state.js') }}?v=3"></script>
 <script>
 let allSessions = [];
@@ -584,6 +584,10 @@ async function selectSession(sessionId) {
     const gen = ++_selectGeneration;  // capture this call's generation; stale callbacks check against it
     stopPolling();
     disconnectSessionStream();
+    // Dispose any poll Turn that wasn't finalized — clears its setInterval/setTimeout
+    if (_pollThinkingId) { chatUI.removeThinkingIndicator(_pollThinkingId); _pollThinkingId = null; }
+    // Dispose all remaining active Turns and clear the container
+    chatUI.clear();
     currentSessionId = sessionId;
     currentAgentId = null;
     lastChatTs = 0;
@@ -633,7 +637,6 @@ async function selectSession(sessionId) {
 
     // Render messages — prefer JSONL if available, fall back to SQLite
     const container = document.getElementById('chat-messages');
-    container.innerHTML = '';
     if (currentAgentId) {
         try {
             const qs = `session_id=${encodeURIComponent(sessionId)}&limit=30`;
@@ -815,18 +818,26 @@ function connectSessionStream(sessionId, afterSeq = 0) {
     }
     if (!currentAgentId) return;
     const url = `/api/agents/${encodeURIComponent(currentAgentId)}/chat/stream?session_id=${encodeURIComponent(sessionId)}&after=${afterSeq}`;
+    // LOG-A: track every connect/reconnect and whether _lastSeq will reset
+    console.log(`[sse] connect afterSeq=${afterSeq} sseThinkingId=${!!_sseThinkingId} url=${url}`);
+    if (afterSeq === 0 && _sseThinkingId) {
+        console.warn('[sse] RECONNECT with afterSeq=0 while thinking bubble is active — events will replay from seq=1 into existing Turn!');
+    }
     const es = new EventSource(url);
     _sessionEs = es;
 
     let _lastSeq = afterSeq;  // start from where the replay left off
     let _fillingGap = false;
     const _gapQueue = [];
+    let _dispatchCount = 0; // LOG-B: count events dispatched per connection
 
     async function fillGap(fromSeq, upToSeq) {
         try {
             const res = await fetch(`/api/agents/${encodeURIComponent(currentAgentId)}/chat/events?session_id=${encodeURIComponent(sessionId)}&after=${fromSeq}&up_to=${upToSeq}`);
             const body = await res.json();
-            for (const ev of (body.events || [])) {
+            const gapEvents = body.events || [];
+            console.log(`[gap-fill] from=${fromSeq} to=${upToSeq} got ${gapEvents.length} events`);
+            for (const ev of gapEvents) {
                 if (ev.seq <= _lastSeq) continue;
                 _lastSeq = ev.seq;
                 dispatchSessionEvent(ev.event, ev.data, sessionId);
@@ -844,12 +855,17 @@ function connectSessionStream(sessionId, afterSeq = 0) {
             return;
         }
         // Skip events already covered by the replay or a previous gap-fill
-        if (seq && seq <= _lastSeq) return;
+        if (seq && seq <= _lastSeq) {
+            console.log(`[sse] dedup skip ${evtName} seq=${seq} _lastSeq=${_lastSeq}`);
+            return;
+        }
         if (seq && _lastSeq > 0 && seq > _lastSeq + 1) {
+            console.warn(`[sse] gap detected ${evtName} seq=${seq} _lastSeq=${_lastSeq} gap=${seq-_lastSeq-1}`);
             _fillingGap = true;
             _gapQueue.push({evtName, data});
             fillGap(_lastSeq, seq).then(() => {
                 _fillingGap = false;
+                console.log(`[gap-fill] draining queue len=${_gapQueue.length}`);
                 while (_gapQueue.length > 0) {
                     const item = _gapQueue.shift();
                     const itemSeq = item.data.seq || 0;
@@ -861,6 +877,9 @@ function connectSessionStream(sessionId, afterSeq = 0) {
             return;
         }
         if (seq) _lastSeq = seq;
+        // LOG-B: count and log every event actually dispatched
+        _dispatchCount++;
+        console.log(`[sse] dispatch #${_dispatchCount} ${evtName} seq=${seq} _lastSeq=${_lastSeq} sseId=${!!_sseThinkingId}`);
         dispatch(data);
     }
 

@@ -665,6 +665,7 @@ class SSEAdapter {
 
         es.onerror = () => {
             this._log.warn('SSE error/closed', url);
+            console.warn('[sse] error/closed _lastSeq=', this._lastSeq, '_fillingGap=', this._fillingGap, '_pendingQueue=', this._pendingQueue.length);
             es.close();
             if (this._es === es) this._es = null;
             // Only reconnect if this was NOT an intentional stop (e.g. after 'done')
@@ -679,6 +680,7 @@ class SSEAdapter {
                 if (this._lastSeq > 0) u.searchParams.set('after', this._lastSeq);
                 const resumeUrl = u.pathname + u.search;
                 this._log.info('reconnecting from seq', this._lastSeq, resumeUrl);
+                console.warn('[sse] reconnecting _lastSeq=', this._lastSeq, '_fillingGap=', this._fillingGap, '_pendingQueue=', this._pendingQueue.length, 'url=', resumeUrl);
                 this._connect(resumeUrl);
             }, 2000);
         };
@@ -688,7 +690,17 @@ class SSEAdapter {
         const seq = data.seq || 0;
 
         if (this._fillingGap) {
+            this._log.debug('queued while filling gap', evtName, 'seq', seq, 'queueLen', this._pendingQueue.length);
+            if (this._pendingQueue.length >= 1 && this._pendingQueue.length % 10 === 0) {
+                console.warn('[sse] pendingQueue grew to', this._pendingQueue.length, 'while filling gap — possible reconnect storm');
+            }
             this._pendingQueue.push({ evtName, data });
+            return;
+        }
+
+        if (seq && seq <= this._lastSeq) {
+            this._log.debug('dedup skip', evtName, 'seq', seq, '≤ lastSeq', this._lastSeq);
+            console.log('[sse] dedup skip', evtName, 'seq=', seq, '_lastSeq=', this._lastSeq);
             return;
         }
 
@@ -698,13 +710,8 @@ class SSEAdapter {
             this._pendingQueue.push({ evtName, data });
             this._fillGap(this._lastSeq, seq).then(() => {
                 this._fillingGap = false;
-                while (this._pendingQueue.length > 0) {
-                    const item = this._pendingQueue.shift();
-                    const itemSeq = item.data.seq || 0;
-                    if (itemSeq && itemSeq <= this._lastSeq) continue;
-                    if (itemSeq) this._lastSeq = itemSeq;
-                    this._dispatch(item.evtName, item.data);
-                }
+                console.warn('[sse] draining pendingQueue len=', this._pendingQueue.length, '_lastSeq=', this._lastSeq);
+                this._drainQueue();
             });
             return;
         }
@@ -719,7 +726,10 @@ class SSEAdapter {
             const res = await $.getJSON(
                 `/api/agents/${encodeURIComponent(agentId)}/chat/events?session_id=${encodeURIComponent(this._sessionId)}&after=${afterSeq}&up_to=${upToSeq}`
             );
-            for (const ev of (res.events || [])) {
+            const evts = res.events || [];
+            this._log.warn('gap-fill response: afterSeq=' + afterSeq + ' upToSeq=' + upToSeq + ' returned=' + evts.length + ' seqs=' + evts.map(e=>e.seq).join(','));
+            console.warn('[gap-fill] returned', evts.length, 'events for after=', afterSeq, 'up_to=', upToSeq, 'seqs:', evts.map(e=>e.seq).join(','));
+            for (const ev of evts) {
                 if (ev.seq <= this._lastSeq) continue;
                 this._lastSeq = ev.seq;
                 this._dispatch(ev.event, ev.data);
@@ -728,6 +738,27 @@ class SSEAdapter {
             this._log.warn('gap-fill failed', err, '— skipping gap');
             this._lastSeq = upToSeq - 1;
         }
+    }
+
+    // Drain _pendingQueue asynchronously — one event per animation frame so we
+    // never block the main thread with a large synchronous burst.
+    _drainQueue() {
+        if (this._pendingQueue.length === 0) {
+            console.warn('[sse] queue drain done _lastSeq=', this._lastSeq);
+            return;
+        }
+        const item = this._pendingQueue.shift();
+        const itemSeq = item.data.seq || 0;
+        if (itemSeq && itemSeq <= this._lastSeq) {
+            console.log('[sse] queue dedup skip', item.evtName, 'seq=', itemSeq);
+            // Skip but continue draining without waiting — dedup is cheap
+            this._drainQueue();
+            return;
+        }
+        if (itemSeq) this._lastSeq = itemSeq;
+        this._dispatch(item.evtName, item.data);
+        // Yield to the browser between each real event
+        requestAnimationFrame(() => this._drainQueue());
     }
 
     _dispatch(evtName, data) {
@@ -936,6 +967,7 @@ class Turn {
         this._transports = [];
         this._timerInterval = null;
         this._staleTimeout = null;
+        this._scrollRAF = null;
         this._startTime = Date.now();
         this._finalized = false;
         this._preApprovalPhase = 'thinking';
@@ -1015,6 +1047,7 @@ class Turn {
     _clearTimers() {
         if (this._timerInterval) { clearInterval(this._timerInterval); this._timerInterval = null; }
         if (this._staleTimeout)  { clearTimeout(this._staleTimeout);   this._staleTimeout = null; }
+        if (this._scrollRAF)     { cancelAnimationFrame(this._scrollRAF); this._scrollRAF = null; }
     }
 
     // ── State machine ────────────────────────────────────────────────────────
@@ -1027,6 +1060,7 @@ class Turn {
         // feeding a completed turn with the next turn's events.
         if (this._finalized) {
             this._log.warn('ingest after finalize ignored', evtName, this.id);
+            console.warn('[turn] ingest ignored (finalized) event=%s turn=%s', evtName, this.id);
             return;
         }
 
@@ -1163,6 +1197,10 @@ class Turn {
     // ── Timeline entries ──────────────────────────────────────────────────────
 
     _addTimelineEntry(ev) {
+        const total = this.$timeline.find('.timeline-entry').length;
+        if (total > 0 && total % 10 === 0) {
+            console.warn('[turn] _addTimelineEntry count=%d type=%s turn=%s — possible duplicate replay?', total + 1, ev.type, this.id);
+        }
         // Remove "Thinking..." placeholder when a new event arrives
         this.$timeline.find('.tl-thinking-pending').remove();
 
@@ -1273,6 +1311,10 @@ class Turn {
     // ── Approval card ─────────────────────────────────────────────────────────
 
     _addApprovalCard(data) {
+        const entryCount = this.$timeline.find('.timeline-entry').length;
+        const pendingCount = this.$timeline.find('.tl-thinking-pending').length;
+        this._log.warn('approval card shown — timeline entries:', entryCount, 'pending rows:', pendingCount, 'phase:', this.phase, 'finalized:', this._finalized, 'turn:', this.id);
+        console.warn('[approval] card shown. timeline entries=%d pending=%d phase=%s finalized=%s', entryCount, pendingCount, this.phase, this._finalized);
         if (data.approval_id && this.$timeline.find(`[data-approval-id="${CSS.escape(data.approval_id)}"]`).length) return;
 
         const riskLevel = (data.approval_info && data.approval_info.risk_level) || 'medium';
@@ -1427,11 +1469,17 @@ class Turn {
     }
 
     _smartScroll() {
-        const c = this._$container[0];
-        if (!c) return;
-        if (c.scrollHeight - c.scrollTop - c.clientHeight < 300) {
-            c.scrollTop = c.scrollHeight;
-        }
+        // Defer the scroll check to the next animation frame to avoid forced synchronous
+        // layout reflows during batch replay (many entries inserted in a tight loop).
+        if (this._scrollRAF) return; // already scheduled for this frame
+        this._scrollRAF = requestAnimationFrame(() => {
+            this._scrollRAF = null;
+            const c = this._$container[0];
+            if (!c) return;
+            if (c.scrollHeight - c.scrollTop - c.clientHeight < 300) {
+                c.scrollTop = c.scrollHeight;
+            }
+        });
     }
 }
 
