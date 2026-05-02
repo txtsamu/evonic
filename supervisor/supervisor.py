@@ -865,6 +865,14 @@ def main():
     write_supervisor_pid(app_root)
     log.info(f'Supervisor started (PID {os.getpid()}, app_root={app_root})')
 
+    # Start daemon from current release immediately
+    if not args.once:
+        ok, pid = start_daemon_from_current(app_root)
+        if ok:
+            log.info(f'Daemon started (PID {pid}) from current release')
+        else:
+            log.warning('Could not start daemon from current release')
+
     # Event flags for signal handlers
     trigger_event = threading.Event()
     restart_event = threading.Event()

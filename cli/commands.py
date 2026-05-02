@@ -137,6 +137,28 @@ def start_server(port=None, host=None, debug=None, daemon=False):
 
     # Daemon (background) mode: spawn detached subprocess
     if daemon:
+        # Check if in release mode (self-update capable)
+        current_link = os.path.join(ROOT, "current")
+        sup_cfg_path = os.path.join(ROOT, "supervisor", "config.json")
+        release_mode = os.path.islink(current_link) and os.path.exists(sup_cfg_path)
+
+        if release_mode:
+            # Start supervisor daemon (handles release + self-update)
+            sup_script = os.path.join(ROOT, "supervisor", "supervisor.py")
+            proc = subprocess.Popen(
+                [sys.executable, sup_script],
+                start_new_session=True,
+            )
+            time.sleep(2)
+            if _is_running(proc.pid):
+                print(f"Supervisor started (PID: {proc.pid})")
+                print(f"Server akan berjalan dari current release dengan self-update otomatis")
+            else:
+                print("Gagal start supervisor. Cek log untuk detail.")
+                sys.exit(1)
+            return
+
+        # Flat mode (no releases): run app.py directly (legacy behavior)
         env = os.environ.copy()
         if port is not None:
             env["PORT"] = str(port)
@@ -251,6 +273,15 @@ def stop_server():
         print(f"Failed to force-kill: {e}")
 
     _remove_pid()
+
+    # Also stop supervisor if running
+    spid = _get_supervisor_pid()
+    if spid and _is_running(spid):
+        try:
+            os.kill(spid, signal.SIGTERM)
+            print(f"Sending SIGTERM to supervisor (PID: {spid})...")
+        except OSError as e:
+            print(f"Failed to send SIGTERM to supervisor: {e}")
 
 
 def status_server():
@@ -1633,6 +1664,28 @@ def setup_wizard():
         _update_env_var(env_path, 'ADMIN_PASSWORD_HASH', new_hash)
         print("  Password set successfully.")
         break
+
+    # -- Generate supervisor/config.json for self-update support --
+    print()
+    print("  Setting up supervisor for self-update...", end=" ", flush=True)
+    sup_cfg = {
+        "app_root": ROOT,
+        "poll_interval": 300,
+        "health_port": 8080,
+        "health_temp_port": 18080,
+        "health_timeout": 10,
+        "monitor_duration": 60,
+        "keep_releases": 3,
+        "python_bin": "python3",
+        "uv_bin": None,
+    }
+    sup_cfg_dir = os.path.join(ROOT, "supervisor")
+    os.makedirs(sup_cfg_dir, exist_ok=True)
+    sup_cfg_path = os.path.join(sup_cfg_dir, "config.json")
+    import json
+    with open(sup_cfg_path, "w") as f:
+        json.dump(sup_cfg, f, indent=4)
+    print("Done!")
 
     print()
     print(f"  Start the server with: evonic start")
