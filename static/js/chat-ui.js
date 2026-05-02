@@ -850,6 +850,9 @@ function ChatUI(config) {
         if (_staleTimers[id]) { clearTimeout(_staleTimers[id]); delete _staleTimers[id]; }
         if (_activeSpinnerId === id) _activeSpinnerId = null;
         const wrapper = document.getElementById(id + '-wrapper');
+        // Never remove a finalized bubble — it is a permanent part of chat history.
+        // Only in-progress (still-spinning) bubbles get removed on turn abort.
+        if (wrapper && wrapper.getAttribute('data-finalized') === 'true') return;
         if (wrapper) wrapper.remove();
         const detail = document.getElementById(id + '-detail');
         if (detail) detail.remove();
@@ -968,6 +971,10 @@ function ChatUI(config) {
         if (_activeSpinnerId === id) _activeSpinnerId = null;
         const wrapper = document.getElementById(id + '-wrapper');
         if (!wrapper) return;
+        // Mark as finalized — once finalized, the bubble is a permanent part of
+        // chat history and must never be removed by _destroyCurrentTurn or any
+        // other cleanup path.
+        wrapper.setAttribute('data-finalized', 'true');
         const spinnerEl = wrapper.querySelector('.thinking-spinner');
         if (spinnerEl) spinnerEl.remove();
 
@@ -1364,6 +1371,10 @@ function ChatUI(config) {
                 if (opts && opts.onDone) opts.onDone(currentThinkingId);
                 es.close();
                 _activeEventSource = null;
+                // Clear thinking ID so onerror reconnect guard doesn't
+                // re-establish a stream to a completed turn, which would
+                // block subsequent user messages from creating a new turn.
+                currentThinkingId = null;
             } else if (evtName === 'message_injected' || evtName === 'message_injection_applied') {
                 // no-op: turn_split handles the delivered marking; these are informational
             } else if (evtName === 'session_clear') {

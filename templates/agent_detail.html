@@ -2272,10 +2272,13 @@ function pollForResponse(existingThinkingId) {
                 lastChatTs = entry.ts;
                 if (entry.type === 'final' || entry.type === 'error') {
                     chatUI.closeStream();
+                    // Sync thinkingId from _currentTurn (set by SSE onThinkingId callback).
+                    // Do this unconditionally — not only when intermediates were collected,
+                    // otherwise the bubble won't be finalized when SSE handled everything.
+                    if (!thinkingId && _currentTurn && _currentTurn.thinkingId) thinkingId = _currentTurn.thinkingId;
                     // SSE fallback: if SSE race-lost (agent finished before stream connected),
                     // the thinking bubble will be empty. Replay intermediates from JSONL history.
                     if (collectedIntermediates.length > 0) {
-                        if (!thinkingId && _currentTurn && _currentTurn.thinkingId) thinkingId = _currentTurn.thinkingId;
                         if (!thinkingId) thinkingId = chatUI.showThinkingIndicator();
                         if (chatUI.getTimelineEntryCount(thinkingId) === 0) {
                             for (const ie of collectedIntermediates) {
