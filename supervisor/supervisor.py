@@ -67,7 +67,6 @@ SHARED_ITEMS = [
 DEFAULT_CONFIG = {
     'app_root': os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'poll_interval': 300,
-    'git_remote': 'origin',
     'health_port': 8080,
     'health_temp_port': 18080,
     'health_timeout': 10,
@@ -297,10 +296,10 @@ def _git(app_root: str, args: list, capture: bool = True) -> tuple:
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def git_fetch_tags(app_root: str, remote: str = 'origin') -> tuple:
-    """Fetch tags from remote. Returns (success, stderr)."""
-    log.info(f'Fetching tags from {remote}')
-    rc, _, err = _git(app_root, ['fetch', '--tags', remote])
+def git_fetch_tags(app_root: str) -> tuple:
+    """Fetch tags from origin. Returns (success, stderr)."""
+    log.info('Fetching tags from origin')
+    rc, _, err = _git(app_root, ['fetch', '--tags', 'origin'])
     if rc != 0:
         log.warning(f'git fetch failed: {err}')
     return rc == 0, err
@@ -898,7 +897,7 @@ def main():
             trigger_event.clear()
             last_poll = now
 
-            git_fetch_tags(app_root, cfg['git_remote'])
+            git_fetch_tags(app_root)
             target_tag = args.tag or get_latest_tag(app_root)
             current_tag = get_current_release(app_root)
 
