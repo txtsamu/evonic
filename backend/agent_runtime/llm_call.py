@@ -11,7 +11,7 @@ from typing import Dict
 
 _READ_ONLY_TOOLS: frozenset = frozenset({
     'read_file', 'read', 'calculator', 'find', 'stats', 'tree',
-    'outline', 'list_functions', 'ps', 'ports', 'disk_usage',
+    'ps', 'ports', 'disk_usage',
     'env', 'uname', 'which',
 })
 
