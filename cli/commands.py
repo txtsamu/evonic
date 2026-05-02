@@ -377,6 +377,40 @@ def plugin_uninstall(name):
 
     print(f"Plugin uninstalled: {name}")
 
+def plugin_enable(plugin_id):
+    """Enable a plugin by its ID."""
+    if not plugin_id:
+        print("Error: plugin-id is required.")
+        print("Usage: evonic plugin enable <plugin-id>")
+        sys.exit(1)
+
+    pm = _get_plugin_manager()
+    result = pm.set_plugin_enabled(plugin_id, enabled=True)
+
+    if "error" in result:
+        print(f"Error: {result['error']}")
+        sys.exit(1)
+
+    print(f"Plugin enabled: {plugin_id}")
+
+
+def plugin_disable(plugin_id):
+    """Disable a plugin by its ID."""
+    if not plugin_id:
+        print("Error: plugin-id is required.")
+        print("Usage: evonic plugin disable <plugin-id>")
+        sys.exit(1)
+
+    pm = _get_plugin_manager()
+    result = pm.set_plugin_enabled(plugin_id, enabled=False)
+
+    if "error" in result:
+        print(f"Error: {result['error']}")
+        sys.exit(1)
+
+    print(f"Plugin disabled: {plugin_id}")
+
+
 def plugin_new():
     """Interactive wizard to scaffold a new plugin project."""
     import re

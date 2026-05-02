@@ -50,7 +50,7 @@ EVONIC_BANNER = _DAY_COLORS[datetime.now().weekday()] + r"""
 
 from cli.commands import (
     start_server, stop_server, status_server,
-    plugin_list, plugin_install, plugin_uninstall, plugin_new,
+    plugin_list, plugin_install, plugin_uninstall, plugin_enable, plugin_disable, plugin_new,
     skill_list, skill_add, skill_get, skill_rm,
     skillset_list, skillset_get, skillset_apply,
     agent_list, agent_get, agent_add, agent_enable, agent_disable, agent_remove,
@@ -143,8 +143,8 @@ def main():
     # --- plugin ---
     plugin_parser = subparsers.add_parser(
         "plugin",
-        help="Manage plugins (install, uninstall, list)",
-        description="Manage Evonic plugins. Available subcommands: list, install, uninstall.",
+        help="Manage plugins (install, uninstall, list, enable, disable)",
+        description="Manage Evonic plugins. Available subcommands: list, install, uninstall, enable, disable.",
     )
     plugin_subparsers = plugin_parser.add_subparsers(
         dest="plugin_command", help="Plugin management commands"
@@ -177,6 +177,28 @@ def main():
     uninstall_parser.add_argument(
         "name",
         help="Plugin ID to uninstall",
+    )
+
+    # plugin enable
+    enable_parser = plugin_subparsers.add_parser(
+        "enable",
+        help="Enable a plugin by its ID",
+        description="Enable a disabled plugin so it can process events and register its handlers.",
+    )
+    enable_parser.add_argument(
+        "plugin_id",
+        help="Plugin ID to enable",
+    )
+
+    # plugin disable
+    disable_parser = plugin_subparsers.add_parser(
+        "disable",
+        help="Disable a plugin by its ID",
+        description="Disable an enabled plugin so it stops processing events and responding to requests.",
+    )
+    disable_parser.add_argument(
+        "plugin_id",
+        help="Plugin ID to disable",
     )
 
     # plugin new
@@ -534,6 +556,10 @@ def main():
             plugin_install(args.source)
         elif args.plugin_command == "uninstall":
             plugin_uninstall(args.name)
+        elif args.plugin_command == "enable":
+            plugin_enable(args.plugin_id)
+        elif args.plugin_command == "disable":
+            plugin_disable(args.plugin_id)
         elif args.plugin_command == "new":
             plugin_new()
     elif args.command == "skill":
