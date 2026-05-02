@@ -60,15 +60,11 @@ def get_evaluator_type(domain: str) -> str:
 
 # Database paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# In post-migration environments the supervisor moves db/ → shared/db/ and
-# symlinks releases/*/db → shared/db.  When running directly from the repo
-# root (dev workflow after migration) shared/db/ exists but db/ is still the
-# stale pre-migration copy.  Prefer shared/db/ when present.
 _shared_db_dir = os.path.join(BASE_DIR, "shared", "db")
-if os.path.isdir(_shared_db_dir):
-    DB_PATH = os.path.join(_shared_db_dir, "evonic.db")
-else:
-    DB_PATH = os.path.join(BASE_DIR, "db", "evonic.db")
+if not os.path.isdir(_shared_db_dir):
+    os.makedirs(_shared_db_dir, exist_ok=True)
+
+DB_PATH = os.path.join(_shared_db_dir, "evonic.db")
 TEST_DB_PATH = os.path.join(BASE_DIR, "seed", "test_db.sqlite")
 
 # Flask
