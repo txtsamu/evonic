@@ -496,6 +496,32 @@ def create_blueprint():
             'message': f'Task #{task_id} triggered for agent {agent_id}'
         })
 
+    # ─── Notifier pause/resume ────────────────────────────────────────────────
+
+    @bp.route('/api/kanban/notifier/status', methods=['GET'])
+    def kanban_notifier_status():
+        """Get current notifier paused state."""
+        try:
+            from plugins.kanban.handler import _is_notifier_paused
+            return jsonify({'paused': _is_notifier_paused()})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @bp.route('/api/kanban/notifier/toggle', methods=['POST'])
+    def kanban_notifier_toggle():
+        """Toggle the notifier paused state. Request body: {"paused": true/false}"""
+        try:
+            from plugins.kanban.handler import _is_notifier_paused, _set_notifier_paused
+            data = request.get_json() or {}
+            if 'paused' in data:
+                new_state = bool(data['paused'])
+            else:
+                new_state = not _is_notifier_paused()
+            _set_notifier_paused(new_state)
+            return jsonify({'paused': new_state})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
     # ─── Agent scan / assignment routes ──────────────────────────────────────
 
     @bp.route('/api/kanban/agent/check', methods=['POST'])

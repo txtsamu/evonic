@@ -56,6 +56,17 @@ _task_state_since: dict = {}         # agent_id -> float (time.time() when state
 _progress_reminder_armed: dict = {}  # agent_id -> bool
 _approval_granted: dict = {}         # agent_id -> task_id (user approved, autopilot=OFF)
 _awaiting_approval: set = set()      # agents that have already presented task, now waiting silently
+_notifier_paused: bool = False       # global notifier pause flag (UI toggle)
+
+
+def _is_notifier_paused() -> bool:
+    return _notifier_paused
+
+
+def _set_notifier_paused(paused: bool):
+    global _notifier_paused
+    _notifier_paused = paused
+    _log(f'Notifier {"paused" if paused else "resumed"} via UI toggle')
 
 # ── Allowed tools while a task is pending (before activate) ──────────────────
 KANBAN_ALLOWED_TOOLS = {
@@ -790,6 +801,10 @@ def _scan_and_notify(sdk=None) -> dict:
     eligible = _parse_eligible_agents(config)
     results = {'notified': 0, 'failed': 0, 'details': []}
     if not eligible:
+        return results
+    if _notifier_paused:
+        _log('Notifier is paused — skipping scan', 'info', sdk)
+        results['paused'] = True
         return results
 
     channel_type = config.get('CHANNEL_TYPE', 'telegram')
@@ -1745,6 +1760,9 @@ def on_kanban_task_updated(event, sdk):
 def on_schedule_fired(event, sdk):
     """Route scheduled events to the appropriate scan function."""
     if event.get('owner_type') != 'plugin' or event.get('owner_id') != PLUGIN_ID:
+        return
+    if _notifier_paused:
+        _log('Notifier is paused — skipping scheduled scan', 'info', sdk)
         return
     if event.get('name') == _STALE_SCHEDULE_NAME:
         _scan_stale_tasks(sdk)
