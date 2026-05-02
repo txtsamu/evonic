@@ -754,6 +754,7 @@ function ChatUI(config) {
             : '';
         const wrapper = document.createElement('div');
         wrapper.className = `flex ${align} ${avatarHtml ? 'items-start gap-2' : ''}`;
+        wrapper.setAttribute('data-msg-role', role);
         if (isError) {
             wrapper.innerHTML = `${avatarHtml}<div class="max-w-[80%]"><div class="${bubbleClass} rounded-lg px-4 py-2 text-sm flex items-start gap-2">${errorIcon}<span class="${wrapClass}">${renderedContent}</span></div>${timestampHtml}</div>`;
         } else {
@@ -765,11 +766,11 @@ function ChatUI(config) {
 
     /* ---------- Public: thinking bubble (streaming) ---------- */
 
-    const _STALE_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+    const _STALE_TIMEOUT_MS = 45 * 1000; // 45 seconds
     const _staleTimers = {};
     let _activeSpinnerId = null; // currently-spinning bubble ID; cleared on finalize/remove
 
-    function showThinkingIndicator(startTs) {
+    function showThinkingIndicator(startTs, insertAfterEl) {
         const container = getContainer();
 
         // Guard: never create a second spinner if one is already active
@@ -791,6 +792,7 @@ function ChatUI(config) {
 
         const wrapper = document.createElement('div');
         wrapper.id = id + '-wrapper';
+        wrapper.setAttribute('data-turn-id', id);
         wrapper.className = `flex ${thinkAlign} ${avatarHtml ? 'items-start gap-2' : ''}`;
         wrapper.innerHTML = `${avatarHtml}
             <div class="thinking-bubble flex items-center gap-2 rounded-lg px-3 py-2 text-xs border border-purple-200 bg-purple-50 dark:border-purple-800 dark:bg-purple-900/60 cursor-pointer"
@@ -812,13 +814,20 @@ function ChatUI(config) {
         const detail = document.createElement('div');
         detail.className = `flex ${thinkAlign}`;
         detail.id = detailId;
+        detail.setAttribute('data-turn-id', id);
         detail.innerHTML = `
             <div class="ml-5 max-w-[80%]">
                 <div class="timeline-panel hidden space-y-0.5 py-0.5"></div>
             </div>`;
 
-        container.appendChild(wrapper);
-        wrapper.after(detail);
+        // Insert after the referenced element when provided (anchors bubble to user message)
+        if (insertAfterEl && insertAfterEl.parentNode === container) {
+            insertAfterEl.after(wrapper);
+            wrapper.after(detail);
+        } else {
+            container.appendChild(wrapper);
+            wrapper.after(detail);
+        }
 
         const startTime = startTs || Date.now();
         const timerInline = wrapper.querySelector('.thinking-timer-inline');
@@ -990,11 +999,11 @@ function ChatUI(config) {
         return detail.querySelectorAll('.timeline-entry').length;
     }
 
-    // Finalize any orphaned active spinner (e.g. poll bubble left behind when a
-    // turn is interrupted before pollForResponse finds the final entry).
+    // Finalize and remove any orphaned active spinner (e.g. poll bubble left behind
+    // when a turn is interrupted before pollForResponse finds the final entry).
     function clearActiveSpinner() {
         if (_activeSpinnerId) {
-            finalizeThinkingBubble(_activeSpinnerId);
+            removeThinkingIndicator(_activeSpinnerId);
         }
     }
 
@@ -1343,13 +1352,13 @@ function ChatUI(config) {
             } else if (evtName === 'turn_begin') {
                 // Create bubble now — LLM is actually about to be called
                 if (!currentThinkingId) {
-                    currentThinkingId = showThinkingIndicator(data.ts);
+                    currentThinkingId = showThinkingIndicator(data.ts, opts && opts.userMsgEl);
                     if (opts && opts.onThinkingId) opts.onThinkingId(currentThinkingId);
                 }
             } else if (evtName === 'turn_split') {
                 // Injected message was consumed by the loop — finalize current bubble, start new one
                 finalizeThinkingBubble(currentThinkingId);
-                currentThinkingId = showThinkingIndicator();
+                currentThinkingId = showThinkingIndicator(null, opts && opts.userMsgEl);
                 markQueuedAsDelivered();
                 if (opts && opts.onSplit) opts.onSplit(currentThinkingId);
             } else if (evtName === 'done') {
@@ -1415,10 +1424,10 @@ function ChatUI(config) {
             es.close();
             _activeEventSource = null;
             // Reconnect after a short delay, resuming from the last seen sequence number.
-            // This handles cases where the server closes the stream while the agent is
-            // still running — without reconnect the thinking bubble would freeze.
+            // Only reconnect if the thinking bubble still exists (turn wasn't destroyed).
             setTimeout(() => {
                 if (_activeEventSource) return; // another stream already started
+                if (currentThinkingId && !document.getElementById(currentThinkingId + '-wrapper')) return; // turn destroyed
                 const u = new URL(url, window.location.origin);
                 if (_lastSeq > 0) u.searchParams.set('after', _lastSeq);
                 connectThinkingStream(u.pathname + u.search, currentThinkingId, opts);
@@ -1442,10 +1451,10 @@ function ChatUI(config) {
     function markLastUserBubbleQueued() {
         const container = getContainer();
         if (!container) return;
-        // Find the last user bubble wrapper (flex justify-end)
-        const wrappers = container.querySelectorAll('.flex.justify-end');
-        if (!wrappers.length) return;
-        const lastWrapper = wrappers[wrappers.length - 1];
+        // Find the last user bubble wrapper using data attribute
+        const userWrappers = container.querySelectorAll('[data-msg-role="user"]');
+        if (!userWrappers.length) return;
+        const lastWrapper = userWrappers[userWrappers.length - 1];
         // Don't add duplicate indicators
         if (lastWrapper.querySelector('.queued-indicator')) return;
         const indicator = document.createElement('div');
