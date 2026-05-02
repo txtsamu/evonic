@@ -1975,7 +1975,7 @@ async function restoreActiveReasoning() {
         _currentTurn.stream = chatUI.connectThinkingStream(
             `/api/agents/${encodeURIComponent(AGENT_ID)}/chat/stream?session_id=${encodeURIComponent(sessionId)}&after=${resumeSeq}`,
             thinkingId,
-            { onSplit: (newId) => { _currentTurn.thinkingId = newId; } }
+            { onSplit: (newId) => { _currentTurn.thinkingId = newId; }, onDone: () => { if (_currentTurn) _currentTurn.thinkingId = null; } }
         );
 
         // Poll until the final response lands
@@ -2160,6 +2160,7 @@ async function sendChat() {
                 userMsgEl: userMsgEl,
                 onThinkingId: (id) => { thinkingId = id; _currentTurn.thinkingId = id; },
                 onSplit: (newId) => { thinkingId = newId; _currentTurn.thinkingId = newId; },
+                onDone: () => { thinkingId = null; if (_currentTurn) _currentTurn.thinkingId = null; },
             }
         );
     }
@@ -2184,6 +2185,7 @@ async function sendChat() {
         } else {
             chatUI.closeStream();
             chatUI.finalizeThinkingBubble(thinkingId);
+            thinkingId = null; if (_currentTurn) _currentTurn.thinkingId = null;
             if (data.tool_trace && data.tool_trace.length > 0) {
                 await chatUI.animateToolTrace(data.tool_trace);
             }
@@ -2268,13 +2270,28 @@ function pollForResponse(existingThinkingId) {
                             }
                         }
                     }
-                    if (thinkingId) { chatUI.finalizeThinkingBubble(thinkingId, (entry.metadata || {}).thinking_duration); thinkingId = null; }
+                    if (thinkingId) { chatUI.finalizeThinkingBubble(thinkingId, (entry.metadata || {}).thinking_duration); thinkingId = null; if (_currentTurn) _currentTurn.thinkingId = null; }
                     chatUI.appendMessage(entry.type === 'error' ? 'error' : 'assistant',
                                         entry.content, {metadata: entry.metadata || {}});
                     gotFinal = true;
                 } else if (['thinking', 'tool_call', 'tool_output', 'intermediate'].includes(entry.type)) {
-                    // Collect for SSE fallback — skipped if SSE is working (bubble already has entries)
                     collectedIntermediates.push(entry);
+                    // Render progressively if SSE isn't connected (SSE handles live rendering otherwise)
+                    if (!chatUI.hasActiveStream()) {
+                        if (!thinkingId && _currentTurn && _currentTurn.thinkingId) thinkingId = _currentTurn.thinkingId;
+                        if (!thinkingId) thinkingId = chatUI.showThinkingIndicator();
+                        if (entry.type === 'thinking') {
+                            chatUI.appendTimelineEntry(thinkingId, {type: 'thinking', content: entry.content});
+                        } else if (entry.type === 'tool_call') {
+                            chatUI.appendTimelineEntry(thinkingId, {type: 'tool_call', tool: entry.function, args: entry.params || {}, param_types: {}});
+                        } else if (entry.type === 'tool_output') {
+                            let result;
+                            try { result = JSON.parse(entry.content); } catch(e) { result = {data: entry.content}; }
+                            chatUI.appendTimelineEntry(thinkingId, {type: 'tool_result', tool: entry.function, result, error: !!entry.error});
+                        } else if (entry.type === 'intermediate') {
+                            chatUI.appendTimelineEntry(thinkingId, {type: 'response', content: entry.content});
+                        }
+                    }
                 }
                 // Other types are handled by SSE live stream; skip to avoid duplication
             }

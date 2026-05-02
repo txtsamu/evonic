@@ -989,8 +989,6 @@ function ChatUI(config) {
             const lastEntry = detail.querySelector('.timeline-entry:last-child');
             if (lastEntry) deactivateTimelineEntry(lastEntry);
         }
-        const count = detail ? detail.querySelectorAll('.timeline-entry').length : 0;
-        if (count === 0) removeThinkingIndicator(id);
     }
 
     function getTimelineEntryCount(id) {
@@ -1363,6 +1361,7 @@ function ChatUI(config) {
                 if (opts && opts.onSplit) opts.onSplit(currentThinkingId);
             } else if (evtName === 'done') {
                 finalizeThinkingBubble(currentThinkingId, data.thinking_duration);
+                if (opts && opts.onDone) opts.onDone(currentThinkingId);
                 es.close();
                 _activeEventSource = null;
             } else if (evtName === 'message_injected' || evtName === 'message_injection_applied') {
