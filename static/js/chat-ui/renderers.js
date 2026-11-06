@@ -8,6 +8,8 @@
 
 import { Lightbox } from './lightbox.js';
 import { setupImageForLazy, createLazyImage, retrofitImageForLazy } from './lazy-image.js';
+import { buildAttachmentCard } from './artifacts.js';
+import { uiIcon } from './icons.js';
 
 // ── Sanitizer ─────────────────────────────────────────────────────────────────
 
@@ -20,7 +22,9 @@ const ALLOWED_ATTRS = {
     a:    ['href', 'title', 'target'],
     code: ['class'],
     pre:  ['class'],
+    span: ['class', 'style', 'aria-hidden'],
     img:  ['src', 'alt', 'class', 'loading'],
+    ol:   ['start'],
 };
 
 function _walkSanitize(node) {
@@ -38,13 +42,30 @@ function _walkSanitize(node) {
             const allowed = (ALLOWED_ATTRS[tag] || []).concat(ALLOWED_ATTRS['*'] || []);
             const attrsToRemove = [...child.attributes].filter(a => !allowed.includes(a.name));
             attrsToRemove.forEach(a => child.removeAttribute(a.name));
-            // Sanitize hrefs
+            // Sanitize hrefs / image sources: only web URLs, mailto:, anchors,
+            // and same-origin /api/ paths are user-accessible. Local filesystem
+            // paths and custom URI schemes (file:, sandbox:, ...) render as
+            // broken links in the browser, so they are neutralized here.
             if (tag === 'a') {
                 const href = child.getAttribute('href') || '';
-                if (/^javascript:/i.test(href) || /^data:/i.test(href)) {
+                if (!/^(https?:\/\/|mailto:|#|\/api\/)/i.test(href)) {
                     child.setAttribute('href', '#');
+                    child.setAttribute('title', 'Local path — not accessible via link');
                 }
                 child.setAttribute('rel', 'noopener noreferrer');
+                // Open external links in a new tab
+                if (/^https?:\/\//i.test(href)) {
+                    child.setAttribute('target', '_blank');
+                }
+            }
+            if (tag === 'img') {
+                const src = child.getAttribute('src') || '';
+                if (!/^(https?:\/\/|\/api\/|data:image\/)/i.test(src)) {
+                    // Neutralize unsafe image sources (local paths, file:/sandbox:)
+                    child.removeAttribute('src');
+                    const alt = child.getAttribute('alt') || '';
+                    child.setAttribute('alt', alt ? alt + ' (unavailable)' : '(unavailable)');
+                }
             }
             _walkSanitize(child);
         }
@@ -66,10 +87,200 @@ function escape(text) {
     return div.innerHTML;
 }
 
+function normalizeTimestamp(timestamp) {
+    if (timestamp == null || timestamp === '') return null;
+    let value = timestamp;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+        if (/^\d+(?:\.\d+)?$/.test(trimmed)) value = Number(trimmed);
+        else value = trimmed;
+    }
+    if (typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 1e12) value *= 1000;
+    const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+// -- KaTeX math rendering ----------------------------------------------------------
+
+// Renders LaTeX math delimiters in HTML content. Runs after marked.parse() and
+// before DOM insertion. The currency-safe rules live in js/markdown-math.js
+// (EvMarkdownMath.render) so chat, KB previews and template scripts share one
+// implementation; without that script math is simply left untouched.
+function renderMath(html) {
+    if (!html) return html || '';
+    const math = typeof window !== 'undefined' ? window.EvMarkdownMath : null;
+    if (math && typeof math.render === 'function') return math.render(html);
+    return html;
+}
+
 function truncateLine(text, max) {
     const first = (text || '').split('\n')[0].trim();
     return first.length > max ? first.slice(0, max) + '\u2026' : first;
 }
+
+// \u2500\u2500 Wiki-link transform \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+function transformWikiLinks(html) {
+    return (html || '').replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m, target, display) => {
+        const t = (target || '').trim();
+        const label = ((display || target) || '').trim();
+        const attr = escape(t).replace(/"/g, '&quot;');
+        return '<a href="#" class="kb-wikilink text-indigo-600 dark:text-indigo-400 font-medium no-underline hover:underline" data-wikilink="' + attr + '">' + escape(label) + '</a>';
+    });
+}
+
+// \u2500\u2500 KB doc preview rendering \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+function kbSplitFrontmatter(content) {
+    const m = (content || '').match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+    if (!m) return { fm: null, body: content || '' };
+    return { fm: m[1], body: m[2] };
+}
+
+function kbParseFM(raw) {
+    const fm = {};
+    (raw || '').split('\n').forEach(function (line) {
+        const i = line.indexOf(':');
+        if (i < 0) return;
+        const k = line.slice(0, i).trim();
+        if (!k) return;
+        let v = line.slice(i + 1).trim();
+        if (v.startsWith('[') && v.endsWith(']')) {
+            v = v.slice(1, -1).split(',').map(function (s) { return s.trim().replace(/^["']|["']$/g, ''); }).filter(Boolean);
+        } else {
+            v = v.replace(/^["']|["']$/g, '');
+        }
+        fm[k] = v;
+    });
+    return fm;
+}
+
+function kbRenderFrontmatter(raw) {
+    const fm = kbParseFM(raw);
+    const asList = function (v) { return Array.isArray(v) ? v : (v ? [v] : []); };
+    const tags = asList(fm.tags), aliases = asList(fm.aliases);
+    const known = new Set(['title', 'type', 'description', 'tags', 'aliases', 'created', 'updated']);
+    let h = '<div class="mb-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-4">';
+    h += '<div class="flex items-center gap-2 flex-wrap mb-1">';
+    if (fm.type) h += '<span class="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-300">' + escape(fm.type) + '</span>';
+    if (fm.title) h += '<span class="text-base font-semibold text-gray-800 dark:text-gray-100">' + escape(fm.title) + '</span>';
+    h += '</div>';
+    if (fm.description) h += '<p class="text-sm text-gray-600 dark:text-gray-300 mt-1 mb-2">' + escape(fm.description) + '</p>';
+    if (tags.length) h += '<div class="flex flex-wrap gap-1 mb-2">' + tags.map(function (t) { return '<span class="text-xs px-2 py-0.5 rounded bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300">#' + escape(t) + '</span>'; }).join('') + '</div>';
+    if (aliases.length) h += '<div class="text-xs text-gray-500 dark:text-gray-400 mb-1">aliases: ' + aliases.map(escape).join(', ') + '</div>';
+    const meta = [];
+    if (fm.created) meta.push('created ' + escape(String(fm.created)));
+    if (fm.updated) meta.push('updated ' + escape(String(fm.updated)));
+    Object.keys(fm).forEach(function (k) {
+        if (!known.has(k)) meta.push(escape(k) + ': ' + escape(Array.isArray(fm[k]) ? fm[k].join(', ') : fm[k]));
+    });
+    if (meta.length) h += '<div class="text-xs text-gray-400 dark:text-gray-500">' + meta.join(' &middot; ') + '</div>';
+    h += '</div>';
+    return h;
+}
+
+function renderKBDocPreview(content) {
+    const parts = kbSplitFrontmatter(content);
+    const cardHtml = parts.fm !== null ? kbRenderFrontmatter(parts.fm) : '';
+    const bodyHtml = typeof marked !== 'undefined'
+        ? transformWikiLinks(sanitize(renderMath(marked.parse(parts.body))))
+        : escape(parts.body);
+    return cardHtml + bodyHtml;
+}
+
+// \u2500\u2500 Wiki-link preview modal \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+var _wikilinkHistory = [];
+
+function _getOrCreateWikilinkModal() {
+    let $modal = $('#wikilink-preview-modal');
+    if ($modal.length) return $modal;
+
+    $modal = $([
+        '<div id="wikilink-preview-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-[150] p-4">',
+        '  <div class="wikilink-modal-dialog bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-[700px] flex flex-col overflow-hidden" style="max-height:85vh;">',
+        '    <div class="flex items-center justify-between px-5 py-3 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">',
+        '      <div class="flex items-center gap-2 min-w-0">',
+        '        <button class="wikilink-modal-back hidden text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex-shrink-0" aria-label="Back">',
+        '          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>',
+        '        </button>',
+        '        <h3 class="wikilink-modal-title text-sm font-semibold text-gray-800 dark:text-gray-200 truncate"></h3>',
+        '      </div>',
+        '      <button class="wikilink-modal-close text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex-shrink-0" aria-label="Close">&times;</button>',
+        '    </div>',
+        '    <div class="wikilink-modal-body prose dark:prose-invert text-sm max-w-none p-5 overflow-y-auto flex-1" style="max-height:70vh;"></div>',
+        '    <div class="px-5 py-3 border-t border-gray-200 dark:border-gray-700 flex justify-end flex-shrink-0">',
+        '      <button class="wikilink-modal-close px-4 py-1.5 text-xs font-medium text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg">Close</button>',
+        '    </div>',
+        '  </div>',
+        '</div>',
+    ].join('\n'));
+
+    function _closeModal() { $modal.addClass('hidden'); _wikilinkHistory = []; }
+
+    $modal.on('click', function (e) { if (e.target === this) _closeModal(); });
+    $modal.find('.wikilink-modal-dialog').on('click', '.wikilink-modal-close', function () { _closeModal(); });
+    $modal.find('.wikilink-modal-dialog').on('click', '.wikilink-modal-back', function () {
+        if (_wikilinkHistory.length) {
+            var prev = _wikilinkHistory.pop();
+            _renderWikilinkModal(prev.title, prev.html, false);
+        }
+    });
+    $modal.find('.wikilink-modal-dialog').on('click', '.kb-wikilink', function (e) {
+        e.preventDefault();
+        var t = $(this).attr('data-wikilink');
+        if (t) document.dispatchEvent(new CustomEvent('evonic:wikilink-click', { detail: { title: t, _fromModal: true } }));
+    });
+    $modal.find('.wikilink-modal-body').on('click', 'a[href^="http://"], a[href^="https://"]', function (e) {
+        e.preventDefault();
+        window.open(this.href, '_blank', 'noopener,noreferrer');
+    });
+    $(document).on('keydown.wikilinkModal', function (e) {
+        if (e.key === 'Escape' && !$modal.hasClass('hidden')) _closeModal();
+    });
+
+    $('body').append($modal);
+    return $modal;
+}
+
+function _renderWikilinkModal(title, htmlContent, pushHistory) {
+    var $modal = _getOrCreateWikilinkModal();
+
+    if (pushHistory) {
+        var curTitle = $modal.find('.wikilink-modal-title').text();
+        var curHtml = $modal.find('.wikilink-modal-body').html();
+        if (curTitle) _wikilinkHistory.push({ title: curTitle, html: curHtml });
+    }
+
+    $modal.find('.wikilink-modal-title').text(title);
+
+    if (htmlContent === null || htmlContent === undefined) {
+        $modal.find('.wikilink-modal-body').html(
+            '<div class="flex flex-col items-center justify-center py-12 text-gray-400 dark:text-gray-500">' +
+            '<svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12 mb-3 text-gray-300 dark:text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>' +
+            '<p class="text-sm font-medium">Dokumen belum tersedia</p>' +
+            '<p class="text-xs mt-1">Informasi ini belum ada di knowledge base.</p>' +
+            '</div>'
+        );
+    } else {
+        $modal.find('.wikilink-modal-body').html(htmlContent);
+    }
+
+    var $back = $modal.find('.wikilink-modal-back');
+    if (_wikilinkHistory.length) $back.removeClass('hidden');
+    else $back.addClass('hidden');
+
+    $modal.find('.wikilink-modal-body').scrollTop(0);
+}
+
+function showWikilinkPreview(title, htmlContent, fromModal) {
+    var $modal = _getOrCreateWikilinkModal();
+    var isOpen = !$modal.hasClass('hidden');
+    _renderWikilinkModal(title, htmlContent, isOpen && fromModal);
+    $modal.removeClass('hidden');
+}
+
 
 // ── Syntax highlighters ───────────────────────────────────────────────────────
 
@@ -118,19 +329,138 @@ export function highlightPython(code) {
     return result;
 }
 
+function _diffTokens(text) {
+    return text.match(/\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || [];
+}
+
+function _intralineDiff(oldText, newText) {
+    const oldTokens = _diffTokens(oldText);
+    const newTokens = _diffTokens(newText);
+    const cellCount = oldTokens.length * newTokens.length;
+
+    // Do not allocate a large LCS table for unusually long generated lines.
+    if (cellCount > 60000) return [escape(oldText), escape(newText)];
+
+    const dp = Array.from({ length: oldTokens.length + 1 }, () => new Int32Array(newTokens.length + 1));
+    for (let i = 1; i <= oldTokens.length; i++) {
+        for (let j = 1; j <= newTokens.length; j++) {
+            dp[i][j] = oldTokens[i - 1] === newTokens[j - 1]
+                ? dp[i - 1][j - 1] + 1
+                : Math.max(dp[i - 1][j], dp[i][j - 1]);
+        }
+    }
+
+    const unchangedOld = new Set();
+    const unchangedNew = new Set();
+    for (let i = oldTokens.length, j = newTokens.length; i > 0 && j > 0;) {
+        if (oldTokens[i - 1] === newTokens[j - 1]) {
+            unchangedOld.add(--i);
+            unchangedNew.add(--j);
+        } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+            i--;
+        } else {
+            j--;
+        }
+    }
+
+    const render = (tokens, unchanged, className) => tokens.map((token, index) => {
+        const html = escape(token);
+        return unchanged.has(index) ? html : `<span class="${className}">${html}</span>`;
+    }).join('');
+    return [
+        render(oldTokens, unchangedOld, 'hl-diff-remove-change'),
+        render(newTokens, unchangedNew, 'hl-diff-add-change'),
+    ];
+}
+
+function _renderDiffLine(type, text, content = escape(text)) {
+    const className = type === 'add' ? 'hl-diff-add' : type === 'remove' ? 'hl-diff-remove' : 'hl-diff-context';
+    const prefix = type === 'add' ? '+' : type === 'remove' ? '-' : ' ';
+    return `<span class="${className}">${prefix}${content}</span>`;
+}
+
+function _renderDiffChangeBlock(removed, added) {
+    const rendered = [];
+    const pairs = Math.min(removed.length, added.length);
+    for (let i = 0; i < pairs; i++) {
+        const [oldHtml, newHtml] = _intralineDiff(removed[i], added[i]);
+        rendered.push(_renderDiffLine('remove', removed[i], oldHtml));
+        rendered.push(_renderDiffLine('add', added[i], newHtml));
+    }
+    for (let i = pairs; i < removed.length; i++) rendered.push(_renderDiffLine('remove', removed[i]));
+    for (let i = pairs; i < added.length; i++) rendered.push(_renderDiffLine('add', added[i]));
+    return rendered;
+}
+
 export function highlightDiff(patch) {
     if (!patch) return '';
-    return escape(patch).split('\n').map(line => {
-        if (line.startsWith('@@'))   return `<span class="hl-diff-header">${line}</span>`;
-        if (line.startsWith('--- ') || line.startsWith('+++ ')) return `<span class="hl-diff-filename">${line}</span>`;
-        if (line.startsWith('+'))   return `<span class="hl-diff-add">${line}</span>`;
-        if (line.startsWith('-'))   return `<span class="hl-diff-remove">${line}</span>`;
-        if (line.startsWith('\\')) return `<span class="hl-diff-meta">${line}</span>`;
-        return `<span class="hl-diff-context">${line}</span>`;
-    }).join('\n');
+    const lines = String(patch).split('\n');
+    const rendered = [];
+    for (let index = 0; index < lines.length;) {
+        const line = lines[index];
+        if (line.startsWith('-') && !line.startsWith('--- ')) {
+            const removed = [];
+            while (index < lines.length && lines[index].startsWith('-') && !lines[index].startsWith('--- ')) {
+                removed.push(lines[index++].slice(1));
+            }
+            const added = [];
+            while (index < lines.length && lines[index].startsWith('+') && !lines[index].startsWith('+++ ')) {
+                added.push(lines[index++].slice(1));
+            }
+            rendered.push(..._renderDiffChangeBlock(removed, added));
+            continue;
+        }
+        if (line.startsWith('@@')) rendered.push(`<span class="hl-diff-header">${escape(line)}</span>`);
+        else if (line.startsWith('--- ') || line.startsWith('+++ ')) rendered.push(`<span class="hl-diff-filename">${escape(line)}</span>`);
+        else if (line.startsWith('+')) rendered.push(_renderDiffLine('add', line.slice(1)));
+        else if (line.startsWith('\\')) rendered.push(`<span class="hl-diff-meta">${escape(line)}</span>`);
+        else rendered.push(_renderDiffLine('context', line.slice(1)));
+        index++;
+    }
+    return rendered.join('\n');
 }
 
 // ── Tool result rendering helpers ─────────────────────────────────────────────
+
+function _truncateToolResultText(value, maxLength = 240) {
+    const text = String(value);
+    return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function _serializeToolResult(value) {
+    try {
+        return _truncateToolResultText(JSON.stringify(value));
+    } catch (error) {
+        return '[Unserializable tool result]';
+    }
+}
+
+function _extractToolError(result) {
+    if (!result || typeof result !== 'object') return null;
+    const error = result.error;
+    if (typeof error === 'string' && error.trim()) return error.trim();
+    if (!error || typeof error !== 'object') return null;
+
+    const message = typeof error.message === 'string' && error.message.trim() ? error.message.trim() : null;
+    const code = error.code === null || error.code === undefined ? null : _truncateToolResultText(error.code, 80);
+    if (message && code) return `${code}: ${message}`;
+    if (message) return message;
+    if (code) return code;
+    return _serializeToolResult(error);
+}
+
+function _summarizeToolResultValue(value) {
+    // Preserve concise scalar arrays (such as validation reason_code) while
+    // continuing to suppress nested objects and potentially verbose payloads.
+    if (value === null || value === undefined || typeof value === 'object' && !Array.isArray(value)) return null;
+    if (Array.isArray(value)) {
+        const scalarValues = value.filter(item => item !== null && item !== undefined && typeof item !== 'object');
+        if (!scalarValues.length) return null;
+        const summary = scalarValues.slice(0, 4).map(String).join(', ');
+        return scalarValues.length > 4 ? `${summary}, …` : summary;
+    }
+    return String(value);
+}
 
 function summarizeToolResult(result) {
     if (result === null || result === undefined) return 'OK';
@@ -138,6 +468,12 @@ function summarizeToolResult(result) {
     if (typeof result === 'object') {
         const keys = Object.keys(result);
         if (!keys.length) return 'OK';
+
+        const error = _extractToolError(result);
+        if (error) {
+            const status = result.status === null || result.status === undefined ? null : _truncateToolResultText(result.status, 80);
+            return status ? `${status}: ${error}` : error;
+        }
         if ('status' in result) {
             const s = String(result.status);
             return ('message' in result && String(result.message).length < 100)
@@ -147,14 +483,13 @@ function summarizeToolResult(result) {
         if ('count'   in result && typeof result.count === 'number') return `${result.count} item${result.count !== 1 ? 's' : ''}`;
         const parts = [];
         for (const k of keys.slice(0, 3)) {
-            const v = result[k];
-            if (v !== null && v !== undefined && typeof v !== 'object') parts.push(`${k}: ${String(v)}`);
+            const summary = _summarizeToolResultValue(result[k]);
+            if (summary !== null) parts.push(`${k}: ${summary}`);
         }
         if (parts.length) return parts.join(' · ');
-        return `${keys.length} field${keys.length !== 1 ? 's' : ''}`;
+        return _serializeToolResult(result);
     }
-    const s = String(result);
-    return s.length > 120 ? s.slice(0, 117) + '...' : s;
+    return _truncateToolResultText(result, 120);
 }
 
 function _renderRunpyResult(r) {
@@ -163,7 +498,7 @@ function _renderRunpyResult(r) {
     const hasError  = r.exit_code !== 0;
     const statusColor = hasError ? 'text-red-600' : 'text-green-600';
     const statusBg    = hasError ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200';
-    const statusIcon  = hasError ? '&#10060;' : '&#9989;';
+    const statusIcon  = hasError ? uiIcon('x-circle', 12) : uiIcon('check-circle', 12);
     const $wrap = $('<div>');
     const $badge = $(`<div class="flex items-center gap-2 mb-1.5 text-[10px] font-mono border rounded px-2 py-1">`).addClass(statusColor).addClass(statusBg);
     $badge.append(
@@ -189,7 +524,7 @@ function _renderBashResult(r) {
     const hasError  = r.exit_code !== 0;
     const statusColor = hasError ? 'text-red-600' : 'text-green-600';
     const statusBg    = hasError ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200';
-    const statusIcon  = hasError ? '&#10060;' : '&#9989;';
+    const statusIcon  = hasError ? uiIcon('x-circle', 12) : uiIcon('check-circle', 12);
     const $wrap = $('<div>');
     const $badge = $(`<div class="flex items-center gap-2 mb-1.5 text-[10px] font-mono border rounded px-2 py-1">`).addClass(statusColor).addClass(statusBg);
     $badge.append(
@@ -210,39 +545,124 @@ function _renderBashResult(r) {
     return $wrap;
 }
 
+function _recallText(value) {
+    return value === null || value === undefined ? '' : String(value).trim();
+}
+
+function _recallDate(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+}
+
+function _recallHeader(label, count, engine) {
+    const $header = $('<div class="recall-header">');
+    const $title = $('<div class="recall-title">').append($('<span class="recall-dot">'), $('<span>').text(label));
+    const $meta = $('<div class="recall-header-meta">');
+    if (_recallText(engine)) $meta.append($('<span class="recall-chip">').text(engine));
+    if (Number.isFinite(count)) $meta.append($('<span class="recall-count">').text(count));
+    return $header.append($title, $meta);
+}
+
+function _recallEmpty(message) {
+    return $('<div class="recall-empty">').text(message);
+}
+
+function _recallBody(text) {
+    const value = _recallText(text) || 'No preview available.';
+    const $body = $('<div class="recall-body">').text(value);
+    if (value.length <= 360 && value.split('\n').length <= 6) return $body;
+    $body.addClass('is-clamped');
+    const $button = $('<button type="button" class="recall-more">').text('Show more').on('click', function () {
+        const expanded = $body.toggleClass('is-clamped').hasClass('is-clamped') === false;
+        $(this).text(expanded ? 'Show less' : 'Show more');
+    });
+    return $('<div>').append($body, $button);
+}
+
+function _recallMeta(items) {
+    const $meta = $('<div class="recall-meta">');
+    items.filter(item => item.value).forEach(item => $meta.append($('<span>').addClass(item.className || '').text(item.value)));
+    return $meta;
+}
+
 function _renderRecallResult(result) {
-    const $wrap = $('<div>');
-    const memories = result.memories || [];
+    const $wrap = $('<div class="recall-ui">');
+    const memories = Array.isArray(result.memories) ? result.memories : [];
+    $wrap.append(_recallHeader('Memory recall', memories.length, result.engine));
+    if (!memories.length) return $wrap.append(_recallEmpty(_recallText(result.result) || 'No memories found.'));
 
-    if (!memories.length) {
-        const msg = result.result || 'No memories found.';
-        return $('<div class="text-xs text-gray-500 italic px-2 py-1">').text(msg);
+    const $list = $('<div class="recall-list">');
+    memories.forEach((memory, index) => {
+        const m = memory && typeof memory === 'object' ? memory : {};
+        const identity = _recallText(m.slug) || (m.id !== null && m.id !== undefined ? '#' + m.id : 'Memory ' + (index + 1));
+        const content = _recallText(m.snippet) || _recallText(m.content) || _recallText(m.title);
+        const score = m.score === null || m.score === undefined || m.score === '' ? NaN : Number(m.score);
+        const $top = $('<div class="recall-card-top">').append($('<span class="recall-card-title">').text(identity));
+        const $chips = $('<span class="recall-card-chips">');
+        if (_recallText(m.category)) $chips.append($('<span class="recall-chip">').text(m.category));
+        if (_recallText(m.evidence)) $chips.append($('<span class="recall-chip recall-chip-accent">').text(m.evidence));
+        if (Number.isFinite(score)) $chips.append($('<span class="recall-chip recall-score">').text(score.toFixed(3)));
+        $top.append($chips);
+        const $card = $('<div class="recall-card">').append($top, _recallBody(content));
+        const meta = [
+            {value: _recallText(m.source_file), className: 'recall-path'},
+            {value: _recallDate(m.created_at), className: 'recall-time'}
+        ];
+        if (meta.some(item => item.value)) $card.append(_recallMeta(meta));
+        $list.append($card);
+    });
+    return $wrap.append($list);
+}
+
+function _renderRecallThinkResult(result) {
+    const $wrap = $('<div class="recall-ui">');
+    const facts = Array.isArray(result.facts) ? result.facts : [];
+    const gaps = Array.isArray(result.gaps) ? result.gaps : [];
+    $wrap.append(_recallHeader('Memory synthesis', facts.length, result.engine));
+
+    const $list = $('<div class="recall-list">');
+    facts.forEach((fact, index) => {
+        const f = fact && typeof fact === 'object' ? fact : {};
+        const $top = $('<div class="recall-card-top">').append($('<span class="recall-card-title">').text('Fact ' + (index + 1)));
+        if (_recallText(f.evidence)) $top.append($('<span class="recall-chip recall-chip-accent">').text(f.evidence));
+        const $card = $('<div class="recall-card">').append($top, _recallBody(_recallText(f.fact) || _recallText(f.snippet)));
+        const meta = [
+            {value: _recallText(f.source), className: 'recall-source'},
+            {value: _recallText(f.source_file), className: 'recall-path'}
+        ];
+        if (meta.some(item => item.value)) $card.append(_recallMeta(meta));
+        $list.append($card);
+    });
+    if (facts.length) $wrap.append($list);
+    if (gaps.length) {
+        const $gaps = $('<details class="recall-gaps">').append($('<summary>').text('Knowledge gaps · ' + gaps.length));
+        gaps.forEach(gap => $gaps.append($('<div>').text(_recallText(gap))));
+        $wrap.append($gaps);
     }
-
-    // Count badge
-    $wrap.append(
-        $('<div class="text-[10px] font-semibold text-purple-600 dark:text-purple-300 mb-1.5">').text(
-            `${memories.length} memory item${memories.length !== 1 ? 's' : ''}`
-        )
-    );
-
-    for (const m of memories) {
-        const $item = $('<div class="mb-1.5 border border-purple-200 rounded px-2 py-1.5 bg-purple-50/50 dark:bg-purple-900/20 dark:border-purple-700">');
-        const $meta = $('<div class="flex items-center gap-2 text-[10px] text-purple-400 mb-0.5">');
-        $meta.append(
-            $('<span class="font-semibold">').text('#' + m.id),
-            $('<span>').text(m.category || 'general')
-        );
-        if (m.created_at) {
-            $meta.append($('<span>').text(new Date(m.created_at).toLocaleString()));
-        }
-        $item.append($meta);
-        $item.append(
-            $('<div class="text-xs text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-words">').text(m.content)
-        );
-        $wrap.append($item);
-    }
+    if (!facts.length && !gaps.length) $wrap.append(_recallEmpty('No synthesis results.'));
     return $wrap;
+}
+
+function _renderRecallGraphResult(result) {
+    const $wrap = $('<div class="recall-ui">');
+    const edges = Array.isArray(result.edges) ? result.edges : [];
+    $wrap.append(_recallHeader('Knowledge graph', edges.length, result.engine));
+    if (_recallText(result.start)) $wrap.append($('<div class="recall-query">').text('From: ' + result.start));
+    if (!edges.length) return $wrap.append(_recallEmpty(_recallText(result.result) || 'No connections found.'));
+
+    const $list = $('<div class="recall-list">');
+    edges.forEach(edge => {
+        const e = edge && typeof edge === 'object' ? edge : {};
+        const $row = $('<div class="recall-edge">').append(
+            $('<span>').text(_recallText(e.from) || 'Unknown source'),
+            $('<span class="recall-relation">').text(_recallText(e.edge) || 'related to'),
+            $('<span>').text(_recallText(e.to) || 'Unknown target')
+        );
+        if (e.hop !== null && e.hop !== undefined) $row.append($('<span class="recall-hop">').text('hop ' + e.hop));
+        $list.append($('<div class="recall-card recall-card-edge">').append($row));
+    });
+    return $wrap.append($list);
 }
 
 /**
@@ -252,8 +672,12 @@ function _renderRecallResult(result) {
 export function buildToolResultDetail(ev) {
     if (ev.error) {
         let msg = typeof ev.error === 'string' && ev.error.length > 1 ? ev.error : null;
+        if (!msg && typeof ev.error === 'object') msg = _extractToolError({ error: ev.error });
         if (!msg && typeof ev.result === 'string') msg = ev.result;
-        if (!msg && ev.result && typeof ev.result === 'object') msg = ev.result.error || ev.result.message || null;
+        if (!msg && ev.result && typeof ev.result === 'object') {
+            msg = _extractToolError(ev.result)
+                || (typeof ev.result.message === 'string' ? ev.result.message : null);
+        }
         if (!msg) msg = 'Tool error';
         return $('<div class="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1 font-mono whitespace-pre-wrap">').text(msg);
     }
@@ -274,9 +698,12 @@ export function buildToolResultDetail(ev) {
     if (typeof ev.result === 'object' && ev.result !== null && Object.keys(ev.result).length === 1 && 'data' in ev.result && typeof ev.result.data === 'string') {
         return $('<pre class="text-xs bg-gray-50 dark:bg-gray-900 dark:text-gray-300 border border-gray-200 rounded p-2 overflow-x-auto font-mono text-gray-700 max-h-[300px] whitespace-pre-wrap">').text(ev.result.data);
     }
-    // recall — show full memory contents
-    if (ev.tool === 'recall' && typeof ev.result === 'object' && ev.result !== null && 'memories' in ev.result) {
-        return _renderRecallResult(ev.result);
+    // recall — show full memory contents for all modes (fts, think, graph)
+    if (ev.tool === 'recall' && typeof ev.result === 'object' && ev.result !== null) {
+        if ('memories' in ev.result) return _renderRecallResult(ev.result);
+        if ('facts' in ev.result)    return _renderRecallThinkResult(ev.result);
+        if ('edges' in ev.result)    return _renderRecallGraphResult(ev.result);
+        return $('<div class="text-xs text-purple-700 bg-purple-50 border border-purple-200 rounded px-2 py-1">').text(summarizeToolResult(ev.result));
     }
     return $('<div class="text-xs text-green-700 bg-green-50 border border-green-200 rounded px-2 py-1">').text(summarizeToolResult(ev.result));
 }
@@ -322,12 +749,18 @@ function _renderStrReplaceDiff(oldStr, newStr, filePath) {
         let oldC=0,newC=0;
         for (let k=lo;k<=hi;k++) { if(ops[k].type!=='add') oldC++; if(ops[k].type!=='remove') newC++; }
         html += `<span class="hl-diff-header">@@ -${oldLn},${oldC} +${newLn},${newC} @@</span>\n`;
-        for (let k=lo;k<=hi;k++) {
-            const {type,line} = ops[k];
-            const esc = escape(line);
-            if (type==='add') html += `<span class="hl-diff-add">+${esc}</span>\n`;
-            else if (type==='remove') html += `<span class="hl-diff-remove">-${esc}</span>\n`;
-            else html += `<span class="hl-diff-context"> ${esc}</span>\n`;
+        for (let k = lo; k <= hi;) {
+            const { type, line } = ops[k];
+            if (type === 'remove') {
+                const removed = [];
+                while (k <= hi && ops[k].type === 'remove') removed.push(ops[k++].line);
+                const added = [];
+                while (k <= hi && ops[k].type === 'add') added.push(ops[k++].line);
+                html += _renderDiffChangeBlock(removed, added).join('\n') + '\n';
+                continue;
+            }
+            html += _renderDiffLine(type, line) + '\n';
+            k++;
         }
     }
     return $('<pre class="diff-code-block mt-0.5" style="max-height:400px;overflow-y:auto">').html(html);
@@ -414,24 +847,24 @@ export function buildTimelineEntry(ev, isActive) {
     let borderClass, icon, label, labelClass, $summary, $detail, spinnerColor, extraAttrs = {};
 
     if (ev.type === 'thinking') {
-        borderClass = 'border-purple-300'; icon = '&#129504;'; label = 'Thinking'; labelClass = 'text-purple-500'; spinnerColor = '#a855f7';
+        borderClass = 'border-purple-300'; icon = uiIcon('brain', 14); label = 'Thinking'; labelClass = 'text-purple-500'; spinnerColor = '#a855f7';
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(truncateLine(ev.content, 80));
         $detail = _buildThinkingContent(ev.content);
 
     } else if (ev.type === 'tool_call') {
-        borderClass = 'border-blue-300'; icon = '&#128295;'; label = 'Tool Call'; labelClass = 'text-blue-500'; spinnerColor = '#3b82f6';
+        borderClass = 'border-blue-300'; icon = uiIcon('wrench', 14); label = 'Tool Call'; labelClass = 'text-blue-500'; spinnerColor = '#3b82f6';
         extraAttrs['data-tool-type'] = 'tool_call';
         extraAttrs['data-tool-name'] = ev.tool;
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(ev.tool + '(' + truncateLine(JSON.stringify(ev.args), 60) + ')');
         $detail = _buildToolCallDetail(ev.tool, ev.args || {}, ev.param_types || {});
 
     } else if (ev.type === 'response') {
-        borderClass = 'border-gray-300'; icon = '&#128172;'; label = 'Response'; labelClass = 'text-gray-500'; spinnerColor = '#6b7280';
+        borderClass = 'border-gray-300'; icon = uiIcon('message', 14); label = 'Response'; labelClass = 'text-gray-500'; spinnerColor = '#6b7280';
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(truncateLine(ev.content, 80));
         $detail = $('<pre class="whitespace-pre-wrap dark:text-gray-200 break-words overflow-x-auto max-w-full text-[11px] text-gray-700">').text(ev.content);
 
     } else if (ev.type === 'retry') {
-        borderClass = 'border-yellow-300'; icon = '&#128260;'; label = 'Mencoba Ulang'; labelClass = 'text-yellow-600'; spinnerColor = '#f59e0b';
+        borderClass = 'border-yellow-300'; icon = uiIcon('retry', 14); label = 'Mencoba Ulang'; labelClass = 'text-yellow-600'; spinnerColor = '#f59e0b';
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(ev.message || `Mencoba ulang... (${ev.retry_count}/${ev.max_retries})`);
         $detail = null;
 
@@ -451,7 +884,7 @@ export function buildTimelineEntry(ev, isActive) {
     }
 
     const $headerRow = $('<div class="flex items-center gap-1 cursor-pointer select-none">');
-    const $chev = $('<span class="tl-chev tool-trace-chevron text-[9px] text-gray-300">').html('&#9656;');
+    const $chev = $('<span class="tl-chev tool-trace-chevron text-gray-300">').html(uiIcon('chevron-right', 11));
     const $iconSpan = $('<span class="text-[10px] font-semibold">').addClass(labelClass).html(icon);
     $headerRow.append($chev, $iconSpan);
 
@@ -487,7 +920,7 @@ function _buildSysBalloon(tag, content, tagColorClass, fullColorClass, truncateL
     const $tagSpan = $('<span class="text-xs font-semibold mr-1.5">').addClass(tagColorClass).text(tag);
     const $preview = $('<span class="sys-balloon-content block">').append($tagSpan, document.createTextNode(truncated));
     $header.append($preview);
-    if (needsCollapse) $header.append($('<span class="sys-chevron text-[10px] flex-shrink-0 mt-0.5">').addClass(fullColorClass).html('&#9660;'));
+    if (needsCollapse) $header.append($('<span class="sys-chevron text-[10px] flex-shrink-0 mt-0.5 ml-auto">').addClass(fullColorClass).html(uiIcon('chevron-down', 12)));
 
     const $full = $('<div class="sys-balloon-full whitespace-pre-wrap">').css('display','none').append(
         $('<span class="text-xs font-semibold mr-1.5">').addClass(tagColorClass).text(tag),
@@ -604,7 +1037,126 @@ function _wrapImageWithDownload($img) {
     });
 }
 
+const _COPY_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const _CHECK_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+
+function _copyText(text, onDone) {
+    const fallback = () => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); onDone(); } catch (_) {}
+        document.body.removeChild(ta);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(onDone).catch(fallback);
+    } else {
+        fallback();
+    }
+}
+
+// Applies highlight.js syntax highlighting to every <pre><code> block in a
+// rendered markdown bubble. Runs on the live DOM (after sanitize), so the
+// injected token <span>s never pass through the sanitizer. No-op if hljs is
+// not loaded. Each block is guarded so one bad block can't break the bubble.
+function _highlightCode($bubble) {
+    if (typeof window === 'undefined' || !window.hljs) return;
+    $bubble.find('pre code').each(function () {
+        if (this.dataset.highlighted) return;
+        try {
+            window.hljs.highlightElement(this);
+        } catch (e) {
+            this.dataset.highlighted = 'error';
+        }
+    });
+}
+
+// Adds a hover-revealed copy button to the bottom-right of every <pre> code block
+// and <blockquote> inside a rendered markdown bubble.
+function _addCopyButtons($bubble) {
+    $bubble.find('pre, blockquote').each(function () {
+        const $el = $(this);
+        if ($el.data('copyAttached')) return;
+        $el.data('copyAttached', true);
+
+        // Wrap so the button stays pinned even when a <pre> scrolls horizontally.
+        $el.wrap($('<div>').css({ position: 'relative' }));
+        const $container = $el.parent();
+
+        const $btn = $('<button type="button">')
+            .attr('title', 'Copy')
+            .attr('aria-label', 'Copy to clipboard')
+            .css({
+                position: 'absolute',
+                bottom: '6px',
+                right: '6px',
+                zIndex: 5,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '28px',
+                height: '28px',
+                padding: '0',
+                borderRadius: '6px',
+                border: 'none',
+                cursor: 'pointer',
+                color: 'currentColor',
+                backgroundColor: 'rgba(128,128,128,0.25)',
+                opacity: 0,
+                transition: 'opacity 150ms ease',
+            })
+            .html(_COPY_ICON)
+            .on('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const text = $el.is('pre') ? ($el.find('code').text() || $el.text()) : $el.text();
+                _copyText(text, function () {
+                    $btn.html(_CHECK_ICON).css('color', '#22c55e');
+                    setTimeout(function () { $btn.html(_COPY_ICON).css('color', 'currentColor'); }, 1500);
+                });
+            });
+        $container.append($btn);
+
+        $container.on('mouseenter', function () { $btn.css('opacity', 1); });
+        $container.on('mouseleave', function () { if (!$btn.is(':focus')) $btn.css('opacity', 0); });
+        $btn.on('mouseenter', function () { $(this).css('backgroundColor', 'rgba(128,128,128,0.4)'); });
+        $btn.on('mouseleave', function () { $(this).css('backgroundColor', 'rgba(128,128,128,0.25)'); });
+        $btn.on('focus', function () { $(this).css({ opacity: 1, outline: '2px solid rgba(128,128,128,0.7)', outlineOffset: '1px' }); });
+        $btn.on('blur', function () {
+            $(this).css({ outline: 'none', outlineOffset: '0' });
+            if (!$container.is(':hover')) $btn.css('opacity', 0);
+        });
+    });
+}
+
+// Divider for a workplace switch note. The note's text is for the agent; the
+// user gets a compact "from → to" marker built from its metadata.
+function buildWorkplaceSwitchMarker(sw, opts, cfg) {
+    const name = side => (side && side.name) ? side.name : 'local workspace';
+    const $label = $('<span class="chat-wp-switch-label">')
+        .append(uiIcon('server', 12), ' Workplace switched: ')
+        .append($('<b>').text(name(sw.from)), ' → ', $('<b>').text(name(sw.to)));
+    const date = opts.timestamp != null ? normalizeTimestamp(opts.timestamp) : null;
+    if (date) {
+        let label = '';
+        try {
+            label = cfg.formatTimestamp ? cfg.formatTimestamp(date)
+                : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } catch (e) {}
+        // Not <time>: '#chat-messages time' styles bubble timestamps as blocks
+        if (label) $label.append($('<span class="chat-wp-switch-time">').attr('title', date.toLocaleString()).text(' · ' + label));
+    }
+    return $('<div class="chat-wp-switch" role="note" data-msg-role="system">')
+        .append('<span class="chat-wp-switch-line"></span>', $label, '<span class="chat-wp-switch-line"></span>');
+}
+
 export function buildMessageBubble(role, content, opts = {}, cfg = {}) {
+    if (opts.metadata && opts.metadata.workplace_switch) {
+        return buildWorkplaceSwitchMarker(opts.metadata.workplace_switch, opts, cfg);
+    }
     const {
         userAlign = 'right',
         assistantAlign = 'left',
@@ -645,8 +1197,7 @@ export function buildMessageBubble(role, content, opts = {}, cfg = {}) {
         const agentTag = agentMatch ? agentMatch[1] : '';
         const agentContent = agentTag ? content.slice(agentMatch[0].length) : content;
         $bubble = $('<div class="bg-blue-100 text-blue-900 border border-blue-300 rounded-2xl px-4 py-2.5 text-sm break-words">');
-        if (agentTag) $bubble.append($('<span class="text-xs font-semibold text-blue-500 mr-1.5">').text(agentTag));
-        $bubble.append(document.createTextNode(agentContent));
+        $bubble.append(_buildSysBalloon(agentTag, agentContent, 'text-blue-500', 'text-blue-400', 120));
 
     } else if (isSystemUser) {
         const sysMatch = content.match(/^(\[(?:SYSTEM(?:\/[^\]]*)?|System\/[^\]]*)\])\s*/);
@@ -657,27 +1208,53 @@ export function buildMessageBubble(role, content, opts = {}, cfg = {}) {
 
     } else if (isUser) {
         $bubble = $('<div class="rounded-2xl px-4 py-2.5 text-sm whitespace-pre-wrap break-words">').addClass(userBubbleClass);
-        // Render image attachment if present
         const meta = opts.metadata || {};
-        if (meta.image_url) {
-            const $img = createLazyImage(meta.image_url);
+        const attachmentInfos = Array.isArray(meta.attachment_infos)
+            ? meta.attachment_infos
+            : (meta.attachment_info ? [meta.attachment_info] : []);
+        const imageInfos = attachmentInfos.filter(info => info && info.is_image);
+        const imageUrls = Array.isArray(meta.image_urls)
+            ? meta.image_urls
+            : (meta.image_url ? [meta.image_url] : imageInfos.map(info =>
+                `/api/attachments/${encodeURIComponent(info.attachment_id)}/view`));
+        const addImage = (slot) => {
+            const imageUrl = imageUrls[slot - 1];
+            if (!imageUrl) return false;
+            const $img = createLazyImage(imageUrl);
             $bubble.append($img);
             _wrapImageWithDownload($img);
             setupImageForLazy($img);
+            return true;
+        };
+        const referenced = new Set();
+        const tokenPattern = /\[Image #(\d+)\]/g;
+        let cursor = 0;
+        let match;
+        while ((match = tokenPattern.exec(content || ''))) {
+            const slot = Number(match[1]);
+            if (!imageUrls[slot - 1]) continue;
+            if (match.index > cursor) $bubble.append(document.createTextNode(content.slice(cursor, match.index)));
+            addImage(slot);
+            referenced.add(slot);
+            cursor = match.index + match[0].length;
         }
-        // Render non-image file badge
-        if (meta.attachment_info && !meta.attachment_info.is_image) {
-            const info = meta.attachment_info;
+        if (content && cursor < content.length) $bubble.append(document.createTextNode(content.slice(cursor)));
+        for (let slot = 1; slot <= imageUrls.length; slot++) {
+            if (!referenced.has(slot)) addImage(slot);
+        }
+        // Render non-image file badges
+        attachmentInfos.filter(info => info && !info.is_image).forEach(info => {
             const $badge = $('<div class="flex items-center gap-1.5 mb-1 px-2 py-1 bg-white/20 rounded text-xs">')
                 .append($('<svg class="w-3.5 h-3.5 flex-shrink-0" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M3 3.5A1.5 1.5 0 0 1 4.5 2h6.879a1.5 1.5 0 0 1 1.06.44l4.122 4.12A1.5 1.5 0 0 1 17 7.622V16.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 16.5v-13Z"/></svg>'))
                 .append($('<span class="truncate">').text(info.filename));
-            $bubble.append($badge);
-        }
-        if (content) $bubble.append(document.createTextNode(content));
+            $bubble.prepend($badge);
+        });
 
     } else if (isError) {
         const $icon = $('<svg class="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clip-rule="evenodd"/></svg>');
-        $bubble = $('<div class="bg-red-50 text-red-700 border border-red-200 rounded-lg px-4 py-2 text-sm flex items-start gap-2">').append($icon, $('<span>').text(content));
+        // min-width:0 + overflow-wrap:anywhere: a flex child cannot shrink below its longest unbroken token, so long
+        // error payloads (JSON without spaces) used to stretch the bubble and the whole message list sideways.
+        $bubble = $('<div class="bg-red-50 text-red-700 border border-red-200 rounded-lg px-4 py-2 text-sm flex items-start gap-2 min-w-0 max-w-full">').append($icon, $('<span style="min-width:0;overflow-wrap:anywhere">').text(content));
 
     } else if (isSystem) {
         const sysMatch = content.match(/^\[system[^\]]*\]\s*/i);
@@ -689,18 +1266,18 @@ export function buildMessageBubble(role, content, opts = {}, cfg = {}) {
     } else if (isBashExec) {
         // Bash exec (!) command output — dark terminal with hacker green text
         const rendered = typeof marked !== 'undefined'
-            ? sanitize(marked.parse((content || ''))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
+            ? sanitize(renderMath(marked.parse((content || '')))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
             : escape(content);
         $bubble = $('<div class="chat-prose terminal-output rounded-2xl px-4 py-2.5 text-sm break-words">');
         $bubble.css({
-            'background-color': '#080e0f',
+            'background-color': '#152022',
             'color': '#359635',
             'border': '1px solid #174217'
         });
         $bubble.attr('role', 'article');
         $bubble.html(rendered);
         $bubble.find('pre').css({
-            'background-color': '#030607',
+            'background-color': '#0d1517',
             'border': '1px solid #174217',
             'border-radius': '0.375rem'
         });
@@ -714,10 +1291,11 @@ export function buildMessageBubble(role, content, opts = {}, cfg = {}) {
             _wrapImageWithDownload($img);
             retrofitImageForLazy($img);
         });
+        _addCopyButtons($bubble);
     } else if (isSlashCmd) {
         // Slash command response — blue styling, visible to user only (not sent to LLM)
         const rendered = typeof marked !== 'undefined'
-            ? sanitize(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
+            ? sanitize(renderMath(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>'))
             : escape(content);
         $bubble = $('<div class="chat-prose rounded-2xl px-4 py-2.5 text-sm break-words text-blue-800 border border-blue-200 dark:bg-blue-950 dark:text-blue-200 dark:border-blue-800">');
         $bubble.attr('role', 'article');
@@ -727,10 +1305,12 @@ export function buildMessageBubble(role, content, opts = {}, cfg = {}) {
             _wrapImageWithDownload($img);
             retrofitImageForLazy($img);
         });
+        _highlightCode($bubble);
+        _addCopyButtons($bubble);
     } else {
         // assistant: markdown with sanitizer
         const rendered = typeof marked !== 'undefined'
-            ? sanitize(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
+            ? transformWikiLinks(sanitize(renderMath(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')))
             : escape(content);
         $bubble = $('<div class="chat-prose rounded-2xl px-4 py-2.5 border-gray-300 text-sm break-words">').addClass(assistantBubbleClass);
         $bubble.attr('role', 'article');
@@ -740,22 +1320,47 @@ export function buildMessageBubble(role, content, opts = {}, cfg = {}) {
             _wrapImageWithDownload($img);
             retrofitImageForLazy($img);
         });
+        _highlightCode($bubble);
+        _addCopyButtons($bubble);
+        $bubble.on('click', '.kb-wikilink', function (e) {
+            e.preventDefault();
+            var title = $(this).attr('data-wikilink');
+            if (title) document.dispatchEvent(new CustomEvent('evonic:wikilink-click', { detail: { title: title } }));
+        });
+        // Render non-image file (send_file) as a type-aware, previewable card.
+        // Images stay inline via the markdown body.
+        if (meta.attachment_info && !meta.attachment_info.is_image) {
+            $bubble.prepend($('<div class="mb-2">').append(buildAttachmentCard(meta.attachment_info)));
+        }
     }
 
     const $inner = $('<div class="max-w-[80%] min-w-0">').append($bubble);
 
-    if (showTimestamps && opts.timestamp) {
-        let tsStr = '';
-        try {
-            tsStr = formatTimestamp
-                ? formatTimestamp(opts.timestamp)
-                : new Date(opts.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-        } catch(e) {}
-        if (tsStr) {
+    if (showTimestamps && (isUser || role === 'assistant') && opts.timestamp != null) {
+        const date = normalizeTimestamp(opts.timestamp);
+        let label = '';
+        if (date) {
+            try {
+                label = formatTimestamp
+                    ? formatTimestamp(date)
+                    : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } catch (e) {}
+        }
+        if (date && label) {
             const tsAlign = isUser
                 ? (userAlign === 'left' ? 'text-left' : 'text-right')
                 : (assistantAlign === 'left' ? 'text-left' : 'text-right');
-            $inner.append($('<div class="text-[10px] text-gray-300 mt-0.5 px-1">').addClass(tsAlign).text(tsStr));
+            const accessibleLabel = date.toLocaleString([], {
+                dateStyle: 'long',
+                timeStyle: 'short',
+            });
+            const $time = $('<time class="block text-[10px] leading-4 text-gray-500 dark:text-gray-400 mt-0.5 px-1 tabular-nums">')
+                .addClass(tsAlign)
+                .attr('datetime', date.toISOString())
+                .attr('aria-label', accessibleLabel)
+                .attr('title', accessibleLabel)
+                .text(label);
+            $inner.append($time);
         }
     }
 
@@ -772,4 +1377,6 @@ export const DEFAULT_RENDERERS = {
     sanitize,
     highlightPython,
     highlightDiff,
+    renderKBDocPreview,
+    showWikilinkPreview,
 };

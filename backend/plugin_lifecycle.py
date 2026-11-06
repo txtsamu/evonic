@@ -7,6 +7,7 @@ Extracted from plugin_manager.py as part of the refactor. Handles:
 - Event bridging, route registration, dashboard cards
 """
 
+import copy
 import logging
 import os
 import re
@@ -17,6 +18,7 @@ import types
 import zipfile
 import tempfile
 import importlib.util
+import inspect
 import traceback
 from collections import deque
 from datetime import datetime, timezone
@@ -26,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from backend.plugin_sdk import PluginSDK
 from backend.plugin_hooks import (
     _tool_guards, _message_interceptors, _builtin_suppressors,
+    _turn_gates, _tool_result_gates,
     _state_handlers, _unload_plugin_state_handlers,
 )
 
@@ -34,21 +37,32 @@ _logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGINS_DIR = os.path.join(BASE_DIR, 'plugins')
 
+# Plugins that became core features. A leftover copy in plugins/ is ignored and
+# cannot be reinstalled, so it never registers a second copy of the feature.
+RETIRED_PLUGIN_IDS = frozenset({'ask_user'})
+
 # Supported events
 VALID_EVENTS = {
     'turn_complete', 'message_received', 'session_created', 'summary_updated',
     'processing_started', 'llm_thinking', 'llm_response_chunk',
-    'tool_executed', 'final_answer', 'message_sent',
+    'tool_call_started', 'tool_executed', 'final_answer', 'message_sent',
     'kanban_task_created', 'kanban_task_updated',
     'schedule_fired', 'schedule_created', 'schedule_cancelled',
-    'state_transition',
+    'state_transition', 'llm_usage',
 }
 
 
 class PluginManager:
     MAX_LOG_ENTRIES = 500
 
-    def __init__(self):
+    def __init__(self, load_plugins: bool = True):
+        """Create a plugin manager.
+
+        Pass load_plugins=False for metadata-only callers (CLI plugin list,
+        requirements checks): importing a plugin handler executes its module
+        level code, which in a short-lived process can mutate shared state
+        the live server owns.
+        """
         os.makedirs(PLUGINS_DIR, exist_ok=True)
         self._handlers: Dict[str, List[Tuple[str, Callable]]] = {}  # event -> [(plugin_id, fn)]
         self._modules: Dict[str, Any] = {}  # plugin_id -> loaded module
@@ -58,7 +72,12 @@ class PluginManager:
         self._blueprints: Dict[str, Any] = {}  # plugin_id -> Blueprint
         self._dashboard_cards: Dict[str, List[Tuple[str, Callable]]] = {}  # plugin_id -> [(card_id, fn)]
         self._nav_cache: Optional[List[Dict[str, Any]]] = None  # memoized get_nav_items()
-        self._load_all()
+        self._agent_tabs_cache: Dict[str, List[Dict]] = {}  # per-agent memoized get_agent_tabs()
+        # Parsed-JSON cache keyed by path with mtime invalidation (tool-def
+        # files are read on every agent context build via get_all_plugin_tool_defs).
+        self._json_file_cache: Dict[str, tuple] = {}
+        if load_plugins:
+            self._load_all()
 
     def _is_plugin_enabled(self, plugin_id: str) -> bool:
         """Check if a plugin is enabled. DB is authoritative; absent = disabled."""
@@ -68,6 +87,7 @@ class PluginManager:
     def _load_all(self):
         """Load handlers from all enabled plugins at startup."""
         self._nav_cache = None
+        self._agent_tabs_cache.clear()
         self._handlers.clear()
         self._modules.clear()
         self._event_bridges.clear()
@@ -113,6 +133,8 @@ class PluginManager:
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)
                 self._modules[plugin_id] = module
+
+                self._call_lifecycle_hook(plugin_id, module, 'on_enable', manifest)
 
                 # Register handler functions and bridge them to the event stream
                 from backend.event_stream import event_stream
@@ -196,10 +218,40 @@ class PluginManager:
             if self._dashboard_cards.get(plugin_id):
                 self.add_log(plugin_id, 'info', f"Registered {len(self._dashboard_cards[plugin_id])} dashboard card(s)")
 
+    def _call_lifecycle_hook(self, plugin_id: str, module: Any,
+                             hook_name: str, manifest: dict = None) -> None:
+        """Invoke an optional lifecycle hook with backward-compatible arity."""
+        hook = getattr(module, hook_name, None)
+        if not callable(hook):
+            return
+
+        try:
+            parameters = inspect.signature(hook).parameters.values()
+            accepts_sdk = any(
+                p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                           inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                           inspect.Parameter.VAR_POSITIONAL)
+                for p in parameters
+            )
+            if accepts_sdk:
+                sdk = PluginSDK(plugin_id, self.get_plugin_config(plugin_id), {},
+                                log_callback=self.add_log)
+                hook(sdk)
+            else:
+                hook()
+            self.add_log(plugin_id, 'info', f"Lifecycle hook completed: {hook_name}")
+        except Exception as e:
+            self.add_log(plugin_id, 'error', f"Lifecycle hook {hook_name} failed: {e}")
+            _logger.error("Lifecycle hook %s failed for '%s': %s",
+                          hook_name, plugin_id, e, exc_info=True)
+
     def _unload_plugin(self, plugin_id: str):
         """Remove all handler registrations for a plugin."""
         self._nav_cache = None  # covers reload (install/enable/disable) and uninstall
-        self._modules.pop(plugin_id, None)
+        self._agent_tabs_cache.clear()
+        module = self._modules.pop(plugin_id, None)
+        if module is not None:
+            self._call_lifecycle_hook(plugin_id, module, 'on_disable')
         prefix = f'plugin_pkg_{plugin_id}_'
         for key in [k for k in sys.modules if k == prefix[:-1] or k.startswith(prefix)]:
             sys.modules.pop(key, None)
@@ -215,8 +267,9 @@ class PluginManager:
         for event_name, bridge in self._event_bridges.pop(plugin_id, []):
             event_stream.off(event_name, bridge)
 
-        # Unregister side-channel hooks
-        for registry in (_tool_guards, _message_interceptors, _builtin_suppressors):
+        # Unregister side-channel and synchronous lifecycle hooks
+        for registry in (_tool_guards, _message_interceptors, _builtin_suppressors,
+                         _turn_gates, _tool_result_gates):
             registry[:] = [fn for fn in registry
                            if not getattr(fn, '__module__', '').startswith(prefix)]
 
@@ -329,6 +382,26 @@ class PluginManager:
         """Return list of registered blueprint names."""
         return list(self._blueprints.keys())
 
+    def get_plugin_endpoints(self, plugin_id: str) -> List[Dict[str, Any]]:
+        """Return HTTP routes registered by a plugin's runtime Flask blueprint."""
+        blueprint = self._blueprints.get(plugin_id)
+        if blueprint is None:
+            return []
+
+        from flask import current_app
+        endpoint_prefix = f'{blueprint.name}.'
+        endpoints = []
+        for rule in current_app.url_map.iter_rules():
+            if not rule.endpoint.startswith(endpoint_prefix):
+                continue
+            methods = sorted(method for method in rule.methods if method not in {'HEAD', 'OPTIONS'})
+            endpoints.append({
+                'path': rule.rule,
+                'methods': methods,
+                'endpoint': rule.endpoint,
+            })
+        return sorted(endpoints, key=lambda item: (item['path'], item['methods'], item['endpoint']))
+
     def dispatch(self, event_name: str, event_data: dict):
         """Dispatch an event via the event stream (non-blocking). Backward compat."""
         from backend.event_stream import event_stream
@@ -350,6 +423,8 @@ class PluginManager:
         if not os.path.isdir(PLUGINS_DIR):
             return plugins
         for name in sorted(os.listdir(PLUGINS_DIR)):
+            if name in RETIRED_PLUGIN_IDS:
+                continue
             plugin_dir = os.path.join(PLUGINS_DIR, name)
             manifest_path = os.path.join(plugin_dir, 'plugin.json')
             if not os.path.isfile(manifest_path):
@@ -365,6 +440,81 @@ class PluginManager:
             except (json.JSONDecodeError, KeyError):
                 continue
         return plugins
+
+    # ── Plugin-provided agent tools ──
+
+    def _read_json_cached(self, path: str):
+        """Parse a JSON file, cached by mtime. Returns a deep copy so callers
+        can tag/mutate the result without polluting the cache.  Returns None
+        if the file is missing or unparseable.  Unlocked: a concurrent race
+        just parses the same file twice, which is harmless."""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            self._json_file_cache.pop(path, None)
+            return None
+        cached = self._json_file_cache.get(path)
+        if cached is None or cached[0] != mtime:
+            try:
+                with open(path, encoding='utf-8') as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return None
+            cached = (mtime, data)
+            self._json_file_cache[path] = cached
+        return copy.deepcopy(cached[1])
+
+    def get_all_plugin_tool_defs(self) -> List[Dict[str, Any]]:
+        """Load tool definitions from all ENABLED plugins declaring tools_file.
+
+        Mirrors skills_manager.get_all_skill_tool_defs: the tools file is a
+        flat JSON array of function defs; each def is tagged with its plugin
+        origin and the namespaced ID 'plugin:<plugin_id>:<fn_name>'.
+        """
+        all_defs = []
+        for plugin in self.list_plugins():
+            if not plugin.get('enabled'):
+                continue
+            tools_file = plugin.get('tools_file', '')
+            if not tools_file:
+                continue
+            plugin_id = plugin.get('id', '')
+            plugin_dir = plugin.get('_dir', os.path.join(PLUGINS_DIR, plugin_id))
+            data = self._read_json_cached(os.path.join(plugin_dir, tools_file))
+            if not isinstance(data, list):
+                continue
+            for d in data:
+                if not isinstance(d, dict):
+                    continue
+                fn_name = d.get('function', {}).get('name', '')
+                if not fn_name:
+                    continue
+                d['id'] = f'plugin:{plugin_id}:{fn_name}'
+                d['_plugin_id'] = plugin_id
+                d['_plugin_dir'] = plugin_dir
+                all_defs.append(d)
+        return all_defs
+
+    def find_plugin_tool_backend(self, tool_name: str,
+                                 plugin_id: str = None) -> Tuple[Optional[str], Optional[str]]:
+        """Locate plugins/<id>/backend/tools/<tool_name>.py in enabled plugins.
+
+        Returns (path, plugin_id) of the first match, or (None, None).
+        If plugin_id is given, only that plugin is searched.
+        """
+        if not re.match(r'^[A-Za-z0-9_]+$', tool_name or ''):
+            return None, None
+        for plugin in self.list_plugins():
+            pid = plugin.get('id', '')
+            if plugin_id and pid != plugin_id:
+                continue
+            if not plugin.get('enabled'):
+                continue
+            plugin_dir = plugin.get('_dir', os.path.join(PLUGINS_DIR, pid))
+            tool_path = os.path.join(plugin_dir, 'backend', 'tools', f'{tool_name}.py')
+            if os.path.isfile(tool_path):
+                return tool_path, pid
+        return None, None
 
     def get_nav_items(self) -> List[Dict[str, Any]]:
         """Return nav items declared by all enabled plugins.
@@ -386,6 +536,51 @@ class PluginManager:
                     })
         self._nav_cache = items
         return items
+
+    def get_agent_tabs(self, agent_id: str) -> List[Dict[str, Any]]:
+        """Return agent_detail tabs declared by enabled plugins for a specific agent.
+
+        Memoized per-agent: keyed by (agent_id, panel_config_mtime) so the
+        cache invalidates when the panel plugin's config for this agent
+        changes. Follows the same architecture as get_nav_items().
+        """
+        # Get panel plugin's per-agent config to use _updated_at as cache mtime
+        panel_config = self.get_agent_plugin_settings("panel", agent_id)
+        config_mtime = panel_config.get("_updated_at", 0)
+        cache_key = f"{agent_id}:{config_mtime}"
+
+        if cache_key in self._agent_tabs_cache:
+            return self._agent_tabs_cache[cache_key]
+
+        items = []
+        for plugin in self.list_plugins():
+            if not plugin['enabled']:
+                continue
+            for item in plugin.get('agent_tabs', []):
+                items.append({
+                    'id': item.get('id', ''),
+                    'label': item.get('label', ''),
+                    'endpoint': item.get('endpoint', ''),
+                    'plugin_id': plugin['id'],
+                })
+
+        self._agent_tabs_cache[cache_key] = items
+        return items
+
+    def invalidate_agent_tabs(self, agent_id: str = None):
+        """Clear agent_tabs cache per-agent or all.
+
+        Args:
+            agent_id: If provided, clear only cache entries for this agent.
+                      If None, clear all agent_tabs cache.
+        """
+        if agent_id is None:
+            self._agent_tabs_cache.clear()
+        else:
+            prefix = f"{agent_id}:"
+            keys_to_remove = [k for k in self._agent_tabs_cache if k.startswith(prefix)]
+            for k in keys_to_remove:
+                del self._agent_tabs_cache[k]
 
     def get_cli_commands(self) -> Dict[str, Any]:
         """Return CLI commands declared by all enabled plugins."""
@@ -431,6 +626,8 @@ class PluginManager:
         manifest['enabled'] = self._is_plugin_enabled(plugin_id)
         manifest['events'] = manifest.get('events', [])
         manifest['event_count'] = len(manifest['events'])
+        manifest['endpoints'] = self.get_plugin_endpoints(plugin_id)
+        manifest['endpoint_count'] = len(manifest['endpoints'])
         manifest['variables'] = manifest.get('variables', [])
         manifest['config'] = self.get_plugin_config(plugin_id)
 
@@ -485,6 +682,8 @@ class PluginManager:
             plugin_id = manifest.get('id', '')
             if not re.match(r'^[a-zA-Z0-9_-]+$', plugin_id):
                 return {'error': f'Invalid plugin id: {plugin_id}'}
+            if plugin_id in RETIRED_PLUGIN_IDS:
+                return {'error': f'Plugin "{plugin_id}" is now built into Evonic and cannot be installed.'}
 
             plugin_src = os.path.dirname(manifest_path)
             plugin_dest = os.path.join(PLUGINS_DIR, plugin_id)
@@ -511,6 +710,8 @@ class PluginManager:
         plugin_id = manifest.get('id', '')
         if not re.match(r'^[a-zA-Z0-9_-]+$', plugin_id):
             return {'error': f'Invalid plugin id: {plugin_id}'}
+        if plugin_id in RETIRED_PLUGIN_IDS:
+            return {'error': f'Plugin "{plugin_id}" is now built into Evonic and cannot be installed.'}
 
         plugin_dest = os.path.join(PLUGINS_DIR, plugin_id)
         source_norm = os.path.normpath(os.path.abspath(source_dir))
@@ -572,7 +773,7 @@ class PluginManager:
         return manifest.get('variables', [])
 
     def get_plugin_config(self, plugin_id: str) -> Dict[str, Any]:
-        """Load config from DB merged with defaults from variables schema."""
+        """Load raw configuration from DB merged with defaults from variables schema."""
         variables = self.get_plugin_variables(plugin_id)
         config = {}
         for v in variables:
@@ -602,20 +803,16 @@ class PluginManager:
             key = f'plugin_config:{plugin_id}:{v["name"]}'
             stored = db.get_setting(key)
             if stored is not None:
-                # Mask secret values in API responses
-                if v.get('secret', False):
-                    config[v['name']] = '••••••••'
+                var_type = v.get('type', 'string')
+                if var_type == 'boolean':
+                    config[v['name']] = stored in ('1', 'true', 'True')
+                elif var_type == 'number':
+                    try:
+                        config[v['name']] = float(stored) if '.' in stored else int(stored)
+                    except ValueError:
+                        pass
                 else:
-                    var_type = v.get('type', 'string')
-                    if var_type == 'boolean':
-                        config[v['name']] = stored in ('1', 'true', 'True')
-                    elif var_type == 'number':
-                        try:
-                            config[v['name']] = float(stored) if '.' in stored else int(stored)
-                        except ValueError:
-                            pass
-                    else:
-                        config[v['name']] = stored
+                    config[v['name']] = stored
 
         return config
 

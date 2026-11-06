@@ -142,14 +142,14 @@
                     <!-- Agent name -->
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Agent Name <span class="text-red-500">*</span></label>
-                        <input type="text" id="agent-name" placeholder="e.g., Admin"
+                        <input type="text" id="agent-name" value="Super Agent" placeholder="e.g., Admin"
                             class="w-full px-3 py-2.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 rounded-lg text-sm placeholder-gray-400 dark:placeholder-gray-500 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20">
                     </div>
 
                     <!-- Agent ID -->
                     <div>
                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Agent ID <span class="text-red-500">*</span></label>
-                        <input type="text" id="agent-id" placeholder="admin" autocomplete="off"
+                        <input type="text" id="agent-id" value="super_agent" placeholder="admin" autocomplete="off"
                             class="w-full px-3 py-2.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 rounded-lg text-sm placeholder-gray-400 dark:placeholder-gray-500 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20">
                         <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">Alphanumeric and underscores only. Auto-derived from name. Cannot be changed later.</p>
                     </div>
@@ -168,6 +168,18 @@
                                 </div>
                             </label>
                             {% endfor %}
+                        </div>
+                    </div>
+
+                    <!-- Memory engine -->
+                    <div class="flex items-start gap-3 pt-1">
+                        <input type="checkbox" id="install-evomem" checked
+                            class="mt-0.5 accent-indigo-600 cursor-pointer">
+                        <div>
+                            <label for="install-evomem" class="text-sm font-medium text-gray-700 dark:text-gray-300 cursor-pointer">
+                                Install evomem memory engine <span class="text-xs text-gray-400 dark:text-gray-500 font-normal">(recommended)</span>
+                            </label>
+                            <p class="text-xs text-gray-400 dark:text-gray-500 mt-0.5">Enables semantic memory and graph features. Falls back to FTS5 if unavailable.</p>
                         </div>
                     </div>
 
@@ -218,6 +230,10 @@
                         <div class="flex justify-between px-4 py-3">
                             <span class="text-gray-500 dark:text-gray-400 font-medium">Language</span>
                             <span id="review-language" class="text-gray-900 dark:text-gray-100"></span>
+                        </div>
+                        <div class="flex justify-between px-4 py-3">
+                            <span class="text-gray-500 dark:text-gray-400 font-medium">Memory Engine</span>
+                            <span id="review-evomem" class="text-gray-900 dark:text-gray-100"></span>
                         </div>
                     </div>
 
@@ -429,6 +445,7 @@ function populateReview() {
     $('#review-agent-name').text($('#agent-name').val().trim());
     $('#review-agent-id').text($('#agent-id').val().trim());
     $('#review-language').text((LANGUAGES[language] || {}).label || language);
+    $('#review-evomem').text($('#install-evomem').prop('checked') ? 'evomem (install)' : 'FTS5 (skip install)');
 }
 
 // ---- Submit ----
@@ -447,6 +464,7 @@ function submitSetup() {
         language: $('input[name="language"]:checked').val(),
         description: '',
         password: $('#password').val(),
+        install_evomem: $('#install-evomem').prop('checked'),
     };
 
     $.ajax({

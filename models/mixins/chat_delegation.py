@@ -1,6 +1,7 @@
 import functools
 import os
-from typing import Dict, Any, List, Optional
+import re
+from typing import Dict, Any, List, Optional, Tuple
 
 import sqlite3
 
@@ -50,7 +51,7 @@ class ChatDelegationMixin:
         session_id = self._chat_db(_db_id).get_or_create_session(
             agent_id, external_user_id, channel_id, channel_type=channel_type)
         self._refresh_session_count(_db_id)
-        self._sync_session_index(_db_id, session_id)
+        self._sync_session_index(agent_id, session_id, db_agent_id=_db_id)
         return session_id
 
     def get_session_messages(self, session_id: str, limit: int = 50,
@@ -89,7 +90,7 @@ class ChatDelegationMixin:
                 pass
             # Keep session_index in sync (message_count, last_message, last_message_role, updated_at).
             # Only user/assistant messages to avoid write amplification from tool calls.
-            self._sync_session_index(_db_id, session_id)
+            self._sync_session_index(agent_id, session_id, db_agent_id=_db_id)
         return result
 
     def touch_agent_active(self, agent_id: str) -> None:
@@ -114,19 +115,42 @@ class ChatDelegationMixin:
     def get_session_state(self, session_id: str, agent_id: str) -> Optional[str]:
         return self._chat_db(agent_id).get_session_state(session_id)
 
-    def clear_session(self, session_id: str, agent_id: str = None):
+    def clear_session(self, session_id: str, agent_id: str = None, no_archive: bool = False):
         agent_id = agent_id or self._find_agent_for_session(session_id)
         if agent_id:
             # Archive session data before clearing (background, non-blocking)
             import config
-            if config.SESSION_ARCHIVE:
+            if config.SESSION_ARCHIVE and not no_archive:
                 from models.session_archive import SessionArchiver
                 SessionArchiver.archive_session(agent_id, session_id)
 
             self._chat_db(agent_id).clear_session(session_id)
             from models.chatlog import chatlog_manager
             chatlog_manager.get(agent_id, session_id).clear()
+            # Drop the byte-exact LLM-trace file (records already read by archiver above)
+            from models.llm_trace import llm_trace_manager
+            llm_trace_manager.get(agent_id, session_id).clear()
+            llm_trace_manager.evict(agent_id, session_id)
             self._remove_session_index(session_id)
+            try:
+                from backend.realtime_store import realtime_store
+                realtime_store.purge_session(session_id)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to purge realtime history for session %s: %s",
+                    session_id, e,
+                )
+
+    def get_last_message_timestamp(self, session_id: str, agent_id: str = None) -> Optional[float]:
+        """Return the unix timestamp of the most recent message in a session.
+
+        Returns None if the session has no messages.
+        """
+        agent_id = agent_id or self._find_agent_for_session(session_id)
+        if not agent_id:
+            return None
+        return self._chat_db(agent_id).get_last_message_timestamp(session_id)
 
     def get_summary(self, session_id: str, agent_id: str = None):
         agent_id = agent_id or self._find_agent_for_session(session_id)
@@ -186,6 +210,15 @@ class ChatDelegationMixin:
                 pass
             self._refresh_session_count(agent_id)
             self._remove_session_index(session_id)
+            try:
+                from backend.realtime_store import realtime_store
+                realtime_store.purge_session(session_id)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to purge realtime history for session %s: %s",
+                    session_id, e,
+                )
             # Wipe attachments tied to this session (rows + on-disk files) so
             # they don't linger unreachable after the conversation is gone.
             try:
@@ -204,11 +237,11 @@ class ChatDelegationMixin:
             return None
         return self._chat_db(agent_id).get_latest_agent_request_metadata(session_id, sender_agent_id)
 
-    def get_session_messages_full(self, session_id: str, agent_id: str = None) -> List[Dict[str, Any]]:
+    def get_session_messages_full(self, session_id: str, agent_id: str = None, limit: int = 200, before_id: Optional[int] = None) -> Tuple[List[Dict[str, Any]], bool]:
         agent_id = agent_id or self._find_agent_for_session(session_id)
         if not agent_id:
-            return []
-        return self._chat_db(agent_id).get_session_messages_full(session_id)
+            return [], False
+        return self._chat_db(agent_id).get_session_messages_full(session_id, limit=limit, before_id=before_id)
 
     def get_new_messages(self, session_id: str, after_id: int, agent_id: str = None) -> List[Dict[str, Any]]:
         agent_id = agent_id or self._find_agent_for_session(session_id)
@@ -259,6 +292,16 @@ class ChatDelegationMixin:
         agent = self.get_agent(session.get('agent_id') or agent_id)
         session['agent_name'] = (agent['name'] if agent
                                  else (session.get('agent_id') or 'Unknown'))
+        session['attachments_enabled'] = bool(agent.get('attachments_enabled', 1)) if agent else True
+        # Resolve the peer agent name for inter-agent sessions
+        # (external_user_id = '__agent__<peer_id>'), mirroring get_all_sessions so
+        # explorer/sub-agent captions can show the real parent name instead of 'Unknown'.
+        ext = session.get('external_user_id') or ''
+        if ext.startswith('__agent__'):
+            peer = self.get_agent(ext[len('__agent__'):])
+            session['peer_agent_name'] = peer['name'] if peer else None
+        else:
+            session['peer_agent_name'] = None
         if session.get('channel_id'):
             ch = self.get_channel(session['channel_id'])
             session['channel_type'] = ch.get('type') if ch else None
@@ -270,12 +313,18 @@ class ChatDelegationMixin:
 
     # ---- Session Index helpers (materialized view in main DB) ----
 
-    def _sync_session_index(self, agent_id: str, session_id: str) -> None:
-        """Read session metadata from per-agent chat DB and upsert into main DB session_index."""
+    def _sync_session_index(self, agent_id: str, session_id: str,
+                            db_agent_id: str = None) -> None:
+        """Upsert session metadata while preserving its logical agent owner.
+
+        ``agent_id`` is written to ``session_index``. ``db_agent_id`` selects
+        the chat DB that physically stores the session, which is the parent for
+        ephemeral sub-agents.
+        """
         import logging
         logger = logging.getLogger(__name__)
         try:
-            chat_db = self._chat_db(agent_id)
+            chat_db = self._chat_db(db_agent_id or agent_id)
             session = chat_db.get_session(session_id)
             if not session:
                 # Session deleted concurrently — remove from index if it exists.
@@ -361,7 +410,9 @@ class ChatDelegationMixin:
             )"""
 
         # Count total matching rows (same WHERE, no LIMIT/OFFSET).
-        count_sql = f"SELECT COUNT(*) FROM {base_from} WHERE {where_sql}"
+        # All table/column names in base_from, columns, where_sql are compile-time constants;
+        # values use ? placeholders.
+        count_sql = "SELECT COUNT(*) FROM " + base_from + " WHERE " + where_sql
 
         # Data query with ORDER BY, LIMIT, OFFSET.
         columns = """si.session_id AS id,
@@ -370,12 +421,13 @@ class ChatDelegationMixin:
                      si.message_count, si.last_message, si.last_message_role,
                      COALESCE(ag.name, si.agent_id) AS agent_name,
                      ch.type AS channel_type, ch.name AS channel_name,
-                     peer.name AS peer_agent_name"""
-        data_sql = f"""SELECT {columns}
-                       FROM {base_from}
-                       WHERE {where_sql}
-                       ORDER BY si.updated_at DESC
-                       LIMIT ? OFFSET ?"""
+                     peer.name AS peer_agent_name,
+                     ag.attachments_enabled"""
+        data_sql = ("SELECT " + columns
+                    + " FROM " + base_from
+                    + " WHERE " + where_sql
+                    + " ORDER BY si.updated_at DESC"
+                    + " LIMIT ? OFFSET ?")
 
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -398,7 +450,18 @@ class ChatDelegationMixin:
                 "SELECT agent_id FROM session_index WHERE session_id = ?",
                 (session_id,)
             ).fetchone()
-            return row['agent_id'] if row else None
+            agent_id = row['agent_id'] if row else None
+        if not agent_id:
+            return None
+        # Sub-agents and explorers persist their messages into the PARENT's
+        # per-agent chat DB (db_agent_id = parent_id), but session_index records
+        # the sub-agent id. Resolve to the parent so message/session lookups hit
+        # the DB that actually holds the rows — otherwise the chat panel loads
+        # from the sub-agent's empty DB and shows nothing.
+        m = re.match(r'^(.+)_(?:sub|explorer|organizer)_\d+$', agent_id)
+        if m and self._chat_db(m.group(1)).get_session(session_id):
+            return m.group(1)
+        return agent_id
 
     def clear_all_sessions(self):
         """Drop all chat sessions, messages, and summaries across all agents.
@@ -428,6 +491,14 @@ class ChatDelegationMixin:
             logging.getLogger(__name__).warning(
                 "Failed to clear attachments during clear_all_sessions: %s", e
             )
+        try:
+            from backend.realtime_store import realtime_store
+            realtime_store.purge_all()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to purge realtime history while clearing sessions: %s", e
+            )
 
     # ---- Long-term Memory delegation ----
 
@@ -455,6 +526,9 @@ class ChatDelegationMixin:
 
     def get_null_dimension_memories(self, agent_id: str) -> List[Dict[str, Any]]:
         return self._chat_db(agent_id).get_null_dimension_memories()
+
+    def get_active_dimensions(self, agent_id: str, limit: int = 50) -> List[str]:
+        return self._chat_db(agent_id).get_active_dimensions(limit)
 
     def supersede_memory(self, agent_id: str, old_memory_id: int, new_memory_id: int):
         self._chat_db(agent_id).supersede_memory(old_memory_id, new_memory_id)

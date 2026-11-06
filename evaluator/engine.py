@@ -27,6 +27,17 @@ from evaluator.logger import test_logger
 from models.db import db
 import config
 
+def _build_evaluation_llm_client():
+    """Return the configured evaluation client or the global default client."""
+    model_id = db.get_setting("eval_model_id", "") or ""
+    if not model_id:
+        return llm_client
+    model_config = db.get_model_by_id(model_id)
+    if not model_config:
+        return llm_client
+    from evaluator.llm_client import LLMClient
+    return LLMClient(model_config)
+
 # Maximum iterations for multi-turn tool calling (configurable via EVAL_MAX_TOOL_ITERATIONS env var)
 MAX_TOOL_ITERATIONS = config.EVAL_MAX_TOOL_ITERATIONS
 
@@ -222,24 +233,29 @@ class EvaluationEngine:
             self._log(f"[INFO] Using custom LLM endpoint: {model_config.get('base_url', 'N/A')}")
         else:
             from evaluator.llm_client import llm_client as run_llm_client
+        self.evaluation_llm_client = _build_evaluation_llm_client()
+        from evaluator.answer_extractor import answer_extractor as _ae
+        _ae.client = self.evaluation_llm_client
         
         try:
-            if self.use_configurable_tests:
-                self._run_configurable_evaluation(
-                    run_id, model_name, domains, run_llm_client,
-                    completed_test_ids=completed_test_ids
-                )
-            else:
-                self._run_legacy_evaluation(run_id, model_name, domains, run_llm_client)
-            
-            # Recalculate level scores from individual results after resume
-            if self.is_running:
-                self._recalculate_all_level_scores(run_id, domains)
-            
-            # Generate summary after all tests
-            if self.is_running:
-                self._generate_summary(run_id, model_name, run_llm_client)
-                
+            from backend.llm_usage_events import usage_context
+            with usage_context('evaluator', session_id=str(run_id)):
+                if self.use_configurable_tests:
+                    self._run_configurable_evaluation(
+                        run_id, model_name, domains, run_llm_client,
+                        completed_test_ids=completed_test_ids
+                    )
+                else:
+                    self._run_legacy_evaluation(run_id, model_name, domains, run_llm_client)
+
+                # Recalculate level scores from individual results after resume
+                if self.is_running:
+                    self._recalculate_all_level_scores(run_id, domains)
+
+                # Generate summary after all tests
+                if self.is_running:
+                    self._generate_summary(run_id, model_name, self.evaluation_llm_client)
+
         except Exception as e:
             import traceback
             self._log(f'[ERROR] Evaluation error: {e}')
@@ -407,17 +423,24 @@ class EvaluationEngine:
         else:
             from evaluator.llm_client import llm_client as run_llm_client
 
-        
+        self.evaluation_llm_client = _build_evaluation_llm_client()
+
+        # Point pass2 extraction at the configured evaluation model.
+        from evaluator.answer_extractor import answer_extractor as _ae
+        _ae.client = self.evaluation_llm_client
+
         try:
-            if self.use_configurable_tests:
-                self._run_configurable_evaluation(run_id, model_name, domains, run_llm_client)
-            else:
-                self._run_legacy_evaluation(run_id, model_name, domains, run_llm_client)
-            
-            # Generate summary after all tests
-            if self.is_running:
-                self._generate_summary(run_id, model_name, run_llm_client)
-                
+            from backend.llm_usage_events import usage_context
+            with usage_context('evaluator', session_id=str(run_id)):
+                if self.use_configurable_tests:
+                    self._run_configurable_evaluation(run_id, model_name, domains, run_llm_client)
+                else:
+                    self._run_legacy_evaluation(run_id, model_name, domains, run_llm_client)
+
+                # Generate summary after all tests
+                if self.is_running:
+                    self._generate_summary(run_id, model_name, self.evaluation_llm_client)
+
         except Exception as e:
             import traceback
             self._log(f'[ERROR] Evaluation error: {e}')
@@ -459,7 +482,7 @@ class EvaluationEngine:
             model_name: Model being evaluated
             selected_domains: List of domain names to test (None = all domains)
         """
-        all_domains = ["conversation", "math", "sql", "tool_calling", "reasoning", "health"]
+        all_domains = ["conversation", "math", "tool_calling", "reasoning", "health"]
         
         # Filter domains if selection provided
         if selected_domains:
@@ -573,10 +596,11 @@ class EvaluationEngine:
 
             # Handle tool_calling domain with multi-turn loop
             if domain == "tool_calling":
+                system_prompt = None  # legacy tests don't define a system prompt
                 from evaluator.tools import tool_framework
                 tools = tool_framework.tools
                 self._log(f'[TOOLS] Available: {[t["function"]["name"] for t in tools]}')
-                
+
                 # Run tool calling loop
                 loop_result = self._run_tool_calling_loop(prompt, tools, system_prompt=system_prompt, run_llm_client=_client)
 
@@ -917,8 +941,17 @@ class EvaluationEngine:
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 return {"error": "Python mock: import statements are not allowed"}
             # Block class/function definitions
-            if isinstance(node, (ast.ClassDef, ast.AsyncFunctionDef)):
-                return {"error": "Python mock: class/async def not allowed"}
+            if isinstance(node, (ast.ClassDef, ast.AsyncFunctionDef, ast.FunctionDef)):
+                return {"error": "Python mock: class/function definitions not allowed"}
+            # Block global/nonlocal declarations (could poison namespace)
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                return {"error": "Python mock: global/nonlocal declarations not allowed"}
+            # Block delete statements
+            if isinstance(node, ast.Delete):
+                return {"error": "Python mock: delete statements not allowed"}
+            # Block raise statements (can probe environment)
+            if isinstance(node, ast.Raise):
+                return {"error": "Python mock: raise statements not allowed"}
             # Block dunder attribute access (e.g. x.__class__.__bases__)
             if isinstance(node, ast.Attribute) and node.attr in _DUNDER_DENIES:
                 return {"error": f"Python mock: access to '{node.attr}' is not allowed"}
@@ -927,12 +960,18 @@ class EvaluationEngine:
                 if node.func.id in ('exec', 'eval', 'compile', '__import__'):
                     return {"error": f"Python mock: {node.func.id}() is not allowed"}
 
+        import datetime as _dt
+        # Pre-warm _strptime lazy import so datetime.strptime works under {'__builtins__': {}}
+        _dt.datetime.strptime('2000-01-01', '%Y-%m-%d')
         namespace = {
             'args': args,
             'math': math,
             'json': json,
             're': __import__('re'),
             'result': None,
+            # Date/time types for mock calculations (e.g., check_price)
+            'datetime': _dt.datetime,
+            'timedelta': _dt.timedelta,
             # Safe builtins that mock code commonly needs
             'sum': sum, 'len': len, 'int': int, 'str': str,
             'list': list, 'dict': dict, 'tuple': tuple, 'set': set,
@@ -943,7 +982,7 @@ class EvaluationEngine:
             'isinstance': isinstance, 'True': True, 'False': False, 'None': None,
         }
         try:
-            exec(py_code, {'__builtins__': {}}, namespace)
+            exec(py_code, {'__builtins__': {'__import__': __import__}}, namespace)
             result = namespace.get('result')
             if result is None:
                 return {"error": "mock did not set result"}
@@ -952,15 +991,52 @@ class EvaluationEngine:
             self._log(f'[PY-MOCK] Exception: {str(e)}')
             return {"error": f"Python mock failed: {str(e)}"}
 
+    # Pool of names for the {{random_name}} placeholder (see _apply_placeholders)
+    _RANDOM_NAMES = [
+        "Andini", "Bagas", "Citra", "Damar", "Elang", "Fitri", "Gilang", "Hana",
+        "Intan", "Joko", "Kirana", "Lestari", "Mahesa", "Nadia", "Oka", "Prita",
+        "Rangga", "Sari", "Tegar", "Wulan",
+    ]
+
+    def _substitute_placeholders(self, obj: Any, mapping: Dict[str, str]) -> Any:
+        """Recursively replace placeholder tokens in every string within obj."""
+        if isinstance(obj, str):
+            for token, value in mapping.items():
+                obj = obj.replace(token, value)
+            return obj
+        if isinstance(obj, dict):
+            return {k: self._substitute_placeholders(v, mapping) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._substitute_placeholders(v, mapping) for v in obj]
+        return obj
+
+    def _apply_placeholders(self, test: Dict[str, Any]) -> None:
+        """Substitute dynamic placeholders (e.g. {{random_name}}) across the test in place.
+
+        A single random value is chosen per test run and applied consistently to the
+        prompt, system_prompt and expected — so a randomly-assigned identity can still be
+        verified. Mutates `test` in place (it is a fresh dict from test_manager.list_tests).
+        """
+        import random
+        if "{{random_name}}" not in json.dumps(test, ensure_ascii=False):
+            return
+        mapping = {"{{random_name}}": random.choice(self._RANDOM_NAMES)}
+        for key in ("prompt", "system_prompt", "expected"):
+            if key in test and test[key] is not None:
+                test[key] = self._substitute_placeholders(test[key], mapping)
+        self._log(f'[PLACEHOLDER] random_name -> {mapping["{{random_name}}"]}')
+
     def _run_single_configurable_test(self, test: Dict[str, Any], domain: str,
                                        level: int, model_name: str, run_id: int, run_llm_client=None) -> TestResult:
         """Run a single configurable test"""
         _client = run_llm_client or llm_client
         test_id = test['id']
+        # Resolve dynamic placeholders (e.g. {{random_name}}) before reading fields
+        self._apply_placeholders(test)
         prompt = test['prompt']
         expected = test.get('expected', {})
         weight = test.get('weight', 1.0)
-        
+
         # Initialize variables for tool calling
         loop_result = None
         tools = None
@@ -1117,7 +1193,7 @@ class EvaluationEngine:
         evaluator_config = test_loader.get_evaluator(evaluator_id) if evaluator_id else None
         
         if evaluator_config and evaluator_config.type in ('custom', 'regex', 'hybrid'):
-            custom_eval = CustomEvaluator(evaluator_config.to_dict())
+            custom_eval = CustomEvaluator(evaluator_config.to_dict(), llm_client_override=self.evaluation_llm_client)
             self._log(f'[EVAL] Using custom evaluator: {evaluator_config.name} (type: {evaluator_config.type})')
             result = custom_eval.evaluate(response_content, expected, level)
         elif evaluator_id:
@@ -1269,6 +1345,9 @@ class EvaluationEngine:
                 capture_output=True, text=True, timeout=5
             )
             output = result.stdout.strip()
+            if not output:
+                stderr_info = (result.stderr or "").strip()[:500]
+                return {"error": "JS script produced no output", "stderr": stderr_info}
             return json.loads(output)
         except subprocess.TimeoutExpired:
             return {"error": "timed out"}
@@ -1744,7 +1823,13 @@ class EvaluationEngine:
             )})
 
             try:
-                force_response = _client.chat_completion(force_messages, tools=None, temperature=0.0)
+                # temperature 0.2 (not 0.0): pure greedy decoding loops on this prompt —
+                # a large repetitive context of research results — and without a
+                # max_tokens cap it runs to self.max_tokens doubled by thinking mode
+                # (observed: 40960-token runaways pinning the GPU for ~10 minutes).
+                force_response = _client.chat_completion(
+                    force_messages, tools=None, temperature=0.2, max_tokens=4096
+                )
                 force_info = _client.extract_content_with_thinking(force_response)
                 final_response = force_info.get("content", "").strip()
                 force_duration = force_response.get("duration_ms", 0)
@@ -1932,15 +2017,31 @@ class EvaluationEngine:
 
         test_results = db.get_test_results(run_id)
 
+        # Get run info early so we can scope the matrix to the domains
+        # that were actually selected for this run.
+        run_info = db.get_evaluation_run(run_id)
+
+        # Parse the run's selected domains (None/empty means all domains)
+        selected_domains = None
+        if run_info and run_info.get('selected_domains'):
+            try:
+                selected_domains = json.loads(run_info['selected_domains'])
+            except (json.JSONDecodeError, TypeError):
+                selected_domains = None
+
         # Organize by domain and level
         matrix = {}
-        
+
         # Get domains from test definitions or use legacy
         if self.use_configurable_tests:
             domains = [d['id'] for d in test_manager.list_domains()]
         else:
-            domains = ["conversation", "math", "sql", "tool_calling", "reasoning"]
-        
+            domains = ["conversation", "math", "tool_calling", "reasoning"]
+
+        # Only display domains that were selected for this run
+        if selected_domains:
+            domains = [d for d in domains if d in selected_domains]
+
         for domain in domains:
             matrix[domain] = {}
             for level in range(1, 6):
@@ -1971,8 +2072,7 @@ class EvaluationEngine:
                     "model_name": result.get("model_name")
                 }
 
-        # Get run info for model name
-        run_info = db.get_evaluation_run(run_id)
+        # Get model name from the run info fetched earlier
         model_name = run_info.get("model_name") if run_info else None
         
         # Determine status

@@ -7,330 +7,347 @@ $(function() {
 function loadDashboard() {
     $.getJSON('/api/dashboard/data', function(data) {
         renderStats(data.stats);
-        renderFeatureCards(data.skill_stats, data.plugin_stats, data.schedule_stats, data.stats, data.plugin_cards);
+        renderSecondaryStats(data.skill_stats, data.plugin_stats, data.schedule_stats);
         renderAgents(data.recent_agents);
+        renderScheduledTasks(data.schedules);
         renderLeaderboard(data.leaderboard);
         renderRecentRuns(data.recent_runs);
         renderModelUsage(data.model_usage);
         renderPluginCards(data.plugin_cards);
-        // Remove skeleton shimmer animation after data is loaded
-        $('.skeleton-value').removeClass('skeleton-value');
+        renderAttention(data.attention);
     }).fail(function() {
-        // Hide all empty/loading placeholders and show error
-        $('#agent-empty, #leaderboard-empty, #recent-runs-empty, #model-usage-empty').html('<p class="text-red-500 dark:text-red-400">Failed to load data. Please try refreshing the page.</p>');
+        $('#agent-empty, #schedules-empty, #leaderboard-empty, #recent-runs-empty, #model-usage-empty')
+            .html('<p class="p-6 text-sm text-red-500 dark:text-red-400">Failed to load data. Please try refreshing the page.</p>');
     });
 }
 
+function emptyState(message) {
+    return '<div class="p-8 text-center text-sm text-gray-400 dark:text-gray-500">' + message + '</div>';
+}
+
+function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+}
+
+function truncate(s, n) {
+    s = String(s == null ? '' : s);
+    return s.length > n ? s.substring(0, n) + '…' : s;
+}
+
+function scorePillClass(score) {
+    return score >= 80 ? 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300' :
+           score >= 60 ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300' :
+                         'bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300';
+}
+
+// ── Hero + compact strip stats ────────────────────────────────────────────────
 function renderStats(stats) {
     $('#stat-agent-count').text(stats.agent_count);
+    $('#stat-session-count').text(stats.session_count);
+    $('#stat-tool-count').text(stats.tool_count);
     $('#stat-active-channel-count').text(stats.active_channel_count);
     $('#stat-channel-count').text(stats.channel_count);
-    $('#stat-session-count').text(stats.session_count);
-    $('#stat-eval-run-count').text(stats.eval_run_count);
-    if (stats.latest_eval_score !== null && stats.latest_eval_score !== undefined) {
-        $('#stat-latest-eval-score').text('Latest: ' + stats.latest_eval_score + '%');
-    } else {
-        $('#stat-latest-eval-score').text('No evaluations yet');
-    }
+    $('#stat-channel-sub').text(stats.channel_count === 0 ? 'none connected yet' : '\u00a0');
 }
 
-function renderFeatureCards(skillStats, pluginStats, scheduleStats, stats, pluginCards) {
-    // Skills
+function renderSecondaryStats(skillStats, pluginStats, scheduleStats) {
     $('#stat-skill-enabled').text(skillStats.enabled);
     $('#stat-skill-total').text(skillStats.total);
-    var skillsetWord = skillStats.skillset_count === 1 ? 'skillset' : 'skillsets';
-    $('#stat-skill-skillsets').text(skillStats.skillset_count + ' ' + skillsetWord);
-
-    // Plugins
+    var setWord = skillStats.skillset_count === 1 ? 'skillset' : 'skillsets';
+    $('#stat-skill-skillsets').text(skillStats.skillset_count + ' ' + setWord);
     $('#stat-plugin-enabled').text(pluginStats.enabled);
     $('#stat-plugin-total').text(pluginStats.total);
-
-    // Tools
-    $('#stat-tool-count').text(stats.tool_count);
-
-    // Scheduler
     $('#stat-schedule-active').text(scheduleStats.active);
     $('#stat-schedule-total').text(scheduleStats.total);
-
-    // Plugin feature cards (Row 2 stat cards from plugins)
-    renderPluginFeatureCards(pluginCards);
+    $('#stat-schedule-sub').text(scheduleStats.total > scheduleStats.active ? (scheduleStats.total - scheduleStats.active) + ' paused' : '\u00a0');
 }
 
-function renderPluginFeatureCards(pluginCards) {
-    var $container = $('#plugin-feature-cards');
-    $container.empty();
-    if (!pluginCards || pluginCards.length === 0) {
-        return;
-    }
-    for (var i = 0; i < pluginCards.length; i++) {
-        var card = pluginCards[i];
-        if (!card.feature_card) {
-            continue;
-        }
-        var fc = card.feature_card;
-        var html = '<a href="' + (card.link || '#') + '" class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-5 hover:shadow-md hover:border-' + (fc.border_color || 'rose') + '-300 transition-all no-underline">';
-        html += '  <div class="flex items-center gap-3 mb-2">';
-        html += '    <div class="w-10 h-10 rounded-full bg-' + (fc.bg_color || 'rose') + '-100 dark:bg-' + (fc.bg_color || 'rose') + '-900/40 flex items-center justify-center flex-shrink-0">';
-        html += '      <svg class="w-5 h-5 text-' + (fc.icon_color || 'rose') + '-600 dark:text-' + (fc.icon_color || 'rose') + '-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>';
-        html += '    </div>';
-        html += '    <div>';
-        html += '      <div class="text-2xl font-bold text-gray-800 dark:text-gray-100">' + (fc.count || 0) + '</div>';
-        html += '      <div class="text-xs text-gray-500 dark:text-gray-400">' + (fc.detail || '') + '</div>';
-        html += '    </div>';
-        html += '  </div>';
-        html += '</a>';
-        $container.append(html);
-    }
-}
-
+// ── Agents ────────────────────────────────────────────────────────────────────
 function renderAgents(agents) {
-    var $container = $('#agent-list');
-    var $empty = $('#agent-empty');
-
+    var $list = $('#agent-list'), $empty = $('#agent-empty');
     if (!agents || agents.length === 0) {
-        $container.hide();
-        $empty.show();
+        $list.hide();
+        $empty.html(emptyState('No agents yet')).show();
         return;
     }
-
     $empty.hide();
-    $container.show();
+    $list.show();
 
     var html = '';
     for (var i = 0; i < agents.length; i++) {
         var a = agents[i];
         var name = a.name || a.id;
         var initial = name.charAt(0).toUpperCase();
-        var desc = a.description || 'No description';
-        if (desc.length > 50) {
-            desc = desc.substring(0, 50) + '...';
-        }
-        var modelBadge = a.model ? '<span class="text-xs bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 px-2 py-0.5 rounded font-mono hidden sm:inline">' + a.model.substring(0, 20) + '</span>' : '';
+        var desc = truncate(a.description || 'No description', 48);
+        var avatar = a.avatar_path
+            ? '<img src="/api/agents/' + a.id + '/avatar?size=small" class="w-9 h-9 rounded-full object-cover flex-shrink-0" alt="">'
+            : '<div class="w-9 h-9 rounded-full bg-indigo-100 dark:bg-indigo-500/20 grid place-items-center flex-shrink-0 text-xs font-bold text-indigo-600 dark:text-indigo-300">' + escapeHtml(initial) + '</div>';
+        var modelBadge = a.model_id
+            ? '<span class="dash-chip hidden md:inline-block" title="' + escapeHtml(a.model_id) + '">' + escapeHtml(truncate(a.model_id, 26)) + '</span>'
+            : '';
+        var off = (a.enabled === 0 || a.enabled === false) ? ' <span class="dash-off">off</span>' : '';
+        var chans = a.channel_count > 0 ? '<span title="Channels">' + a.channel_count + (a.channel_count === 1 ? ' channel' : ' channels') + '</span>' : '';
 
-        html += '<a href="/agents/' + a.id + '" class="flex items-center justify-between p-4 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors no-underline text-inherit">\n';
-        html += '    <div class="flex items-center gap-3 min-w-0">\n';
-        var avatarHtml = a.avatar_path
-            ? '<img src="/api/agents/' + a.id + '/avatar?size=small" class="w-8 h-8 rounded-full object-cover flex-shrink-0" alt="">'
-            : '<div class="w-8 h-8 rounded-full bg-indigo-100 dark:bg-indigo-900/40 flex items-center justify-center flex-shrink-0 text-xs font-bold text-indigo-600 dark:text-indigo-400">' + initial + '</div>';
-        html += '        ' + avatarHtml + '\n';
-        html += '        <div class="min-w-0">\n';
-        html += '            <div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">' + name + '</div>\n';
-        html += '            <div class="text-xs text-gray-400 dark:text-gray-500">' + desc + '</div>\n';
-        html += '        </div>\n';
-        html += '    </div>\n';
-        html += '    <div class="flex items-center gap-3 flex-shrink-0 ml-3">\n';
-        html += modelBadge;
-        html += '        <div class="flex gap-2 text-xs text-gray-400 dark:text-gray-500">\n';
-        html += '            <span title="Tools">' + a.tool_count + ' tools</span>\n';
-        html += '            <span title="Channels">' + a.channel_count + ' ch</span>\n';
-        html += '        </div>\n';
-        html += '    </div>\n';
-        html += '</a>';
+        html += '<a href="/agents/' + encodeURIComponent(a.id) + '" class="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors no-underline text-inherit">'
+              +   '<div class="flex items-center gap-3 min-w-0">' + avatar
+              +     '<div class="min-w-0">'
+              +       '<div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">' + escapeHtml(name) + off + '</div>'
+              +       '<div class="text-xs text-gray-400 dark:text-gray-500 truncate">' + escapeHtml(desc) + '</div>'
+              +     '</div>'
+              +   '</div>'
+              +   '<div class="flex items-center gap-3 flex-shrink-0 ml-3">' + modelBadge
+              +     '<div class="dash-meta"><span title="Tools">' + a.tool_count + (a.tool_count === 1 ? ' tool' : ' tools') + '</span>' + chans + '</div>'
+              +   '</div>'
+              + '</a>';
     }
-
-    $container.html(html);
+    $list.html(html);
 }
 
-function renderLeaderboard(leaderboard) {
-    var $container = $('#leaderboard-list');
-    var $empty = $('#leaderboard-empty');
-
-    if (!leaderboard || leaderboard.length === 0) {
-        $container.hide();
-        $empty.show();
+// ── Scheduled Tasks (replaces Todo Tasks) ─────────────────────────────────────
+function renderScheduledTasks(schedules) {
+    var $list = $('#schedules-list'), $empty = $('#schedules-empty');
+    if (!schedules || schedules.length === 0) {
+        $list.hide();
+        $empty.html(emptyState('No scheduled tasks')).show();
         return;
     }
-
     $empty.hide();
-    $container.show();
+    $list.show();
+
+    var html = '';
+    for (var i = 0; i < schedules.length; i++) {
+        var s = schedules[i];
+        var active = !!s.enabled;
+        var pill = active
+            ? '<span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300">Active</span>'
+            : '<span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 dark:bg-gray-700/60 dark:text-gray-400">Paused</span>';
+        var meta = [];
+        if (s.trigger_type) meta.push(escapeHtml(s.trigger_type));
+        var next = formatNext(s.next_run_at);
+        if (next) meta.push(next.late ? 'overdue ' + next.text.replace(' ago', '') : 'next ' + next.text);
+        var dotColor = active ? 'bg-green-400 dark:bg-green-500' : 'bg-gray-300 dark:bg-gray-600';
+
+        html += '<a href="/scheduler" class="flex items-start gap-3 px-5 py-3 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors no-underline text-inherit">'
+              +   '<span class="w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ' + dotColor + '"></span>'
+              +   '<div class="min-w-0 flex-1">'
+              +     '<div class="flex items-center gap-2">'
+              +       '<span class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">' + escapeHtml(s.name || 'Untitled') + '</span>' + pill
+              +     '</div>'
+              +     (meta.length ? '<div class="text-xs text-gray-400 dark:text-gray-500 mt-0.5 truncate">' + meta.join(' · ') + '</div>' : '')
+              +   '</div>'
+              + '</a>';
+    }
+    $list.html(html);
+}
+
+// "in 3 h", "in 2 days", "overdue 12 min": relative to now, so the list answers "when does this run?" at a glance
+function toEpochMs(v) {
+    if (v == null || v === '') return null;
+    var d = new Date(typeof v === 'number' ? v * 1000 : v);
+    return isNaN(d.getTime()) ? null : d.getTime();
+}
+function formatNext(v, nowMs) {
+    var t = toEpochMs(v);
+    if (t === null) return null;
+    var diff = t - (nowMs == null ? Date.now() : nowMs), late = diff < 0, m = Math.round(Math.abs(diff) / 60000), text;
+    if (m < 1) text = late ? 'just now' : 'in <1 min';
+    else if (m < 60) text = (late ? '' : 'in ') + m + ' min';
+    else if (m < 48 * 60) { var h = Math.round(m / 60); text = (late ? '' : 'in ') + h + ' h'; }
+    else { var dd = Math.round(m / 1440); text = (late ? '' : 'in ') + dd + ' days'; }
+    if (late && text !== 'just now') text += ' ago';
+    return { text: text, late: late && m >= 15 };
+}
+
+function formatDate(v) {
+    if (!v) return '';
+    try {
+        var d = new Date(typeof v === 'number' ? v * 1000 : v);
+        if (isNaN(d.getTime())) return '';
+        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    } catch (e) { return ''; }
+}
+
+// ── Model Leaderboard ─────────────────────────────────────────────────────────
+function renderLeaderboard(leaderboard) {
+    var $list = $('#leaderboard-list'), $empty = $('#leaderboard-empty');
+    if (!leaderboard || leaderboard.length === 0) {
+        $list.hide();
+        $empty.html(emptyState('No model scores yet')).show();
+        return;
+    }
+    $empty.hide();
+    $list.show();
 
     var html = '';
     for (var i = 0; i < leaderboard.length; i++) {
-        var m = leaderboard[i];
-        var idx = i + 1;
-        var medalClass = idx === 1 ? 'bg-yellow-100 text-yellow-700' :
-                         idx === 2 ? 'bg-gray-200 text-gray-600' :
-                         idx === 3 ? 'bg-amber-100 text-amber-700' :
-                         'bg-gray-100 text-gray-500';
+        var m = leaderboard[i], idx = i + 1;
+        var medal = idx === 1 ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-500/20 dark:text-yellow-300' :
+                    idx === 2 ? 'bg-gray-200 text-gray-600 dark:bg-gray-600/40 dark:text-gray-300' :
+                    idx === 3 ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300' :
+                                'bg-gray-100 text-gray-500 dark:bg-gray-700/50 dark:text-gray-400';
         var score = m.best_score * 100;
-        var scoreClass = score >= 80 ? 'bg-green-100 text-green-700' :
-                         score >= 60 ? 'bg-amber-100 text-amber-700' :
-                         'bg-red-100 text-red-700';
-        var modelName = m.model_name;
-        if (modelName.length > 25) modelName = modelName.substring(0, 25) + '...';
         var runWord = m.run_count === 1 ? 'run' : 'runs';
         var href = m.best_run_id ? '/history/' + m.best_run_id : '/history';
 
-        html += '<a href="' + href + '" class="flex items-center justify-between p-4 no-underline hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer">\n';
-        html += '    <div class="flex items-center gap-3 min-w-0">\n';
-        html += '        <div class="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold ' + medalClass + '">#' + idx + '</div>\n';
-        html += '        <div class="min-w-0">\n';
-        html += '            <div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate" title="' + m.model_name + '">' + modelName + '</div>\n';
-        html += '            <div class="text-xs text-gray-400 dark:text-gray-500">' + m.run_count + ' ' + runWord + '</div>\n';
-        html += '        </div>\n';
-        html += '    </div>\n';
-        html += '    <span class="text-xs font-semibold px-2.5 py-1 rounded-full flex-shrink-0 ' + scoreClass + '">' + score.toFixed(1) + '%</span>\n';
-        html += '</a>';
+        html += '<a href="' + href + '" class="flex items-center justify-between px-5 py-3.5 no-underline hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">'
+              +   '<div class="flex items-center gap-3 min-w-0">'
+              +     '<div class="w-7 h-7 rounded-full grid place-items-center flex-shrink-0 text-xs font-bold ' + medal + '">' + idx + '</div>'
+              +     '<div class="min-w-0">'
+              +       '<div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate" title="' + escapeHtml(m.model_name) + '">' + escapeHtml(truncate(m.model_name, 24)) + '</div>'
+              +       '<div class="text-xs text-gray-400 dark:text-gray-500">' + m.run_count + ' ' + runWord + '</div>'
+              +     '</div>'
+              +   '</div>'
+              +   '<span class="text-xs font-semibold px-2.5 py-1 rounded-full flex-shrink-0 ' + scorePillClass(score) + '">' + score.toFixed(0) + '%</span>'
+              + '</a>';
     }
-
-    $container.html(html);
+    $list.html(html);
 }
 
+// ── Recent Evaluations ────────────────────────────────────────────────────────
 function renderRecentRuns(runs) {
-    var $container = $('#recent-runs-list');
-    var $empty = $('#recent-runs-empty');
-
+    var $list = $('#recent-runs-list'), $empty = $('#recent-runs-empty');
     if (!runs || runs.length === 0) {
-        $container.hide();
-        $empty.show();
+        $list.hide();
+        $empty.html(emptyState('No evaluation runs yet')).show();
         return;
     }
-
     $empty.hide();
-    $container.show();
+    $list.show();
 
     var html = '';
     for (var i = 0; i < runs.length; i++) {
         var r = runs[i];
         var modelName = r.model_name || 'Unknown model';
-        var runIdStr = String(r.run_id);
-
-        var scoreHtml = '';
+        var scoreHtml;
         if (r.overall_score !== null && r.overall_score !== undefined) {
             var score = r.overall_score * 100;
-            var scoreClass = score >= 80 ? 'bg-green-100 text-green-700' :
-                             score >= 60 ? 'bg-amber-100 text-amber-700' :
-                             'bg-red-100 text-red-700';
-            scoreHtml = '<span class="text-xs font-semibold px-2.5 py-1 rounded-full ' + scoreClass + '">' + score.toFixed(1) + '%</span>';
+            scoreHtml = '<span class="text-xs font-semibold px-2.5 py-1 rounded-full ' + scorePillClass(score) + '">' + score.toFixed(0) + '%</span>';
         } else {
-            scoreHtml = '<span class="text-xs bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 px-2.5 py-1 rounded-full">--</span>';
+            scoreHtml = '<span class="text-xs bg-gray-100 dark:bg-gray-700/60 text-gray-500 dark:text-gray-400 px-2.5 py-1 rounded-full">--</span>';
         }
 
-        html += '<a href="/history/' + r.run_id + '" class="flex items-center justify-between p-4 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors no-underline text-inherit">\n';
-        html += '    <div class="min-w-0">\n';
-        html += '        <div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate" title="' + r.model_name + '">' + modelName + '</div>\n';
-        html += '        <div class="text-xs text-gray-400 dark:text-gray-500"><span class="font-mono">#' + runIdStr + '</span> · ' + r.passed_count + '/' + r.test_count + ' passed</div>\n';
-        html += '    </div>\n';
-        html += '    <div class="flex items-center gap-2 flex-shrink-0 ml-3">\n';
-        html += scoreHtml;
-        html += '    </div>\n';
-        html += '</a>';
+        html += '<a href="/history/' + encodeURIComponent(r.run_id) + '" class="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors no-underline text-inherit">'
+              +   '<div class="min-w-0 mr-3">'
+              +     '<div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate" title="' + escapeHtml(modelName) + '">' + escapeHtml(truncate(modelName, 24)) + '</div>'
+              +     '<div class="text-xs text-gray-400 dark:text-gray-500"><span class="font-mono">#' + escapeHtml(String(r.run_id)) + '</span> · ' + r.passed_count + '/' + r.test_count + ' passed</div>'
+              +   '</div>' + scoreHtml
+              + '</a>';
     }
-
-    $container.html(html);
+    $list.html(html);
 }
 
+// ── Model Distribution ────────────────────────────────────────────────────────
 function renderModelUsage(modelUsage) {
-    var $container = $('#model-usage-list');
-    var $empty = $('#model-usage-empty');
-
+    var $list = $('#model-usage-list'), $empty = $('#model-usage-empty');
     if (!modelUsage || modelUsage.length === 0) {
-        $container.hide();
-        $empty.show();
+        $list.hide();
+        $empty.html(emptyState('No model usage data yet')).show();
         return;
     }
-
     $empty.hide();
-    $container.show();
+    $list.show();
 
-    var maxCount = modelUsage[0].agent_count;
+    var total = modelUsage.reduce(function (n, m) { return n + (m.agent_count || 0); }, 0) || 1;
     var html = '';
-
     for (var i = 0; i < modelUsage.length; i++) {
         var item = modelUsage[i];
-        var model = item.model;
-        if (model.length > 30) model = model.substring(0, 30) + '...';
-        var agentWord = item.agent_count === 1 ? 'agent' : 'agents';
-        var pct = Math.round(item.agent_count / maxCount * 100);
-
-        html += '<div>\n';
-        html += '    <div class="flex justify-between items-center mb-1">\n';
-        html += '        <span class="text-sm text-gray-700 dark:text-gray-300 font-medium truncate" title="' + item.model + '">' + model + '</span>\n';
-        html += '        <span class="text-xs text-gray-400 dark:text-gray-500 flex-shrink-0 ml-2">' + item.agent_count + ' ' + agentWord + '</span>\n';
-        html += '    </div>\n';
-        html += '    <div class="w-full bg-gray-100 dark:bg-gray-700 rounded-full h-2">\n';
-        html += '        <div class="bg-indigo-500 h-2 rounded-full" style="width: ' + pct + '%"></div>\n';
-        html += '    </div>\n';
-        html += '</div>';
+        var share = item.agent_count / total * 100;
+        var pct = Math.max(4, Math.round(share));
+        html += '<div>'
+              +   '<div class="flex justify-between items-center mb-1.5 gap-2">'
+              +     '<span class="text-sm text-gray-700 dark:text-gray-300 font-medium truncate" title="' + escapeHtml(item.model) + '">' + escapeHtml(truncate(item.model, 28)) + '</span>'
+              +     '<span class="dash-share">' + item.agent_count + (item.agent_count === 1 ? ' agent' : ' agents') + ' \u00b7 ' + Math.round(share) + '%</span>'
+              +   '</div>'
+              +   '<div class="w-full bg-gray-100 dark:bg-gray-700/60 rounded-full h-2">'
+              +     '<div class="bg-indigo-500 dark:bg-indigo-400 h-2 rounded-full" style="width:' + pct + '%"></div>'
+              +   '</div>'
+              + '</div>';
     }
-
-    $container.html(html);
+    $list.html(html);
 }
 
+// ── Plugin cards (right column; reflows main grid when present) ────────────────
 function renderPluginCards(pluginCards) {
     var $container = $('#plugin-cards-container');
     $container.empty();
-
     if (!pluginCards || pluginCards.length === 0) {
+        $container.hide();
         return;
     }
 
-    var $quickActions = $('#quick-actions-card');
-    var hasVisibleCards = false;
-
+    var html = '';
     for (var i = 0; i < pluginCards.length; i++) {
         var card = pluginCards[i];
         var items = card.items || [];
-
-        var cardHtml = '<div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">';
-        cardHtml += '  <div class="p-5 border-b border-gray-100 dark:border-gray-700 flex justify-between items-center">';
-        cardHtml += '    <h3 class="text-base font-semibold text-gray-800 dark:text-gray-100 m-0">' + (card.title || 'Plugin Card') + '</h3>';
-        if (card.link) {
-            cardHtml += '    <a href="' + card.link + '" class="text-xs text-indigo-600 dark:text-indigo-400 hover:underline">View all</a>';
+        var fc = card.feature_card;
+        html += '<div class="dash-card">'
+              +   '<div class="flex justify-between items-center dash-card-h">'
+              +     '<h3 class="text-base font-semibold text-gray-800 dark:text-gray-100 m-0">' + escapeHtml(card.title || 'Plugin Card') + '</h3>'
+              +     (card.link ? '<a href="' + escapeHtml(card.link) + '" class="text-xs text-indigo-600 dark:text-indigo-400 hover:underline no-underline">View all</a>' : '')
+              +   '</div>';
+        if (fc) {
+            html += '<div class="dash-feature"><div class="dash-feature-v">' + escapeHtml(fc.count) + '</div>'
+                  + (fc.detail ? '<div class="dash-feature-d">' + escapeHtml(fc.detail) + '</div>' : '')
+                  + sparkline(fc.series) + '</div>';
         }
-        cardHtml += '  </div>';
-
-        hasVisibleCards = true;
         if (items.length === 0) {
-            // Empty state
-            cardHtml += '  <div class="p-8 text-center text-gray-400 dark:text-gray-500 text-sm">';
-            cardHtml += '    <svg class="w-8 h-8 mx-auto mb-2 text-gray-300 dark:text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>';
-            cardHtml += '    <p>No items</p>';
-            cardHtml += '  </div>';
+            if (!fc) html += emptyState('No items');
         } else {
-            cardHtml += '  <div class="divide-y divide-gray-50 dark:divide-gray-700">';
-
+            html += '<div class="divide-y divide-gray-100 dark:divide-gray-700/50' + (fc ? ' border-t border-gray-100 dark:border-gray-700/50' : '') + '">';
             var maxShow = Math.min(items.length, 5);
             for (var j = 0; j < maxShow; j++) {
-                var item = items[j];
-                var title = item.title || 'Untitled';
-                var desc = item.description || '';
-                if (desc.length > 60) {
-                    desc = desc.substring(0, 60) + '...';
-                }
-                var created = '';
-                if (item.created_at) {
-                    try {
-                        var d = new Date(item.created_at);
-                        created = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                    } catch(e) {}
-                }
-
-                cardHtml += '    <a href="' + (card.link || '#') + '" class="block p-4 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors no-underline text-inherit">';
-                cardHtml += '      <div class="flex items-start gap-3">';
-                cardHtml += '        <div class="w-2 h-2 rounded-full bg-amber-400 dark:bg-amber-500 mt-2 flex-shrink-0"></div>';
-                cardHtml += '        <div class="min-w-0">';
-                cardHtml += '          <div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">' + title + '</div>';
-                if (desc) {
-                    cardHtml += '          <div class="text-xs text-gray-400 dark:text-gray-500 mt-0.5">' + desc + '</div>';
-                }
-                if (created) {
-                    cardHtml += '          <div class="text-xs text-gray-400 dark:text-gray-500 mt-1">Created ' + created + '</div>';
-                }
-                cardHtml += '        </div>';
-                cardHtml += '      </div>';
-                cardHtml += '    </a>';
+                var it = items[j];
+                var desc = it.description ? truncate(it.description, 60) : '';
+                var created = formatDate(it.created_at);
+                html += '<a href="' + escapeHtml(card.link || '#') + '" class="block px-5 py-3.5 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors no-underline text-inherit">'
+                      +   '<div class="flex items-start gap-3">'
+                      +     '<span class="w-2 h-2 rounded-full bg-amber-400 dark:bg-amber-500 mt-1.5 flex-shrink-0"></span>'
+                      +     '<div class="min-w-0">'
+                      +       '<div class="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">' + escapeHtml(it.title || 'Untitled') + '</div>'
+                      +       (desc ? '<div class="text-xs text-gray-400 dark:text-gray-500 mt-0.5">' + escapeHtml(desc) + '</div>' : '')
+                      +       (created ? '<div class="text-xs text-gray-400 dark:text-gray-500 mt-1">Created ' + created + '</div>' : '')
+                      +     '</div>'
+                      +   '</div>'
+                      + '</a>';
             }
-
-            cardHtml += '  </div>';
+            html += '</div>';
         }
-
-        cardHtml += '</div>';
-        $container.append(cardHtml);
+        html += '</div>';
     }
+    $container.html(html).show();
 
-    // Adjust quick actions column span based on whether plugin cards are visible
-    if (hasVisibleCards) {
-        $quickActions.removeClass('lg:col-span-2').addClass('lg:col-span-1');
+    // Reflow: make room for the 3-col plugin column (default is 7 / 5 / hidden).
+    $('#agents-card').removeClass('lg:col-span-7').addClass('lg:col-span-5');
+    $('#middle-col').removeClass('lg:col-span-5').addClass('lg:col-span-4');
+}
+
+// ── Sparkline: one bar per bucket (24 hourly buckets for token usage) ─────────
+function sparkline(series) {
+    if (!series || !series.length || !series.some(function (v) { return v > 0; })) return '';
+    var max = Math.max.apply(null, series), n = series.length, w = 100 / n, bars = '';
+    for (var i = 0; i < n; i++) {
+        var h = Math.max(v2h(series[i], max), series[i] > 0 ? 6 : 2);
+        bars += '<rect class="bar' + (i === n - 1 ? ' is-last' : '') + '" x="' + (i * w + w * 0.12).toFixed(2) + '" y="' + (40 - h * 0.4).toFixed(2) + '" width="' + (w * 0.76).toFixed(2) + '" height="' + (h * 0.4).toFixed(2) + '" rx="1.2"/>';
     }
+    return '<svg class="dash-spark" viewBox="0 0 100 40" preserveAspectRatio="none" role="img" aria-label="Last 24 hours">' + bars + '</svg>'
+         + '<div class="dash-spark-axis"><span>24 h ago</span><span>now</span></div>';
+}
+function v2h(v, max) { return max > 0 ? v / max * 100 : 0; }
+
+// ── Needs attention ───────────────────────────────────────────────────────────
+function renderAttention(items) {
+    var $sec = $('#attention');
+    if (!items || !items.length) { $sec.addClass('hidden'); return; }
+    var tone = { danger: 'ag-alert-danger', warn: 'ag-alert-warn', info: 'ag-alert-info' };
+    var icon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>';
+    $('#attention-count').text(items.length);
+    $('#attention-list').html(items.map(function (it) {
+        return '<a href="' + escapeHtml(it.href || '#') + '" class="ag-alert ' + (tone[it.level] || tone.warn) + '">'
+             +   '<span class="ag-alert-ic">' + icon + '</span>'
+             +   '<div class="ag-alert-body"><p class="ag-alert-t">' + escapeHtml(it.title) + '</p>'
+             +   (it.detail ? '<p class="ag-alert-s">' + escapeHtml(it.detail) + '</p>' : '') + '</div></a>';
+    }).join(''));
+    $sec.removeClass('hidden');
 }

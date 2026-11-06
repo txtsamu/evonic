@@ -2,8 +2,9 @@
 
 Reads user-uploaded file attachments stored under data/attachments/<agent_id>/.
 Enforces per-agent isolation, reuses the existing read_file pagination core for
-text content, attempts PDF text extraction via pypdf when available, and falls
-back to a metadata block for opaque binary files.
+text content, converts documents (PDF and office formats) to Markdown via the
+optional anydoc converter (firecrawl-anydoc) when available, and falls back to
+a metadata block for opaque binary files.
 """
 
 import json
@@ -14,7 +15,15 @@ from backend.tools.read_file import read_file as _read_text_file
 
 
 _ATTACHMENTS_ROOT = os.path.join('data', 'attachments')
-_PDF_TEXT_CAP_BYTES = 100 * 1024  # 100 KB cap on extracted PDF text
+_DOC_TEXT_CAP_BYTES = 100 * 1024  # 100 KB cap on extracted document text
+
+# Document formats handled by the optional `anydoc` converter
+# (firecrawl-anydoc, imports as `anydoc`). When not installed these fall
+# back to the metadata block below.
+_ANYDOC_EXTS = frozenset({
+    '.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt',
+    '.odt', '.ods', '.odp', '.rtf', '.epub',
+})
 
 _TEXTISH_MIMES = {
     'application/json',
@@ -55,6 +64,12 @@ def _is_pdf(mime_type: Optional[str], path: str) -> bool:
     return path.lower().endswith('.pdf')
 
 
+def _is_anydoc(mime_type: Optional[str], path: str) -> bool:
+    """True for office/document formats handled by the optional anydoc converter."""
+    ext = os.path.splitext(path)[1].lower()
+    return ext in _ANYDOC_EXTS
+
+
 def _agent_root(agent_id: str) -> str:
     return os.path.realpath(os.path.join(_ATTACHMENTS_ROOT, agent_id))
 
@@ -69,7 +84,8 @@ def _path_within_agent(path: str, agent_id: str) -> bool:
     return real.startswith(root + os.sep)
 
 
-def _format_metadata(row: Optional[Dict[str, Any]], fallback_path: str) -> str:
+def _format_metadata(row: Optional[Dict[str, Any]], fallback_path: str,
+                     workplace_path: Optional[str] = None) -> str:
     """Return a JSON metadata block for binary attachments."""
     if row:
         meta = {
@@ -93,66 +109,49 @@ def _format_metadata(row: Optional[Dict[str, Any]], fallback_path: str) -> str:
             'created_at': None,
             'path': fallback_path,
         }
+    if workplace_path and workplace_path != meta.get('path'):
+        meta['workplace_path'] = workplace_path
     return (
         "[Attachment metadata — binary file, not directly readable as text]\n\n"
         + json.dumps(meta, indent=2)
     )
 
 
-def _read_pdf_text(path: str, offset: int) -> str:
-    """Extract text from a PDF using pypdf if available; paginate by line."""
+def _read_anydoc_text(path: str, offset: int) -> str:
+    """Convert a document (PDF or office format) to Markdown via anydoc; paginate by line.
+
+    anydoc is an optional dependency (firecrawl-anydoc, imports as `anydoc`).
+    When unavailable, or when conversion fails, fall back to a metadata block.
+    """
     try:
-        from pypdf import PdfReader  # type: ignore
+        import anydoc  # type: ignore
     except ImportError:
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = None
-        return (
-            "[PDF text extraction unavailable: install 'pypdf' to enable]\n\n"
-            + json.dumps({
-                'filename': os.path.basename(path),
-                'mime_type': 'application/pdf',
-                'size_bytes': size,
-                'path': path,
-            }, indent=2)
+        return _format_metadata(None, path, None) + (
+            "\n\n[Document text extraction unavailable: install 'firecrawl-anydoc' to enable]"
         )
 
     try:
-        reader = PdfReader(path)
-    except Exception as e:  # pragma: no cover - depends on file contents
-        return f"Error: Failed to open PDF: {e}"
+        with open(path, 'rb') as fh:
+            data = fh.read()
+        body = anydoc.to_markdown_bytes(data)
+    except Exception as e:
+        return _format_metadata(None, path, None) + f"\n\n[Document conversion failed: {e}]"
 
-    out_parts = []
-    total = 0
-    truncated = False
-    for i, page in enumerate(reader.pages):
-        try:
-            txt = page.extract_text() or ''
-        except Exception:
-            txt = ''
-        header = f"--- Page {i + 1} ---\n"
-        chunk = header + txt + "\n"
-        if total + len(chunk) > _PDF_TEXT_CAP_BYTES:
-            remaining = _PDF_TEXT_CAP_BYTES - total
-            if remaining > 0:
-                out_parts.append(chunk[:remaining])
-            truncated = True
-            break
-        out_parts.append(chunk)
-        total += len(chunk)
-
-    body = ''.join(out_parts)
-    if not body.strip():
+    if not body or not body.strip():
         return (
-            "[PDF contains no extractable text — it may be image-only or scanned. "
+            "[Document contains no extractable text — it may be image-only or scanned. "
             "Returning metadata instead.]\n\n"
             + json.dumps({
                 'filename': os.path.basename(path),
-                'mime_type': 'application/pdf',
+                'mime_type': None,
                 'path': path,
             }, indent=2)
         )
+
+    # Cap output size before rendering.
+    truncated = len(body) > _DOC_TEXT_CAP_BYTES
+    if truncated:
+        body = body[:_DOC_TEXT_CAP_BYTES]
 
     # Paginate by lines using read_file core for consistency. Write to a temp
     # buffer is unnecessary — render manually since content already in memory.
@@ -171,7 +170,7 @@ def _read_pdf_text(path: str, offset: int) -> str:
         chars += len(line_str) + 1
         end_idx = i + 1
     header_line = (
-        f"[PDF: {os.path.basename(path)} | {total_lines} extracted lines | "
+        f"[Document: {os.path.basename(path)} | {total_lines} extracted lines | "
         f"showing lines {start_idx + 1}-{end_idx}"
         + (" | text truncated at 100KB" if truncated else "")
         + "]"
@@ -214,12 +213,18 @@ def execute(agent, args: dict) -> dict:
             return {"error": "Invalid attachment_id — must be an integer."}
         row = db.get_attachment(attachment_id)
         if not row:
-            return {"error": "Attachment not found or expired."}
+            return {
+                "error": (
+                    f"Attachment ID {attachment_id} was not found. Use the numeric "
+                    "'Attachment ID' shown in the attachment metadata; do not use "
+                    "a session ID or a number inferred from the file path."
+                )
+            }
         if row['agent_id'] != agent_id and not agent.get('is_super'):
             return {"error": "Access denied — attachment belongs to a different agent."}
         resolved_path = row.get('file_path')
         if not resolved_path or not os.path.isfile(resolved_path):
-            return {"error": "Attachment file is missing on disk (it may have expired)."}
+            return {"error": "Attachment file is missing on disk. It may have been moved by save_artifact, manually deleted, or expired via retention cleanup."}
     elif raw_path:
         # Path-based access: resolve and enforce agent root prefix.
         target_agent_id = agent_id
@@ -240,14 +245,26 @@ def execute(agent, args: dict) -> dict:
     else:
         return {"error": "Provide either 'attachment_id' or 'path'."}
 
+    # If the agent operates in a remote workplace (SSH/tunnel/etc.), ensure the
+    # attachment file is available on the remote filesystem.  This is needed
+    # because _read_text_file routes through the execution backend when the
+    # agent has a workplace, and would otherwise fail to find the file.
+    try:
+        from backend.tools._ensure_workplace_file import ensure_workplace_file
+        workplace_path = ensure_workplace_file(resolved_path, agent)
+    except (ImportError, RuntimeError) as e:
+        return {"error": f"Failed to prepare attachment for workplace: {e}"}
+
     mime_type = (row or {}).get('mime_type')
 
-    # Dispatch
-    if _is_pdf(mime_type, resolved_path):
-        return {"result": _read_pdf_text(resolved_path, offset)}
+    # Dispatch — use the workplace path for operations that route through the
+    # execution backend, and the original host path for direct filesystem access.
+    assert resolved_path is not None  # guaranteed by the isfile checks above
+    if _is_anydoc(mime_type, resolved_path):
+        return {"result": _read_anydoc_text(resolved_path, offset)}
 
     if _is_textish(mime_type, resolved_path):
-        return {"result": _read_text_file(resolved_path, offset=offset)}
+        return {"result": _read_text_file(workplace_path, offset=offset)}
 
     # Binary fallback — metadata only.
-    return {"result": _format_metadata(row, resolved_path)}
+    return {"result": _format_metadata(row, resolved_path, workplace_path)}

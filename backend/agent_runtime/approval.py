@@ -25,6 +25,10 @@ class PendingApproval:
     created_at: float = field(default_factory=time.time)
     decision_event: threading.Event = field(default_factory=threading.Event)
     decision: Optional[str] = None  # 'approve' or 'reject'
+    # Who decided: 'user:web' | 'user:telegram' | 'user:whatsapp' | 'user:discord'
+    # | 'agent:<agent_id>' | 'timeout'.  Surfaced in the chat timeline so an
+    # automated decision is never mistaken for a human one.
+    resolved_by: Optional[str] = None
 
 
 class ApprovalRegistry:
@@ -54,19 +58,50 @@ class ApprovalRegistry:
             self._by_session[session_id] = approval_id
         return pa
 
-    def resolve(self, approval_id: str, decision: str) -> bool:
+    def resolve(self, approval_id: str, decision: str,
+                resolved_by: Optional[str] = None) -> bool:
         """Set the decision and signal the waiting loop thread. Returns False if not found."""
         with self._lock:
             pa = self._pending.get(approval_id)
             if pa is None or pa.decision is not None:
                 return False
             pa.decision = decision
+            pa.resolved_by = resolved_by
         pa.decision_event.set()
         return True
 
     def get(self, approval_id: str) -> Optional[PendingApproval]:
         with self._lock:
             return self._pending.get(approval_id)
+
+    def list_pending(self) -> list:
+        """Return all still-unresolved approvals as plain dicts.
+
+        This is the freshest source of truth for what is actively blocking an
+        agent right now (same registry the /chat/approve endpoint checks). Used
+        by the web UI's polling safety-net so the approval modal is delivered
+        even if the live SSE 'approval_required' event was lost in transit.
+        """
+        with self._lock:
+            items = list(self._pending.values())
+        out = []
+        for pa in items:
+            if pa.decision is not None:
+                continue  # already resolved, awaiting cleanup
+            sr = pa.safety_result or {}
+            out.append({
+                'approval_id': pa.approval_id,
+                'agent_id': pa.agent_id,
+                'session_id': pa.session_id,
+                'tool': pa.tool_name,
+                'args': pa.tool_args,
+                'approval_info': sr.get('approval_info', {}),
+                'reasons': sr.get('reasons', []),
+                'score': sr.get('score'),
+                'safety': sr.get('_safety') or {},
+                'created_at': pa.created_at,
+            })
+        return out
 
     def get_by_session(self, session_id: str) -> Optional[PendingApproval]:
         with self._lock:

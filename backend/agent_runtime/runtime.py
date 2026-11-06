@@ -16,6 +16,7 @@ import time
 import queue
 import threading
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from typing import Callable, Any, Dict, Generator, List, Optional, TypeVar
 T = TypeVar('T')
 
 from models.db import db
+from models.boolean import message_wrapper_enabled
 from models.chatlog import chatlog_manager
 from config import AGENT_TIMEOUT_RETRIES as MAX_TIMEOUT_RETRIES, AGENT_QUEUE_WORKERS
 
@@ -32,23 +34,155 @@ from backend.agent_runtime import llm_loop as _loop
 from backend.agent_runtime import summarizer as _sum
 from backend.agent_runtime.concurrency import ConcurrencyManager
 from backend.agent_state import AgentState
-from backend.agent_runtime.memory_manager import get_memories_for_context
 from backend.channels.registry import channel_manager
 from backend.channels.base import BaseChannel
 from backend.event_stream import event_stream
 from backend.plugin_manager import get_busy_message
-from backend.slash_commands import parse_command, execute_command
+from backend.slash_commands import parse_command, execute_command, COMMAND_SUPPRESSED
 from backend.agent_runtime.prefetch import TurnPrefetcher
+from backend.agent_runtime import simulation_spec as sim_spec
 import atexit
+import json
 import re
 from config import AGENT_MAX_TOOL_RESULT_CHARS as MAX_TOOL_RESULT_CHARS
 from config import STALE_SESSION_INJECTION_ENABLED, STALE_SESSION_THRESHOLD_SECONDS
-from config import LONG_GAP_WEEKS
+from config import LONG_GAP_WEEKS, BACKGROUND_JOBS_INJECTION_ENABLED
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _LOGS_DIR = os.path.join(_BASE_DIR, 'logs')
 
 _logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Deferred chatlog echoes (tool-batch ordering guard)
+# ---------------------------------------------------------------------------
+# Some tools echo a user-visible assistant message into the chatlog while they
+# run: send_file records the attachment note, and send_channel_message-style
+# tools do the same. Those writes happen *inside* an open tool batch, so the
+# echoing `final` row used to land between the assistant `tool_call` row and the
+# `tool_output` row it belongs to. History reconstruction then produced
+#
+#     assistant(tool_calls=[A,B]) , assistant(text) , tool(A) , ...
+#
+# which the provider (and validate_tool_pairs) rejects as out-of-order. Because
+# the row order is persisted, the defect stuck for every later turn.
+#
+# The loop now marks the batch (begin/end) and the echo is queued here instead;
+# end_tool_batch() flushes the queue after the batch's tool_output rows, so the
+# transcript and the provider payload always agree on "results first, prose
+# after". State is module-level (keyed by agent/session) because parallel tool
+# execution runs on worker threads.
+_ECHO_LOCK = threading.Lock()
+_ECHO_OPEN: set = set()
+_ECHO_PENDING: Dict[tuple, List[Dict[str, Any]]] = {}
+
+
+def _echo_key(agent_id: str, session_id: str) -> tuple:
+    return (agent_id, session_id)
+
+
+def begin_tool_batch(agent_id: str, session_id: str) -> None:
+    """Mark a tool batch as open for this session.
+
+    Batches never nest, so this is idempotent rather than counting: if a batch
+    was left open by an aborted turn, the next begin repairs the state. Any
+    echoes still queued from that aborted batch are flushed by the next
+    end_tool_batch(), i.e. after a real batch's tool_output rows.
+    """
+    with _ECHO_LOCK:
+        _ECHO_OPEN.add(_echo_key(agent_id, session_id))
+
+
+def end_tool_batch(agent_id: str, session_id: str) -> int:
+    """Close a tool batch and append any echoes deferred while it was open."""
+    key = _echo_key(agent_id, session_id)
+    with _ECHO_LOCK:
+        _ECHO_OPEN.discard(key)
+        pending = _ECHO_PENDING.pop(key, [])
+    if not pending:
+        return 0
+    log = chatlog_manager.get(agent_id, session_id)
+    for entry in pending:
+        log.append(entry)
+    return len(pending)
+
+
+def append_or_defer_chatlog_echo(agent_id: str, session_id: str,
+                                 entry: Dict[str, Any]) -> None:
+    """Append an assistant chatlog echo, or defer it until the batch closes."""
+    key = _echo_key(agent_id, session_id)
+    with _ECHO_LOCK:
+        if key in _ECHO_OPEN:
+            _ECHO_PENDING.setdefault(key, []).append(entry)
+            return
+        # Outside a batch: also drain anything stranded by an aborted batch so
+        # the row is never lost, even if no later end_tool_batch() runs.
+        stale = _ECHO_PENDING.pop(key, [])
+    log = chatlog_manager.get(agent_id, session_id)
+    for pending_entry in stale:
+        log.append(pending_entry)
+    log.append(entry)
+
+
+# Image-embed detection for external channels (web renders these fine; chat
+# clients like WhatsApp/Telegram/Discord do not). Used by the final-message
+# safety net in AgentRuntime._strip_media_embeds().
+_IMG_EMBED_RE = re.compile(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>', re.IGNORECASE)
+_MD_IMG_EMBED_RE = re.compile(r'!\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
+_ARTIFACT_URL_RE = re.compile(r'^/api/agents/([^/]+)/artifacts/(.+)$')
+_ATTACHMENT_URL_RE = re.compile(r'^/api/attachments/(\d+)(?:/view)?$')
+
+
+def _append_attachment_context(content: str, attachment_infos, attachment_info,
+                               agent: dict, has_describe_image: bool) -> str:
+    """Append context notes for plural attachments with a legacy singular fallback."""
+    if not isinstance(attachment_infos, list):
+        attachment_infos = []
+    attachment_infos = [info for info in attachment_infos if isinstance(info, dict)]
+    if not attachment_infos and isinstance(attachment_info, dict):
+        attachment_infos = [attachment_info]
+
+    notes = []
+    for index, info in enumerate(attachment_infos, 1):
+        fp = info.get('file_path', '')
+        if fp and not os.path.isabs(fp):
+            fp = os.path.abspath(os.path.join(_BASE_DIR, fp))
+        fn = info.get('filename', '')
+        mt = info.get('mime_type', '')
+        sb = int(info.get('size_bytes', 0) or 0)
+        is_img = bool(mt and mt.startswith('image/'))
+        is_audio = bool(mt and mt.startswith('audio/'))
+        if sb >= 1048576:
+            sz = f"{sb / 1048576:.1f} MB"
+        elif sb >= 1024:
+            sz = f"{sb / 1024:.1f} KB"
+        else:
+            sz = f"{sb} B"
+        label = f"Attachment #{index}" if len(attachment_infos) > 1 else "Attachment"
+        note = f"\n\n[{label}: {fn} ({mt}, {sz})]\nFile path: {fp}"
+        if is_img and has_describe_image:
+            note += "\nUse the `describe_image` tool to view and analyze this image."
+        if is_audio and agent.get('audio_enabled'):
+            note += "\nUse the `transcribe_audio` tool to listen to this audio."
+        notes.append(note)
+    return content.rstrip() + ''.join(notes) if notes else content
+
+
+def _injected_user_content(text: str, meta: dict, agent: dict, db_agent_id: str) -> str:
+    """Model-visible content for a mid-loop injected user message, including
+    attachment notes (mirrors what a fresh turn renders via _apply_multimodal)."""
+    infos = _ctx.attachment_infos_from_metadata(meta)
+    if not infos:
+        return text
+    has_describe_image = (
+        'describe_image' in db.get_agent_tools(db_agent_id)
+        or bool(agent.get('vision_enabled', 1))
+    )
+    return text.rstrip() + _ctx.build_attachment_notes(
+        infos,
+        has_describe_image=has_describe_image,
+        audio_enabled=bool(agent.get('audio_enabled')),
+    )
 
 
 # --- Configuration constants ---
@@ -57,7 +191,6 @@ CLEANUP_TTL_SECONDS = 3600          # TTL for session state entries before clean
 WORKER_JOIN_TIMEOUT_SECONDS = 5.0   # Max time to wait for worker threads to finish on shutdown
 WORKER_JOIN_MIN_TIMEOUT = 0.1       # Minimum timeout per worker join iteration (seconds)
 DEFAULT_BUFFER_SECONDS = 2          # Default message buffering delay when agent has no config (seconds)
-SESSION_BUFFER_CLEANUP_DELAY = 30.0 # Delay before cleaning up SSE session buffers (seconds)
 
 
 def _llm_log_path(agent_id: str) -> str:
@@ -69,7 +202,7 @@ def _llm_log_path(agent_id: str) -> str:
 WRAPPER_PREFIX = (
         """[Pre-response check: Before you answer or reply to the user's request, first verify the following:
 
-1. Does the message contain explicit or implicit information—such as instructions, or shared personal details, facts, preferences, phone numbers, secret keys, addresses, PINs, etc.? If yes, save it to memory using the `remember()` tool. If the message contains style notes, rules, or procedures that don't always need to be applied, record them in the `notes.md` knowledge base. If the message contains a request to change style or rules that is highly critical and must be applied on every turn, write it to `SYSTEM.md`.
+1. Does the message contain explicit or implicit information—such as instructions, or shared personal details, facts, preferences, phone numbers, secret keys, addresses, PINs, etc.? If yes, save it to memory using the `remember()` tool. If the message contains style notes, rules, or procedures that don't always need to be applied, record them via `remember()` for non-factual style notes. If the message contains a request to change style or rules that is highly critical and must be applied on every turn, write it to `SYSTEM.md`.
 2. Does the message relate to a specific project or task? If so, read the relevant knowledge base files first—there may be an existing KB containing per-item/per-project procedures.
 3. Only after completing these steps, reply to the user naturally.]
 
@@ -84,22 +217,36 @@ SUBAGENT_EXECUTE_DIRECTIVE = (
 )
 
 
+def _apply_restart_origin_guard(agent_context: dict, assigned_tool_ids: list,
+                                tools: list, metadata: dict) -> tuple:
+    """Remove restart authorization from an automatic post-restart turn."""
+    if not isinstance(metadata, dict) or not metadata.get('restart_origin'):
+        return assigned_tool_ids, tools
+    agent_context['restart_origin'] = True
+    assigned_tool_ids = [
+        tool_id for tool_id in assigned_tool_ids
+        if tool_id != 'restart' and not tool_id.endswith(':restart')
+    ]
+    tools = [
+        tool for tool in tools
+        if tool.get('function', {}).get('name') != 'restart'
+    ]
+    agent_context['assigned_tool_ids'] = assigned_tool_ids
+    return assigned_tool_ids, tools
+
+
 def _should_wrap_user_message(agent: dict) -> bool:
     """Check if message wrapper is enabled for this agent.
 
     Priority: per-agent setting > global setting > default (True).
     """
-    per_agent = agent.get('message_wrapper_enabled')
-    if per_agent is not None:
-        return bool(per_agent)
-    from models.db import db as _db
-    global_val = _db.get_setting('message_wrapper_enabled', '1')
-    return global_val != '0'
+    return message_wrapper_enabled(agent, db)
 
 
 def _apply_wrapper_prefix(messages: list, enabled: bool,
                           is_stale: bool = False,
-                          stale_threshold: int = 25200) -> None:
+                          stale_threshold: int = 25200,
+                          loaded_skills_count: int = 0) -> None:
     """Apply message wrapper prefix to user messages in-place.
 
     Wraps: (a) the LAST (current) user message when it has >= 4 words,
@@ -109,11 +256,14 @@ def _apply_wrapper_prefix(messages: list, enabled: bool,
     When is_stale is True, appends a staleness-awareness note to the wrapper
     prefix prompting the agent to assess whether conversation history is
     still relevant.
+
+    When loaded_skills_count > 0, replaces point 3 with a dynamic reminder
+    to check loaded skills before responding.
     """
     if not enabled or not messages:
         return
 
-    # Build effective wrapper prefix — may include staleness notice
+    # Build effective wrapper prefix — may include staleness notice or skill reminder
     effective_prefix = WRAPPER_PREFIX
     if is_stale:
         hours = max(1, stale_threshold // 3600)
@@ -125,6 +275,22 @@ def _apply_wrapper_prefix(messages: list, enabled: bool,
             f"context.\n\n"
         )
         effective_prefix = WRAPPER_PREFIX + staleness_note
+
+    # Dynamic point 3: if agent has loaded skills, occasionally remind it to check/unload them
+    # 1:3 probability — injects ~25% of the time to avoid redundancy
+    if loaded_skills_count and loaded_skills_count > 0:
+        import random
+        if random.random() < 0.25:
+            options = [
+                f"[SKILL — {loaded_skills_count} loaded] Use a relevant one if this fits. Otherwise unload it — it's no longer needed.",
+                f"[SKILL — {loaded_skills_count} loaded] Check if any loaded skill applies to this request. If not, unload it before replying.",
+                f"[SKILL — {loaded_skills_count} loaded] Got skills loaded. Use one if relevant, or unload it if it's stale. Then reply naturally.",
+                f"[SKILL — {loaded_skills_count} loaded] Loaded skills ready. Pick the right one or unload the irrelevant ones. Then respond.",
+            ]
+            effective_prefix = WRAPPER_PREFIX + f"\n\n{random.choice(options)}"
+    else:
+        if is_stale:
+            effective_prefix = WRAPPER_PREFIX + staleness_note
 
     for i, msg in enumerate(messages):
         if msg.get('role') == 'user':
@@ -232,6 +398,7 @@ class SessionContext:
     external_user_id: str
     channel_id: Optional[str] = None
     session_db_agent_id: Optional[str] = None
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class _QueueTask:
@@ -263,12 +430,11 @@ class _QueueTask:
 #      (b) _session_store._stop_flags_guard
 #      (c) _session_store._inject_queues_guard
 #      (d) _session_store._busy_guard
-#      (e) _agent_tracker._guard
-#      (f) _cleanup_tracker._guard
-#      (g) _llm_serializer._summarize_guard
-#      (h) _llm_serializer._llm_lock
-#      (i) _shutdown_mgr._lock
-#      (j) instance._buffer_lock
+#      (e) _cleanup_tracker._guard
+#      (f) _llm_serializer._summarize_guard
+#      (g) _llm_serializer._llm_lock
+#      (h) _shutdown_mgr._lock
+#      (i) instance._buffer_lock
 #
 # 2. GUARD-LOCK PATTERN:  Each mutable dict has a dedicated "guard" lock.
 #    The guard protects structuring operations (get-or-create, pop, clear).
@@ -285,8 +451,6 @@ class _QueueTask:
 # 5. INVARIANTS:
 #    • Every session_id present in _cleanup_tracker._ttl MUST also have
 #      entries in _session_store (or be in the process of being cleaned up).
-#    • _agent_tracker._busy[agent_id] exists only while an agent is
-#      actively processing a turn; cleared on completion or TTL expiry.
 #    • _shutdown_mgr._event, once set, is never cleared (shutdown is final).
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,41 +534,6 @@ class _SessionStore:
         #           actively processing a turn for that session.
         self._busy: Dict[str, bool] = {}
         self._busy_guard = threading.Lock()
-
-
-class _AgentTracker:
-    """Track which agents are currently busy processing a session.
-
-    Thread-safety:
-        The _guard lock protects all reads and writes to the _busy dict,
-        which is mutated by worker threads when agents start or finish
-        processing turns.
-
-        Acquired by: _set_agent_busy(), _clear_agent_busy(),
-                     is_agent_busy(), get_busy_agents().
-        Released: immediately after the dict operation (short critical
-                  section — < 1ms).
-
-        Deadlock risk: NONE — _guard is never nested with any other lock.
-        It is acquired independently each time.
-
-        TTL staleness: entries older than the TTL (default 600s) are
-        treated as stale and auto-expired.  This protects against hung
-        threads that never clear their busy flag.
-
-        Invariants:
-            • An agent_id appears in _busy only while it is actively
-              processing an LLM turn.
-            • Each entry has {session_id: str, started_at: float}.
-            • At most one entry per agent_id (set overwrites).
-    """
-
-    def __init__(self) -> None:
-        # agent_id -> {session_id: str, started_at: float}
-        # Guarded by _guard — prevents races between agent_busy set/clear
-        # calls coming from different worker threads.
-        self._busy: Dict[str, dict] = {}
-        self._guard = threading.Lock()
 
 
 class _CleanupTracker:
@@ -562,9 +691,8 @@ class _ShutdownManager:
 
 
 class AgentRuntime:
-    # State containers — reduce class-level attributes from 23 to 6
+    # State containers — reduce class-level attributes from 23 to 5
     _session_store = _SessionStore()
-    _agent_tracker = _AgentTracker()
     _cleanup_tracker = _CleanupTracker()
     _llm_serializer = _LLMSerializer()
     _shutdown_mgr = _ShutdownManager()
@@ -597,10 +725,38 @@ class AgentRuntime:
         #  being registered once but workers being tracked per-instance)
         # We don't hold a class-level workers list here — instances call
         # _join_workers() themselves. The executor is shared, so we shut it down.
+        _logger.info("Stopping detached background jobs...")
+        try:
+            from backend.agent_runtime.background_jobs import background_jobs
+            from backend.tools.lib.exec_backend import registry
+            for job in list(background_jobs._jobs.values()):
+                if job.status != "running":
+                    continue
+                backend = registry.get_backend(job.session_id, {})
+                background_jobs.stop_for_session(
+                    job.session_id,
+                    lambda script, backend=backend: backend.run_bash(script, 15, {}),
+                )
+        except Exception:
+            _logger.exception("Failed to stop detached background jobs")
+
+        # Messaging channels own child processes (the WhatsApp bridge). Without this they outlive the app, keep the
+        # WhatsApp session connected but unmanaged, and block the next start ("auth directory is already owned").
+        _logger.info("Stopping channels...")
+        try:
+            from backend.channels.registry import channel_manager
+            t = threading.Thread(target=channel_manager.stop_all, name="shutdown-stop-channels", daemon=True)
+            t.start()
+            t.join(timeout=10)
+            if t.is_alive():
+                _logger.warning("Channels did not stop within 10s; continuing shutdown")
+        except Exception:
+            _logger.exception("Failed to stop channels")
+
         _logger.info("Shutting down background executor...")
         cls._bg_executor.shutdown(wait=False, cancel_futures=True)
 
-        # Cancel the cleanup timer (already done above, but defensive)
+        # Cancel the cleanup timer (already done above, but defensive:)
         _logger.info("Graceful shutdown complete.")
 
     @classmethod
@@ -610,6 +766,20 @@ class AgentRuntime:
         sig_name = signal.Signals(signum).name
         _logger.info("\nReceived %s, initiating graceful shutdown...", sig_name)
         cls.graceful_shutdown()
+        # sys.exit() only raises SystemExit in the main thread. When the signal
+        # arrives while the main thread is blocked in the threaded WSGI server's
+        # accept loop, that SystemExit gets swallowed by the server — the runtime
+        # ends up drained (queue workers + executor stopped) but the process
+        # stays alive serving requests. systemd still sees it as active, so
+        # Restart=always never fires and the FD-watchdog's SIGTERM produces a
+        # half-dead "zombie" instead of a restart. Arm a daemon backstop that
+        # force-exits if the clean exit doesn't take, then attempt the clean
+        # exit (which runs atexit Docker cleanup) first.
+        forcer = threading.Timer(
+            WORKER_JOIN_TIMEOUT_SECONDS + 3.0, lambda: os._exit(0)
+        )
+        forcer.daemon = True
+        forcer.start()
         # Use sys.exit to allow normal Python shutdown — this triggers
         # atexit handlers (including Docker container cleanup) and
         # thread cleanup, whereas os.kill hard-terminates the process.
@@ -662,6 +832,9 @@ class AgentRuntime:
         """Mark session as active (called on every turn)."""
         with cls._cleanup_tracker._guard:
             cls._cleanup_tracker._ttl[session_id] = time.time()
+            if (os.environ.get('EVONIC_TESTING') == '1'
+                    or os.environ.get('EVONIC_SMOKE_TEST') == '1'):
+                return
             if cls._cleanup_tracker._timer is None:
                 cls._cleanup_tracker._timer = threading.Timer(cls._cleanup_tracker._interval, cls._cleanup_idle_sessions)
                 cls._cleanup_tracker._timer.daemon = True
@@ -674,28 +847,44 @@ class AgentRuntime:
         self._buffer_timers: Dict[str, threading.Timer] = {}
         self._buffer_lock = threading.Lock()
         self._workers: list[threading.Thread] = []
-        # Read worker count from DB (user-configurable), fall back to config default
-        try:
-            from models.db import db as _db
-            _db_workers = _db.get_setting('agent_queue_workers')
-            initial_workers = max(1, min(32, int(_db_workers))) if _db_workers else AGENT_QUEUE_WORKERS
-        except Exception:
-            initial_workers = AGENT_QUEUE_WORKERS
-        for i in range(initial_workers):
-            t = threading.Thread(target=self._worker, name=f'agent-worker-{i}', daemon=True)
-            t.start()
-            self._workers.append(t)
-        _logger.info("Started %d queue worker(s)", initial_workers)
+        background_enabled = not (
+            os.environ.get('EVONIC_TESTING') == '1'
+            or os.environ.get('EVONIC_SMOKE_TEST') == '1'
+        )
+        if background_enabled:
+            try:
+                from backend.realtime_store import realtime_store
+                interrupted = realtime_store.interrupt_stale_turns()
+                if interrupted:
+                    _logger.warning("Marked %d turn(s) interrupted after restart", len(interrupted))
+            except Exception as exc:
+                _logger.error("Failed to recover durable active turns: %s", exc)
+            # Read worker count from DB (user-configurable), fall back to config default
+            try:
+                from models.db import db as _db
+                _db_workers = _db.get_setting('agent_queue_workers')
+                initial_workers = max(1, min(32, int(_db_workers))) if _db_workers else AGENT_QUEUE_WORKERS
+            except Exception:
+                initial_workers = AGENT_QUEUE_WORKERS
+            for i in range(initial_workers):
+                t = threading.Thread(target=self._worker, name=f'agent-worker-{i}', daemon=True)
+                t.start()
+                self._workers.append(t)
+            _logger.info("Started %d queue worker(s)", initial_workers)
         AgentRuntime._llm_serializer._concurrency_mgr = ConcurrencyManager()
         self._session_skill_mds: Dict[str, Dict[str, str]] = {}    # session_id -> {skill_id: system_md}
         self._session_skill_tools: Dict[str, Dict[str, list]] = {}  # session_id -> {skill_id: [tool_defs]}
         self._prefetcher = TurnPrefetcher()  # pre-loads messages for next turn
-        # Register signal handlers + atexit for graceful shutdown (once only)
-        AgentRuntime._register_signal_handlers()
-        atexit.register(self._atexit_shutdown)
+        # session_id -> notes held until that session's running turn ends.
+        # Guarded by _session_store._busy_guard (see add_session_note).
+        self._pending_session_notes: Dict[str, list] = {}
         # Schedule periodic cleanup of stale buffer timers
         self._buffer_timer_stats = {"created": 0, "cancelled": 0, "leaked": 0}
-        self._stale_timer_cleanup()
+        if background_enabled:
+            # Register signal handlers + atexit for graceful shutdown (once only)
+            AgentRuntime._register_signal_handlers()
+            atexit.register(self._atexit_shutdown)
+            self._stale_timer_cleanup()
 
     def _atexit_shutdown(self) -> None:
         AgentRuntime.graceful_shutdown()
@@ -746,9 +935,22 @@ class AgentRuntime:
                 _resp = result.get('response', '')
                 if task.send_via_channel and _resp and _resp != "(No response)" and task.ctx.channel_id:
                     instance = channel_manager._active.get(task.ctx.channel_id)
+                    # DIAGNOSTIC (shared-channel reply loss): confirm the buffered
+                    # worker resolves a running channel instance and attempts the send.
+                    _logger.info(
+                        "[buffered-send] channel_id=%s instance=%s running=%s user=%s session=%s",
+                        task.ctx.channel_id,
+                        type(instance).__name__ if instance else None,
+                        getattr(instance, 'is_running', None) if instance else None,
+                        task.ctx.external_user_id, task.ctx.session_id)
                     if instance and instance.is_running:
                         try:
-                            instance.send_message(task.ctx.external_user_id, result['response'])
+                            _out_text = result['response']
+                            # External channels do not render HTML <img>/Markdown image
+                            # embeds: deliver resolvable media via send_file and strip
+                            # the embed markup from the outgoing text.
+                            _out_text = self._strip_media_embeds(_out_text, task.ctx.session_id)
+                            instance.send_message(task.ctx.external_user_id, _out_text)
                             # Check for async send errors (channel records failures internally)
                             if isinstance(instance, BaseChannel) and instance.has_send_error(task.ctx.external_user_id):
                                 send_err = instance.get_send_error(task.ctx.external_user_id)
@@ -759,8 +961,18 @@ class AgentRuntime:
                                     )
                         except Exception as e:
                             _logger.error("Channel send error for session %s: %s", task.ctx.session_id, e)
+                elif task.send_via_channel and not result.get('stopped'):
+                    # DIAGNOSTIC (shared-channel reply loss): the reply was generated
+                    # and saved (so it shows in the web session) but the channel send
+                    # was skipped. Log exactly which precondition failed.
+                    _logger.warning(
+                        "[buffered-send] SKIPPED for session %s user=%s: "
+                        "resp_empty=%s resp_placeholder=%s channel_id=%s",
+                        task.ctx.session_id, task.ctx.external_user_id,
+                        not bool(_resp), _resp == "(No response)", task.ctx.channel_id)
             except Exception as e:
                 _logger.error("Worker error for session %s: %s", task.ctx.session_id, e, exc_info=True)
+                self._fail_queued_task(task, str(e))
                 task.result = {
                     "response": "An unexpected error occurred. Please try again.",
                     "error": True,
@@ -813,50 +1025,147 @@ class AgentRuntime:
         with self._session_store._busy_guard:
             return self._session_store._busy.get(session_id, False)
 
-    def _set_agent_busy(self, agent_id: str, session_id: str) -> None:
-        with self._agent_tracker._guard:
-            self._agent_tracker._busy[agent_id] = {'session_id': session_id, 'started_at': time.time()}
+    def add_session_note(self, agent_id: str, session_id: str, content: str,
+                         metadata: Dict[str, Any], external_user_id: str = '') -> None:
+        """Append a ``[SYSTEM]`` note to a session (LLM context + chat UI).
 
-    def _clear_agent_busy(self, agent_id: str) -> None:
-        with self._agent_tracker._guard:
-            self._agent_tracker._busy.pop(agent_id, None)
+        A running turn keeps the context and workplace it started with, so a
+        note arriving mid-turn is held and written when that turn ends —
+        otherwise its later tool results would land after the note.
+        """
+        note = (agent_id, content, metadata, external_user_id)
+        if self._is_busy(session_id) and self._has_live_turn(agent_id, session_id):
+            with self._session_store._busy_guard:
+                # Re-check under the guard: the turn's finally clears busy under
+                # it before flushing, so a note queued here is never stranded.
+                if self._session_store._busy.get(session_id, False):
+                    self._pending_session_notes.setdefault(session_id, []).append(note)
+                    return
+        self._write_session_note(session_id, *note)
+
+    def _flush_session_notes(self, session_id: str) -> None:
+        with self._session_store._busy_guard:
+            notes = self._pending_session_notes.pop(session_id, [])
+        for note in notes:
+            self._write_session_note(session_id, *note)
+
+    def _write_session_note(self, session_id: str, agent_id: str, content: str,
+                            metadata: Dict[str, Any], external_user_id: str) -> None:
+        # Same shape as the /stop injection: a user-role DB row plus a chatlog
+        # 'system' entry, which the LLM history replays as a user message.
+        message_id = db.add_chat_message(session_id, 'user', content,
+                                         agent_id=agent_id, metadata=metadata)
+        chatlog_manager.get(agent_id, session_id).append({
+            'type': 'system', 'session_id': session_id, 'content': content,
+            'metadata': metadata, 'message_id': message_id,
+        })
+        self._prefetcher.invalidate(session_id)
+        event_stream.emit('message_received', {
+            'agent_id': agent_id, 'session_id': session_id,
+            'external_user_id': external_user_id, 'message': content,
+            'message_id': message_id, 'metadata': metadata, 'role': 'system',
+        })
+
+    def _has_live_turn(self, agent_id: str, session_id: str) -> bool:
+        """True when the durable store still holds a running turn for the session.
+
+        The in-process ``_busy`` flag can outlive its durable turn (a worker that
+        was reaped as stale while still marked busy). Probing the store lets the
+        caller avoid injecting into a loop that can no longer consume the
+        message. Falls back to True on any probe error so normal injection is
+        never skipped because of a transient failure.
+        """
+        try:
+            from backend.realtime_store import realtime_store
+            realtime_store.reap_stale_turns()
+            return any(
+                turn.get('state') == 'running'
+                for turn in realtime_store.active_turns(
+                    agent_id=agent_id, session_id=session_id)
+            )
+        except Exception:
+            return True
+
+    def _mark_task_queued(self, task: '_QueueTask') -> None:
+        from backend.realtime_store import realtime_store
+        # ponytail: one runtime lock preserves queue/stop event order; use
+        # per-session locks only if message-ingress contention is measured.
+        with self._buffer_lock:
+            turn_id, _created = realtime_store.queue_turn(
+                task.agent['id'], task.ctx.session_id, task.ctx.turn_id,
+            )
+            task.ctx.turn_id = turn_id
+            # Queue insertion is the acceptance point: a stop racing before it
+            # applies to the old turn; a stop racing after it can cancel this row.
+            self._get_stop_event(task.ctx.session_id).clear()
+            from backend.tools.lib.process_tracker import process_tracker
+            process_tracker.clear_stop(task.ctx.session_id)
+
+    def _put_task(self, task: '_QueueTask', *, already_queued: bool = False) -> None:
+        if not already_queued:
+            self._mark_task_queued(task)
+        try:
+            self._message_queue.put(task)
+        except Exception:
+            self._fail_queued_task(task, 'queue_failed')
+            raise
+
+    def _fail_queued_task(self, task: '_QueueTask', reason: str) -> None:
+        from backend.realtime_store import realtime_store
+        with self._buffer_lock:
+            cancelled = realtime_store.cancel_queued_turns(
+                task.ctx.session_id, task.ctx.turn_id,
+            )
+            if not cancelled:
+                return
+            self._emit_cancelled_turn(cancelled[0], reason, task)
+
+    def _emit_cancelled_turn(self, turn: dict, reason: str,
+                             task: '_QueueTask | None' = None) -> None:
+        from backend.realtime_store import realtime_store
+        agent_id = turn['agent_id']
+        session_id = turn['session_id']
+        event_stream.emit('turn_complete', {
+            'agent_id': agent_id,
+            'agent_name': task.agent.get('name', '') if task else '',
+            'session_id': session_id,
+            'external_user_id': task.ctx.external_user_id if task else '',
+            'channel_id': task.ctx.channel_id if task else None,
+            'turn_id': turn['turn_id'],
+            'response': '',
+            'tool_trace': [],
+            'is_error': True,
+            'interrupted': True,
+            'reason': reason,
+        })
+        realtime_store.finish_turn(turn['turn_id'])
+        remaining = realtime_store.busy_agents().get(agent_id)
+        event_stream.emit('agent_busy_changed', {
+            'agent_id': agent_id,
+            'busy': bool(remaining),
+            'session_id': remaining.get('session_id', session_id) if remaining else session_id,
+            'session_ids': remaining.get('session_ids', []) if remaining else [],
+            'active_count': remaining.get('active_count', 0) if remaining else 0,
+            'state': remaining.get('state', 'idle') if remaining else 'idle',
+            'turn_id': None,
+        })
 
     def is_agent_busy(self, agent_id: str, ttl: int = 600) -> bool:
-        """Return True if agent is currently processing an LLM turn.
+        """Return durable queued/running state. ``ttl`` is kept for callers.
 
-        A TTL guard treats entries older than `ttl` seconds as stale (e.g. a
-        thread that hung and never cleared its flag).  Default is 10 minutes.
+        Reaps abandoned turns first: restart recovery runs only at boot, so a
+        row left by a crashed worker or a hung turn would otherwise pin the
+        agent busy for the life of the process.
         """
-        with self._agent_tracker._guard:
-            entry = self._agent_tracker._busy.get(agent_id)
-        if not entry:
-            return False
-        if time.time() - entry['started_at'] > ttl:
-            # Auto-expire stale entry
-            self._clear_agent_busy(agent_id)
-            return False
-        return True
+        from backend.realtime_store import realtime_store
+        realtime_store.reap_stale_turns()
+        return bool(realtime_store.active_turns(agent_id=agent_id))
 
     def get_busy_agents(self, ttl: int = 600) -> dict:
-        """Return a snapshot of all currently busy agents (respects TTL)."""
-        now = time.time()
-        with self._agent_tracker._guard:
-            snapshot = dict(self._agent_tracker._busy)
-        result = {}
-        stale = []
-        for agent_id, entry in snapshot.items():
-            elapsed = now - entry['started_at']
-            if elapsed > ttl:
-                stale.append(agent_id)
-            else:
-                result[agent_id] = {
-                    'session_id': entry['session_id'],
-                    'started_at': entry['started_at'],
-                    'elapsed': round(elapsed, 1),
-                }
-        for agent_id in stale:
-            self._clear_agent_busy(agent_id)
-        return result
+        """Return all durable queued/running turns grouped by agent."""
+        from backend.realtime_store import realtime_store
+        realtime_store.reap_stale_turns()
+        return realtime_store.busy_agents()
 
     @contextmanager
     def _buffer_timer(self, session_id: str, buffer_seconds: float,
@@ -900,14 +1209,37 @@ class AgentRuntime:
         """Signal the agent loop for this session to stop after the current LLM call.
         Also cancels any pending buffer timer so no new task is enqueued.
         Kills any running tool subprocess immediately via process_tracker."""
+        from backend.realtime_store import realtime_store
         with self._buffer_lock:
+            self._get_stop_event(session_id).set()
             timer = self._buffer_timers.pop(session_id, None)
-        if timer is not None:
-            timer.cancel()
-        self._get_stop_event(session_id).set()
+            if timer is not None:
+                timer.cancel()
+            for turn in realtime_store.cancel_queued_turns(session_id):
+                self._emit_cancelled_turn(turn, 'stopped')
         # Kill any running tool subprocess for this session
         from backend.tools.lib.process_tracker import process_tracker
         process_tracker.kill(session_id)
+
+        # Also stop detached tmux/screen/nohup jobs owned by this session.
+        try:
+            from backend.agent_runtime.background_jobs import background_jobs
+            from backend.tools.lib.exec_backend import registry
+            backend = registry.get_backend(session_id, {})
+            background_jobs.stop_for_session(
+                session_id,
+                lambda script: backend.run_bash(script, 15, {}),
+            )
+        except Exception:
+            _logger.exception("Failed to stop detached background jobs for %s", session_id)
+
+    def is_stop_requested(self, session_id: str) -> bool:
+        """True if /stop was signalled for this session and not yet consumed.
+
+        Public read-only view of the stop flag, for blocking tools (e.g. the
+        sync Explore wait) that must abort promptly instead of holding the
+        agent loop until their own timeout expires."""
+        return self._get_stop_event(session_id).is_set()
 
     def summarize_session(self, agent: dict, session_id: str) -> bool:
         """Trigger summarization for a session. Public API for slash commands.
@@ -922,7 +1254,8 @@ class AgentRuntime:
 
     def _run_bash_exec(self, agent: Dict[str, Any], session_id: str,
                        db_agent_id: str, external_user_id: str,
-                       message: str) -> str:
+                       message: str, client_message_id: str | None = None
+                       ) -> tuple[str, int | str | None, int | str | None]:
         """Run a web user's "!<command>" directly and persist it for UI display only.
 
         The command and its output are saved with a `bash_exec` metadata flag so
@@ -933,7 +1266,7 @@ class AgentRuntime:
         """
         cmd = message.lstrip()[1:].strip()
         if not cmd:
-            return "Usage: `!<command>` — run a shell command directly (web only)."
+            return "Usage: `!<command>` — run a shell command directly (web only).", None, None
 
         from backend.tools import bash
         exec_agent = {**agent, 'session_id': session_id, '_skip_safety': True}
@@ -951,25 +1284,49 @@ class AgentRuntime:
             if stderr:
                 parts.append(stderr)
             body = "\n".join(parts) if parts else "(no output)"
+        # Truncate output if it exceeds MAX_OUTPUT characters (both stdout+stderr).
+        MAX_OUTPUT = 1000
+        if len(body) > MAX_OUTPUT:
+            body = body[:MAX_OUTPUT] + "\n… (truncated)"
         response = f"$ {cmd}\n```bash\n{body}\n```"
         exit_code = result.get('exit_code')
         if exit_code not in (0, None):
             response += f"\n_(exit code {exit_code})_"
 
         # Persist for UI display only — hidden from LLM via the `bash_exec` flag.
-        _db_retry(db.add_chat_message, session_id, 'user', message,
-                  agent_id=db_agent_id, metadata={'bash_exec': True},
-                  label="save bash command")
-        _db_retry(db.add_chat_message, session_id, 'assistant', response,
-                  agent_id=db_agent_id, metadata={'bash_exec': True},
-                  label="save bash output")
+        command_meta = {'bash_exec': True}
+        if client_message_id:
+            command_meta['client_message_id'] = client_message_id
+        message_id = _db_retry(
+            db.add_chat_message, session_id, 'user', message,
+            agent_id=db_agent_id, metadata=command_meta,
+            label="save bash command",
+        )
+        response_id = _db_retry(
+            db.add_chat_message, session_id, 'assistant', response,
+            agent_id=db_agent_id, metadata={'bash_exec': True},
+            label="save bash output",
+        )
+        message_id = message_id if type(message_id) in (int, str) else None
+        response_id = response_id if type(response_id) in (int, str) else None
         _cl = chatlog_manager.get(db_agent_id, session_id)
         _cl.append({'type': 'user', 'session_id': session_id, 'content': message,
-                    'sender_id': external_user_id, 'metadata': {'bash_exec': True}})
+                    'sender_id': external_user_id, 'metadata': command_meta,
+                    'message_id': message_id})
         _cl.append({'type': 'system', 'session_id': session_id, 'content': response,
-                    'metadata': {'bash_exec': True}})
+                    'metadata': {'bash_exec': True}, 'message_id': response_id})
+        for role, content, saved_id, meta in (
+                ('user', message, message_id, command_meta),
+                ('assistant', response, response_id, {'bash_exec': True})):
+            event_stream.emit('message_received', {
+                'agent_id': agent['id'], 'session_id': session_id,
+                'external_user_id': external_user_id, 'message': content,
+                'message_id': saved_id,
+                'client_message_id': meta.get('client_message_id'),
+                'metadata': meta, 'role': role,
+            })
         self._prefetcher.invalidate(session_id)
-        return response
+        return response, message_id, response_id
 
     def handle_message(self, agent_id: str, external_user_id: str,
                        message: str, channel_id: Optional[str] = None,
@@ -977,7 +1334,8 @@ class AgentRuntime:
                        audio_url: Optional[str] = None,
                        video_url: Optional[str] = None,
                        metadata: Optional[Dict[str, Any]] = None,
-                       skip_buffer: bool = False) -> Dict[str, Any]:
+                       skip_buffer: bool = False,
+                       session_id: Optional[str] = None) -> Dict[str, Any]:
         """Process an incoming user message. Always queued for processing.
 
         - With buffer: debounce rapid messages, queue when timer fires.
@@ -991,6 +1349,8 @@ class AgentRuntime:
             skip_buffer: If True, bypass message buffering even if the agent has
                 message_buffer_seconds set. Used by API routes that need a synchronous
                 response (e.g. /chat/completions).
+            session_id: Existing owned session to use instead of resolving one from
+                external_user_id and channel_id.
         """
         # Normalize external_user_id — system-internal messages (e.g. restart
         # greeting) may arrive with None when no external user is associated.
@@ -1017,13 +1377,37 @@ class AgentRuntime:
         if not agent.get('is_super') and not agent.get('enabled', True):
             return {"response": "This agent is currently disabled.", "tool_trace": []}
 
+        # Defense-in-depth: check if the user is blocked (FINDING-012).
+        # Skip internal/system users (they have no user record to check).
+        if external_user_id not in ('__system__', '') and not external_user_id.startswith('__agent__'):
+            if db.is_user_blocked_by_external_id(external_user_id):
+                _logger.info(
+                    "[handle_message] agent=%s sender=%s BLOCKED — rejecting message.",
+                    agent_id, external_user_id,
+                )
+                return {
+                    "response": (
+                        "Your account has been suspended. "
+                        "Please contact the administrator for further information."
+                    ),
+                    "tool_trace": [],
+                }
+
         # Determine if this is a sub-agent (uses parent's per-agent chat DB)
         is_subagent = agent.get('is_subagent', False)
 
         # Get or create session (sub-agents store their own ID but use parent's DB)
-        session_id = _db_retry(db.get_or_create_session, agent_id, external_user_id,
-                               channel_id, db_agent_id=db_agent_id if is_subagent else None,
-                               label="get/create session")
+        if session_id:
+            session = _db_retry(db.get_session_with_details, session_id,
+                                label="get explicit session")
+            if not session or session.get('agent_id') != agent_id:
+                return {"response": "Session not found.", "tool_trace": []}
+            external_user_id = session.get('external_user_id') or external_user_id
+            channel_id = session.get('channel_id')
+        else:
+            session_id = _db_retry(db.get_or_create_session, agent_id, external_user_id,
+                                   channel_id, db_agent_id=db_agent_id if is_subagent else None,
+                                   label="get/create session")
 
         # Sub-agents always start fresh — clear any stale messages from a
         # previous spawn that reused the same session slug.
@@ -1035,11 +1419,15 @@ class AgentRuntime:
         # On a channel, a "!"-prefixed message falls through as ordinary user text.
         if message.lstrip().startswith('!') and channel_id is None \
                 and agent.get('bash_exec_enabled'):
-            response = self._run_bash_exec(
+            response, message_id, response_id = self._run_bash_exec(
                 agent, session_id, db_agent_id, external_user_id, message,
+                (metadata or {}).get('client_message_id'),
             )
             return {"response": response, "tool_trace": [], "timeline": [],
-                    "slash_command": True, "bash_exec": True}
+                    "slash_command": True, "bash_exec": True,
+                    "message_id": message_id,
+                    "response_message_id": response_id,
+                    "client_message_id": (metadata or {}).get('client_message_id')}
 
         # Slash command interception — execute before saving message or sending to LLM
         parsed = parse_command(message)
@@ -1049,25 +1437,113 @@ class AgentRuntime:
                 cmd_name, cmd_args, session_id, agent_id,
                 external_user_id, channel_id,
             )
-            if response is not None:
-                # Command was recognized — save command echo and response, then return
-                _db_retry(db.add_chat_message, session_id, 'user', message,
-                          agent_id=db_agent_id, metadata={"slash_command": True},
-                          label="save command message")
-                _db_retry(db.add_chat_message, session_id, 'assistant', response,
-                          agent_id=db_agent_id, metadata={"slash_command": True},
-                          label="save command response")
+            if response is COMMAND_SUPPRESSED:
+                # Command recognized but suppressed by a per-agent setting
+                # (e.g. /help disabled) — save the user message for the record,
+                # emit message_received, but send NO reply and do NOT fall
+                # through to LLM processing.
+                command_meta = {"slash_command": True, "suppressed": True}
+                if metadata and metadata.get('client_message_id'):
+                    command_meta['client_message_id'] = metadata['client_message_id']
+                message_id = _db_retry(
+                    db.add_chat_message, session_id, 'user', message,
+                    agent_id=db_agent_id, metadata=command_meta,
+                    label="save suppressed command message",
+                )
                 _cl = chatlog_manager.get(db_agent_id, session_id)
                 _cl.append({'type': 'user', 'session_id': session_id, 'content': message,
                              'sender_id': external_user_id,
-                             'metadata': {'slash_command': True}})
+                             'metadata': command_meta, 'message_id': message_id})
+                event_stream.emit('message_received', {
+                    'agent_id': agent_id, 'session_id': session_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'message': message, 'message_id': message_id,
+                    'client_message_id': command_meta.get('client_message_id'),
+                    'metadata': command_meta, 'role': 'user',
+                })
+                self._prefetcher.invalidate(session_id)
+                return {
+                    "response": None, "tool_trace": [], "timeline": [],
+                    "message_id": message_id,
+                    "response_message_id": None,
+                    "client_message_id": command_meta.get('client_message_id'),
+                    "slash_command": True, "suppressed": True,
+                }
+            if response is not None and cmd_name == "goal":
+                # /goal sets a durable, session-scoped objective. The literal
+                # command is retained for audit only (excluded from LLM context
+                # by its slash_command metadata); the turn itself is driven by a
+                # trusted [SYSTEM] goal event so the model never sees
+                # slash-command syntax and never re-reads its own raw command.
+                original_message = message
+                command_meta = {"slash_command": True, "audit_only": True}
+                if metadata and metadata.get('client_message_id'):
+                    command_meta['client_message_id'] = metadata['client_message_id']
+                audit_id = _db_retry(
+                    db.add_chat_message, session_id, 'user', original_message,
+                    agent_id=db_agent_id, metadata=command_meta,
+                    label="save goal command audit record",
+                )
+                _cl = chatlog_manager.get(db_agent_id, session_id)
+                _cl.append({'type': 'user', 'session_id': session_id,
+                            'content': original_message,
+                            'sender_id': external_user_id,
+                            'metadata': command_meta, 'message_id': audit_id})
+                event_stream.emit('message_received', {
+                    'agent_id': agent_id, 'session_id': session_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'message': original_message, 'message_id': audit_id,
+                    'client_message_id': command_meta.get('client_message_id'),
+                    'metadata': command_meta, 'role': 'user',
+                })
+                self._prefetcher.invalidate(session_id)
+                # Falls through to normal processing with the translated event.
+                message = str(response)
+            elif response is not None:
+                # Command was recognized — save command echo and response, then return
+                command_meta = {"slash_command": True}
+                if metadata and metadata.get('client_message_id'):
+                    command_meta['client_message_id'] = metadata['client_message_id']
+                message_id = _db_retry(
+                    db.add_chat_message, session_id, 'user', message,
+                    agent_id=db_agent_id, metadata=command_meta,
+                    label="save command message",
+                )
+                response_id = _db_retry(
+                    db.add_chat_message, session_id, 'assistant', response,
+                    agent_id=db_agent_id, metadata={"slash_command": True},
+                    label="save command response",
+                )
+                _cl = chatlog_manager.get(db_agent_id, session_id)
+                _cl.append({'type': 'user', 'session_id': session_id, 'content': message,
+                             'sender_id': external_user_id,
+                             'metadata': command_meta, 'message_id': message_id})
                 _cl.append({'type': 'system', 'session_id': session_id, 'content': response,
-                             'metadata': {'slash_command': True}})
+                             'metadata': {'slash_command': True}, 'message_id': response_id})
+                event_stream.emit('message_received', {
+                    'agent_id': agent_id, 'session_id': session_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'message': message, 'message_id': message_id,
+                    'client_message_id': command_meta.get('client_message_id'),
+                    'metadata': command_meta, 'role': 'user',
+                })
+                event_stream.emit('message_received', {
+                    'agent_id': agent_id, 'session_id': session_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'message': response, 'message_id': response_id,
+                    'metadata': {'slash_command': True}, 'role': 'assistant',
+                })
                 # Signal the client to clear the chat UI when the clear command was used
                 extra = {"clear_ui": True} if cmd_name == "clear" else {}
                 extra["slash_command"] = True  # flag so frontend skips thinking bubble
                 self._prefetcher.invalidate(session_id)
-                return {"response": response, "tool_trace": [], "timeline": [], **extra}
+                return {
+                    "response": response, "tool_trace": [], "timeline": [],
+                    "message_id": message_id,
+                    "response_message_id": response_id,
+                    "client_message_id": command_meta.get('client_message_id'),
+                    **extra,
+                }
             # Unknown command — fall through to normal LLM processing
 
         # Save user message (store image reference and any extra metadata)
@@ -1083,18 +1559,54 @@ class AgentRuntime:
         # Flag user message as wrapped if preference wrapper is enabled for this agent
         if _should_wrap_user_message(agent):
             meta['wrapped'] = True
-        # Enrich metadata for agent-originated messages
-        if external_user_id.startswith("__agent__") and not meta.get('agent_message'):
-            sender_id = external_user_id[len("__agent__"):]
-            sender_agent = db.get_agent(sender_id)
-            meta['agent_message'] = True
-            meta['from_agent_id'] = sender_id
-            meta['from_agent_name'] = sender_agent.get('name', sender_id) if sender_agent else sender_id
-        _db_retry(db.add_chat_message, session_id, 'user', message or "[Image]",
-                  agent_id=db_agent_id, metadata=meta if meta else None, label="save user message")
+        # Enrich metadata and handle inter-agent clearing
+        if external_user_id.startswith("__agent__"):
+            # Clear session context before saving the new message when
+            # inter_agent_clear_context is enabled for this agent.
+            # This ensures the agent processes the message with a fresh
+            # context containing only the sender's message.
+            # Must run BEFORE the not meta.get('agent_message') guard because
+            # send_agent_message already sets agent_message=True in metadata.
+            if agent.get('inter_agent_clear_context'):
+                # Skip clearing if the last message in this session arrived
+                # less than 7 seconds ago — the sending agent may be sending
+                # multiple messages concurrently.
+                last_ts = db.get_last_message_timestamp(session_id, agent_id=db_agent_id)
+                if last_ts and (time.time() - last_ts) < 7:
+                    _logger.debug(
+                        "Skipped inter-agent clear for session %s: "
+                        "last message was %.1fs ago (within 7s window)",
+                        session_id, time.time() - last_ts)
+                else:
+                    db.clear_session(session_id, agent_id=db_agent_id)
+                    # Reset fallback model so the agent starts fresh with
+                    # its primary model on the next inter-agent message.
+                    try:
+                        _as_raw = db.get_agent_state(db_agent_id)
+                        _as = json.loads(_as_raw) if _as_raw else {}
+                        if _as.pop('active_fallback_model_id', None):
+                            db.upsert_agent_state(
+                                json.dumps(_as), agent_id=db_agent_id)
+                            _logger.info(
+                                "Reset fallback model for agent %s after "
+                                "inter-agent clear", db_agent_id)
+                    except Exception:
+                        pass
+            if not meta.get('agent_message'):
+                sender_id = external_user_id[len("__agent__"):]
+                sender_agent = db.get_agent(sender_id)
+                meta['agent_message'] = True
+                meta['from_agent_id'] = sender_id
+                meta['from_agent_name'] = sender_agent.get('name', sender_id) if sender_agent else sender_id
+        message_id = _db_retry(
+            db.add_chat_message, session_id, 'user', message or "[Image]",
+            agent_id=db_agent_id, metadata=meta if meta else None,
+            label="save user message",
+        )
         _cl_user = chatlog_manager.get(db_agent_id, session_id)
         _cl_user_entry = {'type': 'user', 'session_id': session_id,
-                           'content': message or '[Image]', 'sender_id': external_user_id}
+                           'content': message or '[Image]', 'sender_id': external_user_id,
+                           'message_id': message_id}
         if meta:
             _cl_user_entry['metadata'] = meta
         _cl_user.append(_cl_user_entry)
@@ -1114,7 +1626,52 @@ class AgentRuntime:
             'image_url': image_url,
             'audio_url': audio_url,
             'video_url': video_url,
+            'metadata': meta,
+            'message_id': message_id,
+            'client_message_id': meta.get('client_message_id'),
+            'role': 'user',
         })
+
+        # A plain human reply in the exact originating session resumes the
+        # delegated agent that requested it. Save and emit it above for complete
+        # history, then stop the originating agent from processing it as a new turn.
+        is_human_message = not external_user_id.startswith(
+            ('__agent__', '__system__', '__scheduler__'))
+        # `skip_escalation_consume` is the explicit marker set by the
+        # delegation auto-forward path; the other keys cover pre-existing
+        # agent traffic. Any of them means this message is not a human answer.
+        _agent_traffic_keys = (
+            'escalation_reply', 'agent_message', 'agent_reply',
+            'skip_escalation_consume',
+        )
+        _is_agent_traffic = any(bool(meta.get(k)) for k in _agent_traffic_keys)
+        if is_human_message and _is_agent_traffic:
+            _triggered_key = next(
+                (k for k in _agent_traffic_keys if meta.get(k)), 'unknown')
+            _logger.debug(
+                "[ESCALATION_GUARD] agent=%s session=%s suppressed escalation routing "
+                "because metadata marks agent traffic (key=%s)",
+                agent_id, session_id, _triggered_key,
+            )
+        if is_human_message and not _is_agent_traffic:
+            from backend.escalation_routing import route_pending_escalation_reply
+            escalation_result = route_pending_escalation_reply(
+                agent_id, session_id, message,
+            )
+            if escalation_result is not None:
+                routed = bool(escalation_result.get('success'))
+                return {
+                    "response": (
+                        "Your response was sent to the requesting agent."
+                        if routed else
+                        "Your response could not be sent to the requesting agent."
+                    ),
+                    "tool_trace": [],
+                    "timeline": [],
+                    "escalation_routed": routed,
+                    "message_id": message_id,
+                    "client_message_id": meta.get('client_message_id'),
+                }
 
         # Busy-ack: if the agent-level concurrency gate is saturated, send an
         # immediate acknowledgment so the user knows their message was received.
@@ -1137,14 +1694,24 @@ class AgentRuntime:
             )
             _ack_meta = {"busy_ack": True, "concurrency_limited": True,
                          "concurrency_active": _cap["active"], "concurrency_max": _cap["max"]}
-            _db_retry(db.add_chat_message, session_id, 'assistant', _ack_text,
-                      agent_id=db_agent_id, metadata=_ack_meta,
-                      label="save busy ack")
+            _ack_id = _db_retry(
+                db.add_chat_message, session_id, 'assistant', _ack_text,
+                agent_id=db_agent_id, metadata=_ack_meta,
+                label="save busy ack",
+            )
+            _ack_id = _ack_id if type(_ack_id) in (int, str) else None
             chatlog_manager.get(db_agent_id, session_id).append({
                 'type': 'final',
                 'session_id': session_id,
                 'content': _ack_text,
                 'metadata': _ack_meta,
+                'message_id': _ack_id,
+            })
+            event_stream.emit('message_received', {
+                'agent_id': agent_id, 'session_id': session_id,
+                'external_user_id': external_user_id, 'channel_id': channel_id,
+                'message': _ack_text, 'message_id': _ack_id,
+                'metadata': _ack_meta, 'role': 'assistant',
             })
             event_stream.emit('concurrency_limited', {
                 'agent_id': agent_id,
@@ -1179,9 +1746,11 @@ class AgentRuntime:
         # in a DIFFERENT session, reject this message with a contextual explanation.
         # Check focus first (requires DB read) only when agent-level busy is confirmed.
         if agent.get('enable_agent_state') and self.is_agent_busy(agent_id):
-            with self._agent_tracker._guard:
-                busy_entry = self._agent_tracker._busy.get(agent_id)
-            if busy_entry and busy_entry['session_id'] != session_id:
+            from backend.realtime_store import realtime_store
+            busy_sessions = {
+                turn['session_id'] for turn in realtime_store.active_turns(agent_id=agent_id)
+            }
+            if busy_sessions and session_id not in busy_sessions:
                 ms = self._restore_agent_state(agent_id)
                 if ms and ms.focus:
                     busy_msg = self._handle_busy_rejection(
@@ -1192,23 +1761,41 @@ class AgentRuntime:
         # into the active loop instead of blocking/queuing a new task.
         # Message is already saved to DB above, so DB order is preserved.
         if self._is_busy(session_id):
-            _logger.info(
-                "[handle_message] agent=%s session=%s — session busy, injecting into active loop.",
-                agent_id, session_id,
-            )
-            self._get_inject_queue(session_id).put({
-                'role': 'user',
-                'content': message or '[Image]',
-            })
-            event_stream.emit('message_injected', {
-                'agent_id': agent_id,
-                'agent_name': agent.get('name', ''),
-                'session_id': session_id,
-                'external_user_id': external_user_id,
-                'channel_id': channel_id,
-                'message': message,
-            })
-            return {"response": None, "injected": True, "tool_trace": [], "timeline": []}
+            # Only inject while a durable running turn still owns the session.
+            # A reaped/stale turn can leave the in-process flag set; injecting
+            # then would hand the message to a dead loop and silently drop it.
+            # In that case clear the flag and queue a normal fresh turn instead
+            # (the per-session lock serializes it behind any real worker).
+            if not self._has_live_turn(agent_id, session_id):
+                _logger.warning(
+                    "[handle_message] agent=%s session=%s — clearing stale in-process "
+                    "busy flag (no live durable turn); queuing a fresh turn instead of "
+                    "injecting.", agent_id, session_id,
+                )
+                self._set_busy(session_id, False)
+            else:
+                _logger.info(
+                    "[handle_message] agent=%s session=%s — session busy, injecting into active loop.",
+                    agent_id, session_id,
+                )
+                self._get_inject_queue(session_id).put({
+                    'role': 'user',
+                    'content': _injected_user_content(
+                        message or '[Image]', meta, agent, db_agent_id),
+                })
+                event_stream.emit('message_injected', {
+                    'agent_id': agent_id,
+                    'agent_name': agent.get('name', ''),
+                    'session_id': session_id,
+                    'external_user_id': external_user_id,
+                    'channel_id': channel_id,
+                    'message': message,
+                })
+                return {
+                    "response": None, "injected": True, "tool_trace": [], "timeline": [],
+                    "message_id": message_id,
+                    "client_message_id": meta.get('client_message_id'),
+                }
 
         # Message buffering: debounce rapid messages, then queue
         # Skip when skip_buffer=True (e.g. API routes need synchronous response)
@@ -1221,6 +1808,7 @@ class AgentRuntime:
             task = _QueueTask(agent, SessionContext(session_id, external_user_id, channel_id,
                                                     session_db_agent_id=db_agent_id if is_subagent else None),
                               send_via_channel=True)
+            self._mark_task_queued(task)
             timer = threading.Timer(buffer_seconds, self._enqueue_buffered, args=(task,))
             timer.daemon = True
             with self._buffer_lock:
@@ -1233,8 +1821,14 @@ class AgentRuntime:
                 # If start() fails, cancel the timer and remove it from the dict
                 with self._buffer_lock:
                     self._buffer_timers.pop(session_id, None)
+                self._fail_queued_task(task, 'buffer_timer_failed')
                 raise
-            return {"response": None, "buffered": True, "tool_trace": [], "timeline": []}
+            return {
+                "response": None, "buffered": True, "tool_trace": [], "timeline": [],
+                "message_id": message_id,
+                "client_message_id": meta.get('client_message_id'),
+                "turn_id": task.ctx.turn_id,
+            }
 
         # Inter-agent messages: fire-and-forget (don't block the sender's worker thread).
         # The sub-agent/target processes asynchronously and results are delivered via
@@ -1247,16 +1841,27 @@ class AgentRuntime:
             task = _QueueTask(agent, SessionContext(session_id, external_user_id, channel_id,
                                                     session_db_agent_id=db_agent_id if is_subagent else None),
                               send_via_channel=False)
-            self._message_queue.put(task)
-            return {"response": None, "async": True, "tool_trace": [], "timeline": []}
+            self._put_task(task)
+            return {
+                "response": None, "async": True, "tool_trace": [], "timeline": [],
+                "message_id": message_id,
+                "client_message_id": meta.get('client_message_id'),
+                "turn_id": task.ctx.turn_id,
+            }
 
         # No buffering — queue immediately and wait for result
         task = _QueueTask(agent, SessionContext(session_id, external_user_id, channel_id,
                                                 session_db_agent_id=db_agent_id if is_subagent else None),
-                          send_via_channel=False)
-        self._message_queue.put(task)
+                          send_via_channel=bool(channel_id))
+        self._put_task(task)
         task.event.wait()
-        return task.result
+        result = task.result or {}
+        result.update({
+            'message_id': message_id,
+            'client_message_id': meta.get('client_message_id'),
+            'turn_id': task.ctx.turn_id,
+        })
+        return result
 
     def _enqueue_buffered(self, task: '_QueueTask') -> None:
         """Queue a buffered task, cleaning up its timer even on failure."""
@@ -1266,7 +1871,7 @@ class AgentRuntime:
         except Exception:
             pass  # Timer may already be gone; the context manager handles cleanup
         try:
-            self._message_queue.put(task)
+            self._put_task(task, already_queued=True)
         except Exception:
             _logger.error("Failed to enqueue buffered task for session %s: %s",
                           task.ctx.session_id, traceback.format_exc())
@@ -1275,14 +1880,27 @@ class AgentRuntime:
         """Build messages from DB, call LLM, trigger summarization, return response.
         Uses per-agent/per-model concurrency gate then per-session lock."""
         agent_id = agent['id']
-        # Sub-agents don't exist in the agents DB — use parent's ID for model lookup
         db_agent_id = agent.get('_db_agent_id', agent_id)
         AgentRuntime._touch_session(ctx.session_id)
         try:
-            model = db.get_agent_model(db_agent_id)
+            if agent.get('is_explorer'):
+                from backend.agent_runtime import explorer as _explorer
+                model = _explorer.primary_model(agent) or db.get_agent_model(db_agent_id)
+            elif agent.get('is_simulation'):
+                model = sim_spec.model(agent, db_agent_id)
+            else:
+                model = db.get_agent_model(db_agent_id)
             model_id = model.get('id') if model else None
+            # A per-session model override gates on its own model's concurrency.
+            try:
+                _ss = json.loads(db.get_session_state(ctx.session_id, agent_id=db_agent_id) or '{}')
+                _ov = _ss.get('model_override_id') if isinstance(_ss, dict) else None
+                if _ov and db.get_model_by_id(_ov):
+                    model_id = _ov
+            except Exception:
+                pass
         except Exception as e:
-            _logger.warning("Failed to get default model for agent %s, proceeding without model gating: %s", agent_id, e)
+            _logger.warning("Failed to resolve turn model for agent %s, proceeding without model gating: %s", agent_id, e)
             model_id = None
         with self._llm_serializer._concurrency_mgr.turn_gate(agent_id, model_id):
             session_lock = self._get_session_lock(ctx.session_id)
@@ -1292,12 +1910,28 @@ class AgentRuntime:
     def _do_process(self, agent: dict, ctx: SessionContext) -> dict:
         """Internal: build messages and call LLM (must hold session lock)."""
         agent_id = agent['id']
+        from backend.realtime_store import realtime_store
+        if not realtime_store.start_turn(ctx.turn_id):
+            return {
+                'response': None, 'stopped': True,
+                'tool_trace': [], 'timeline': [],
+            }
         self._set_busy(ctx.session_id, True)
-        self._set_agent_busy(agent_id, ctx.session_id)
+        active = realtime_store.busy_agents().get(agent_id, {})
         event_stream.emit('agent_busy_changed', {
             'agent_id': agent_id,
             'busy': True,
             'session_id': ctx.session_id,
+            'session_ids': active.get('session_ids', [ctx.session_id]),
+            'active_count': active.get('active_count', 1),
+            'state': 'running',
+            'turn_id': ctx.turn_id,
+        })
+        event_stream.emit('turn_begin', {
+            'agent_id': agent_id,
+            'session_id': ctx.session_id,
+            'turn_id': ctx.turn_id,
+            'ts': int(time.time() * 1000),
         })
         _turn_start = time.time()
         _turn_complete_emitted = False
@@ -1331,10 +1965,8 @@ class AgentRuntime:
                     'tool_trace': [],
                     'is_error': True,
                     'thinking_duration': _err_dur,
+                    'turn_id': ctx.turn_id,
                 })
-                self._bg_executor.submit(
-                    lambda sid=ctx.session_id: (time.sleep(SESSION_BUFFER_CLEANUP_DELAY), event_stream.cleanup_session_buffer(sid)),
-                )
             result = {
                 "response": "An unexpected error occurred. Please try again.",
                 "error": True,
@@ -1353,11 +1985,20 @@ class AgentRuntime:
             return result
         finally:
             self._set_busy(ctx.session_id, False)
-            self._clear_agent_busy(agent_id)
+            try:
+                self._flush_session_notes(ctx.session_id)
+            except Exception:
+                _logger.warning("Failed to write held session notes for %s", ctx.session_id, exc_info=True)
+            realtime_store.finish_turn(ctx.turn_id)
+            remaining = realtime_store.busy_agents().get(agent_id)
             event_stream.emit('agent_busy_changed', {
                 'agent_id': agent_id,
-                'busy': False,
-                'session_id': ctx.session_id,
+                'busy': bool(remaining),
+                'session_id': remaining.get('session_id', ctx.session_id) if remaining else ctx.session_id,
+                'session_ids': remaining.get('session_ids', []) if remaining else [],
+                'active_count': remaining.get('active_count', 0) if remaining else 0,
+                'state': remaining.get('state', 'idle') if remaining else 'idle',
+                'turn_id': None,
             })
             # Drain any messages that arrived in the injection queue just as the loop
             # was finishing (race between _is_busy check and loop exit). They are
@@ -1372,8 +2013,12 @@ class AgentRuntime:
             if orphaned:
                 _logger.warning("%d orphaned injected message(s) for %s — re-processing as new turn",
                                  len(orphaned), ctx.session_id)
-                task = _QueueTask(agent, ctx, send_via_channel=bool(ctx.channel_id))
-                self._message_queue.put(task)
+                next_ctx = SessionContext(
+                    ctx.session_id, ctx.external_user_id, ctx.channel_id,
+                    ctx.session_db_agent_id,
+                )
+                task = _QueueTask(agent, next_ctx, send_via_channel=bool(ctx.channel_id))
+                self._put_task(task)
 
     def _check_evonet_offline(self, agent: dict, ctx: SessionContext):
         """Return a completed turn result dict if the agent's Tunnel Workplace is offline,
@@ -1402,13 +2047,17 @@ class AgentRuntime:
         )
 
         db_agent_id = ctx.session_db_agent_id or agent['id']
-        _db_retry(db.add_chat_message, ctx.session_id, 'assistant', reply,
-                  agent_id=db_agent_id, metadata={'evonet_offline': True},
-                  label="save evonet offline reply")
+        message_id = _db_retry(
+            db.add_chat_message, ctx.session_id, 'assistant', reply,
+            agent_id=db_agent_id, metadata={'evonet_offline': True},
+            label="save evonet offline reply",
+        )
+        message_id = message_id if type(message_id) in (int, str) else None
         chatlog_manager.get(db_agent_id, ctx.session_id).append({
             'type': 'final', 'session_id': ctx.session_id,
             'content': reply,
             'metadata': {'evonet_offline': True},
+            'message_id': message_id,
         })
         if ctx.channel_id:
             try:
@@ -1435,6 +2084,7 @@ class AgentRuntime:
             'tool_trace': [],
             'is_error': True,
             'thinking_duration': 0,
+            'message_id': message_id,
         })
         return {'response': reply, 'tool_trace': [], 'error': True}
 
@@ -1448,9 +2098,6 @@ class AgentRuntime:
         """
         agent_id = agent['id']
         db_agent_id = ctx.session_db_agent_id or agent_id
-
-        # Clear any stale stop flag so a previous /stop doesn't kill this new request
-        self._get_stop_event(ctx.session_id).clear()
 
         # Send typing indicator now that processing is actually starting
         if ctx.channel_id:
@@ -1476,12 +2123,53 @@ class AgentRuntime:
         if _early_reply:
             return _early_reply
 
-        # Build messages for LLM (summary-aware)
-        # Try prefetched context from the previous turn's background warmup
-        # (only when disable_turn_prefetch is not set).
+        # ── CMP early boundary hook (offload-aware) ──────────────────────────
+        # Runs BEFORE context assembly so a switch/branch decision shapes this
+        # turn's history window, and gates the prefetch hit (prefetch builds
+        # under the continue assumption). State is persisted immediately so
+        # _restore_agent_state below re-reads consistent post-switch fields.
+        # Rule 0 in the detector guarantees approval-like messages classify
+        # `continue`, so the plan-approval check later is never bypassed.
+        _cmp_early_handled = False
+        _cmp_filter_state = None
+        _cmp_switched_this_turn = False
+        if (agent.get('enable_cmp') and agent.get('enable_agent_state')
+                and not agent.get('is_subagent')):
+            try:
+                _cmp_ms = self._restore_agent_state(db_agent_id, session_id=ctx.session_id)
+                if _cmp_ms is not None:
+                    from backend.agent_runtime import cmp as _cmp_pkg
+                    _cmp_chatlog = chatlog_manager.get(db_agent_id, ctx.session_id)
+                    _cmp_user = _cmp_chatlog.get_last_entry(types=frozenset({'user'}))
+                    _cmp_res = _cmp_pkg.on_turn_boundary(
+                        agent, _cmp_ms, _cmp_chatlog,
+                        (_cmp_user or {}).get('content', ''),
+                        session_id=ctx.session_id, agent_id=agent['id'])
+                    if _cmp_res is not None:
+                        _cmp_early_handled = True
+                        from backend.agent_runtime.llm_loop import _persist_agent_state_split
+                        _persist_agent_state_split(_cmp_ms, agent_id, ctx.session_id, db_agent_id)
+                        _cmp_filter_state = _cmp_ms.cmp
+                        if _cmp_res.get('decision') not in ('continue', 'init'):
+                            _cmp_switched_this_turn = True
+                            _logger.info(
+                                "CMP boundary(early): %s -> %s (layer %s) for session %s",
+                                _cmp_res.get('decision'), _cmp_res.get('target'),
+                                _cmp_res.get('layer'), ctx.session_id)
+            except Exception:
+                _logger.exception("CMP early boundary hook failed — full-history turn")
+                _cmp_filter_state = None
+
+        # Build messages for LLM (summary-aware). A prefetch is valid only if
+        # it was assembled under the current summary watermark; summarization
+        # can advance asynchronously after the background warmup completes.
+        summary_record = db.get_summary(ctx.session_id, agent_id=db_agent_id)
+        summary_watermark = (summary_record.get('last_message_ts')
+                             if summary_record else None)
         _prefetch = None
-        if not agent.get('disable_turn_prefetch', 0):
-            _prefetch = self._prefetcher.try_get(ctx.session_id)
+        if not agent.get('disable_turn_prefetch', 0) and not _cmp_switched_this_turn:
+            _prefetch = self._prefetcher.try_get(
+                ctx.session_id, summary_watermark=summary_watermark)
         if _prefetch and _prefetch.agent_id == agent_id:
             system_prompt = _prefetch.system_prompt
             tools = _prefetch.tools
@@ -1493,8 +2181,8 @@ class AgentRuntime:
             _used_prefetch = True
             _logger.debug("Turn prefetch HIT for session %s — skipping context build", ctx.session_id)
         else:
-            system_prompt = _ctx.build_system_prompt(agent)
-            tools = _ctx.build_tools(agent)
+            system_prompt = _ctx.build_system_prompt(agent, injected_system_vars=agent.get('injected_system_vars'))
+            tools = _ctx.build_tools(agent, channel_id=ctx.channel_id)
             _used_prefetch = False
             messages = [{"role": "system", "content": system_prompt}]
 
@@ -1522,42 +2210,74 @@ class AgentRuntime:
         # _should_wrap_user_message is defined at module level (also used by handle_message).
         # Keep this alias so the rest of _do_process_inner reads naturally.
 
+        # Will be set to True if describe_image is in the agent's assigned_tool_ids.
+        # Must exist before _apply_multimodal so the closure can capture it.
+        _has_describe_image = False
+
         def _apply_multimodal(msg: dict) -> dict:
-            """Apply multimodal formatting for user messages with image/audio/video if agent supports it."""
+            """Apply multimodal formatting for user messages with video if agent supports it.
+
+            Images are NEVER auto-fed to the main LLM — images are always accessed via
+            the ``describe_image`` tool instead. Audio is likewise never auto-fed —
+            agents listen to it via the ``transcribe_audio`` tool.
+            """
             if msg.get('role') != 'user':
                 return msg
-            img = msg.pop('_image_url', None) if agent.get('vision_enabled') else msg.pop('_image_url', None) and None
-            audio = msg.pop('_audio_url', None) if agent.get('audio_enabled') else msg.pop('_audio_url', None) and None
+            # Always pop _image_url/_audio_url but NEVER feed them to the LLM.
+            msg.pop('_image_url', None)
+            msg.pop('_audio_url', None)
+            # Append authoritative structured metadata, including the numeric ID
+            # required by read_attachment. This also repairs legacy message text
+            # that omitted the ID when restored from JSONL.
+            _att = msg.pop('attachment_info', None) or msg.get('attachment_info')
+            _atts = msg.pop('attachment_infos', None) or []
+            _atts = [i for i in _atts if isinstance(i, dict)]
+            if len(_atts) > 1 or (_atts and not _att):
+                # Several attachments in one message: note every one, not just the
+                # first (the singular key is only set for a single attachment).
+                _text = msg.get('content', '') or ''
+                _atts = [i for i in _atts
+                         if f"Attachment ID: {i.get('attachment_id')}" not in _text]
+                if _atts:
+                    msg['content'] = _text.rstrip() + _ctx.build_attachment_notes(
+                        _atts,
+                        has_describe_image=_has_describe_image,
+                        audio_enabled=bool(agent.get('audio_enabled')),
+                    )
+            elif _att and isinstance(_att, dict):
+                _ctx.append_attachment_note(
+                    msg,
+                    _att,
+                    has_describe_image=_has_describe_image,
+                    audio_enabled=bool(agent.get('audio_enabled')),
+                )
             video = msg.pop('_video_url', None) if agent.get('video_enabled') else msg.pop('_video_url', None) and None
-            if not img and not audio and not video:
+            if not video:
                 return msg
             parts = []
             text_content = msg.get('content', '')
             if text_content and text_content not in ('[Image]', '[Audio]', '[Video]'):
                 parts.append({"type": "text", "text": text_content})
-            if img:
-                parts.append({"type": "image_url", "image_url": {"url": img}})
-            if audio:
-                # OpenAI-compatible input_audio format
-                # Extract base64 data and format from data URL
-                if audio.startswith("data:"):
-                    try:
-                        header, b64data = audio.split(",", 1)
-                        # e.g. data:audio/ogg;base64 → ogg
-                        fmt = header.split(":")[1].split(";")[0].split("/")[1]
-                    except (ValueError, IndexError):
-                        fmt, b64data = "wav", audio
-                    parts.append({"type": "input_audio", "input_audio": {"data": b64data, "format": fmt}})
-                else:
-                    parts.append({"type": "input_audio", "input_audio": {"data": audio, "format": "wav"}})
             if video:
                 parts.append({"type": "video_url", "video_url": {"url": video}})
             if not parts or parts[0].get('type') != 'text':
                 parts.insert(0, {"type": "text", "text": "What is in this media?"})
             return {**msg, 'content': parts}
 
-        summary_record = db.get_summary(ctx.session_id, agent_id=db_agent_id)
         chatlog = chatlog_manager.get(db_agent_id, ctx.session_id)
+
+        # Compute whether describe_image is assigned so the _apply_multimodal
+        # closure can conditionally inject the hint.  Done early because
+        # _apply_multimodal is called during message building below.
+        # Describes whether the agent has (or will receive — via auto-assign
+        # below) access to the describe_image tool.
+        if _used_prefetch:
+            _has_describe_image = 'describe_image' in _agent_ctx_prebuilt.get('assigned_tool_ids', [])
+        else:
+            _has_describe_image = (
+                'describe_image' in db.get_agent_tools(db_agent_id)
+                or bool(agent.get('vision_enabled', 1))
+            )
 
         if _used_prefetch:
             # Prefetch already contains the full conversation history (system prompt +
@@ -1575,18 +2295,34 @@ class AgentRuntime:
                     _img = _cur_meta.get('image_url')
                     if _img:
                         _cur_msg['_image_url'] = _img
-                    _aud = _cur_meta.get('audio_url')
-                    if _aud:
-                        _cur_msg['_audio_url'] = _aud
                     _vid = _cur_meta.get('video_url')
                     if _vid:
                         _cur_msg['_video_url'] = _vid
+                    _atts = _cur_meta.get('attachment_infos')
+                    if isinstance(_atts, list):
+                        _cur_msg['attachment_infos'] = _atts
+                    _att = _cur_meta.get('attachment_info')
+                    if _att:
+                        _cur_msg['attachment_info'] = _att
                     messages.append(_apply_multimodal(_cur_msg))
         else:
-            # Prefer JSONL-based context if the log has entries for this session
-            _jsonl_entries = chatlog.get_entries_for_llm(
-                after_ts=summary_record.get('last_message_ts') if summary_record else None,
-            )
+            # Prefer JSONL-based context if the log has entries for this session.
+            # CMP offload: with multiple paths, scope the history window to the
+            # active path's segments (shared builder — same as prefetch).
+            _jsonl_entries = None
+            try:
+                from backend.agent_runtime.cmp import assembler as _cmp_asm
+                if _cmp_asm.should_filter(_cmp_filter_state):
+                    _jsonl_entries = _cmp_asm.build_history(
+                        chatlog, summary_record, _cmp_filter_state)
+            except Exception:
+                _logger.exception("CMP history filter failed — using full history")
+                _jsonl_entries = None
+            if _jsonl_entries is None:
+                _jsonl_entries = chatlog.get_entries_for_llm_trail(
+                    after_ts=summary_record.get('last_message_ts') if summary_record else None,
+                    **_ctx.trail_history_kwargs(agent_id),
+                )
             # NOTE: The second condition handles an edge case where _jsonl_entries is empty
             # but the chatlog still has entries for this session. This happens when ALL
             # messages after the summary are themselves covered by the summary (after_ts
@@ -1638,21 +2374,16 @@ class AgentRuntime:
                         tail_start += 1
                     for msg in raw_tail[tail_start:]:
                         if not _is_legacy_agent_state_msg(msg) and not _is_ui_only_msg(msg) and not _is_slash_command_msg(msg):
-                            messages.append(_ctx.build_message_entry(msg, agent))
+                            messages.append(_ctx.build_message_entry(msg, agent, _has_describe_image))
                 else:
                     history = db.get_session_messages(ctx.session_id, limit=50, agent_id=db_agent_id)
                     for msg in history:
                         if not _is_legacy_agent_state_msg(msg) and not _is_ui_only_msg(msg) and not _is_slash_command_msg(msg):
-                            messages.append(_ctx.build_message_entry(msg, agent))
+                            messages.append(_ctx.build_message_entry(msg, agent, _has_describe_image))
 
         # Ensure messages don't end with assistant role (causes prefill error with some APIs)
         while len(messages) > 1 and messages[-1].get('role') == 'assistant':
             messages.pop()
-
-        # Inject long-term memories (position 1, right after system prompt)
-        memory_section = get_memories_for_context(db_agent_id, messages)
-        if memory_section:
-            messages.insert(1, {"role": "system", "content": memory_section})
 
         # Inject inter-agent session context so the agent is aware of the situation
         if ctx.external_user_id.startswith("__agent__"):
@@ -1690,60 +2421,108 @@ class AgentRuntime:
                 if chan_instr:
                     messages.insert(1, {"role": "system", "content": chan_instr})
 
-        # Inject channel user identity so the agent knows who it's speaking with.
-        # This is authoritative for the session and overrides any stale remembered name.
-        # Skip if the identity was already injected (e.g. via prefetcher) to avoid
-        # piling up duplicates across turns.
-        if ctx.channel_id and not ctx.external_user_id.startswith("__agent__"):
-            _already_injected = any(
-                "## Current User" in (m.get("content") or "")
-                for m in messages[:6]
+        # Inject trusted channel sender identity for eligible human-facing sessions.
+        # Skip if already present (e.g. via prefetcher) to avoid duplicate blocks.
+        _already_injected = any(
+            "## Current User" in (m.get("content") or "")
+            for m in messages[:6]
+        )
+        if not _already_injected:
+            user_id_ctx = _ctx.build_user_identity_context(
+                ctx.channel_id, ctx.external_user_id,
             )
-            if not _already_injected:
-                user_id_ctx = _ctx.build_user_identity_context(
-                    ctx.channel_id, ctx.external_user_id,
-                )
-                if user_id_ctx:
-                    messages.insert(1, {"role": "system", "content": user_id_ctx})
+            if user_id_ctx:
+                messages.insert(1, {"role": "system", "content": user_id_ctx})
 
         # Build tool definitions (use prefetched if available)
         if _used_prefetch:
-            tools = _tools_prebuilt
-            assigned_tool_ids = _agent_ctx_prebuilt.get('assigned_tool_ids', [])
+            tools = list(_tools_prebuilt)
+            assigned_tool_ids = list(_agent_ctx_prebuilt.get('assigned_tool_ids', []))
             agent_context = dict(_agent_ctx_prebuilt)  # shallow copy to allow mutations
         else:
-            tools = _ctx.build_tools(agent)
+            tools = _ctx.build_tools(agent, channel_id=ctx.channel_id)
 
-            # Build agent context for tool backends
-            assigned_tool_ids = db.get_agent_tools(db_agent_id)
+            # Build agent context for tool backends. Explorers use their own
+            # configured tool set; everyone else resolves through sim_spec so
+            # this allowlist matches what build_tools() exposed to the model.
+            if agent.get('is_explorer'):
+                from backend.agent_runtime import explorer as _explorer
+                assigned_tool_ids = list(_explorer.tool_ids(agent))
+            else:
+                assigned_tool_ids = list(sim_spec.tools(agent, db_agent_id))
 
-            # Super agent gets all skill tool IDs automatically — authorization guard
-            # must allow execution of all skill tools without per-skill assignment.
-            if agent.get('is_super'):
+            # Inter-agent communication is enabled by the agent-level toggle;
+            # send_agent_message is therefore available without a separate tool
+            # assignment, matching build_tools() exposure.
+            if (agent.get('agent_messaging_enabled') != 0
+                    and 'send_agent_message' not in assigned_tool_ids):
+                assigned_tool_ids.append('send_agent_message')
+
+            # Inject skill tool IDs from assigned skills into assigned_tool_ids.
+            # This mirrors context.py build_tools() Layer 9 auto-injection and
+            # ensures the authorization guard allows execution of skill tools
+            # that belong to skills explicitly assigned to the agent.
+            # Skill tool IDs are namespaced: skill:<skill_id>:<fn_name>
+            assigned_skill_ids = set(sim_spec.skills(agent, db_agent_id))
+            if assigned_skill_ids:
                 from backend.skills_manager import skills_manager
-                _all_skill_ids = set()
+                _existing = set(assigned_tool_ids)
                 for _sd in skills_manager.get_all_skill_tool_defs():
                     _tid = _sd.get('id', '')
-                    if _tid:
-                        _all_skill_ids.add(_tid)
-                _existing = set(assigned_tool_ids)
-                for _tid in _all_skill_ids:
-                    if _tid not in _existing:
+                    if not _tid:
+                        continue
+                    # Parse skill:<skill_id>:<fn_name>
+                    _parts = _tid.split(':', 2)
+                    if len(_parts) != 3 or _parts[0] != 'skill':
+                        continue
+                    _skill_id = _parts[1]
+                    if _skill_id in assigned_skill_ids and _tid not in _existing:
                         assigned_tool_ids.append(_tid)
 
-            # Agents with save_artifact automatically get list_artifacts + fetch_artifact.
-            # No DB assignment needed — every artifacts-enabled agent can search and fetch their files.
-            if 'save_artifact' in assigned_tool_ids:
-                if 'list_artifacts' not in assigned_tool_ids:
-                    assigned_tool_ids.append('list_artifacts')
-                if 'fetch_artifact' not in assigned_tool_ids:
-                    assigned_tool_ids.append('fetch_artifact')
+            # Auto-assign artifact tools (save_artifact, list_artifacts, fetch_artifact)
+            # only when artifacts_enabled is True for the agent.
+            if agent.get('artifacts_enabled', True):
+                if 'save_artifact' not in assigned_tool_ids:
+                    assigned_tool_ids.append('save_artifact')
+
+                # Agents with save_artifact automatically get list_artifacts.
+                # fetch_artifact is only auto-assigned for agents with workplace or sandbox;
+                # local agents can access artifacts directly via bash/runpy.
+                if 'save_artifact' in assigned_tool_ids:
+                    if 'list_artifacts' not in assigned_tool_ids:
+                        assigned_tool_ids.append('list_artifacts')
+                    if agent.get('workplace_id') or agent.get('sandbox_enabled', 0):
+                        if 'fetch_artifact' not in assigned_tool_ids:
+                            assigned_tool_ids.append('fetch_artifact')
+
+            # Auto-assign send_file to all agents so they can send files via channels.
+            # No DB assignment needed — every agent can send file attachments.
+            if 'send_file' not in assigned_tool_ids:
+                assigned_tool_ids.append('send_file')
+
+            # Agents with vision_enabled automatically get describe_image.
+            # No DB assignment needed — every vision-capable agent can analyze images.
+            if agent.get('vision_enabled', 1) and 'describe_image' not in assigned_tool_ids:
+                assigned_tool_ids.append('describe_image')
+
+            # ask_user_question is on unless the agent turned it off.
+            if agent.get('ask_user_enabled', 1) and 'ask_user_question' not in assigned_tool_ids:
+                assigned_tool_ids.append('ask_user_question')
+
+            # Agents with audio_enabled automatically get transcribe_audio.
+            if agent.get('audio_enabled') and 'transcribe_audio' not in assigned_tool_ids:
+                assigned_tool_ids.append('transcribe_audio')
 
             # Resolve workspace: workplace config takes priority over agent.workspace.
             # For tunnel workplaces, never fall back to the agent's /workspace path —
             # Evonet runs on the remote device and has its own working directory.
+            # EXPLORERS: their workspace is set by explorer.build_config to the
+            # user-requested absolute path (the 'path' parameter of Explore).
+            # Use it directly — the workplace_id is only for SSH backend routing.
             _workplace_id = agent.get('workplace_id') or None
-            if _workplace_id:
+            if agent.get('is_explorer'):
+                _workspace = agent.get('workspace') or None
+            elif _workplace_id:
                 try:
                     import json as _json
                     _workplace = db.get_workplace(_workplace_id)
@@ -1757,28 +2536,89 @@ class AgentRuntime:
             else:
                 _workspace = agent.get('workspace') or None
 
+            # A LID-addressed WhatsApp DM reaches us as bare LID digits, which
+            # look exactly like a phone number. Resolve the real identity once
+            # here so tools never have to guess from user_id.
+            from backend.channels.whatsapp_identity import resolve_identity
+            _identity = resolve_identity(ctx.channel_id, ctx.external_user_id)
+
             agent_context = {
                 'id': agent_id,
+                '_db_agent_id': agent.get('_db_agent_id', agent_id),
                 'name': agent.get('name', ''),
                 'agent_name': agent.get('name', ''),
                 'agent_model': None,
                 'user_id': ctx.external_user_id,
+                'user_phone': _identity['user_phone'],
+                'user_jid': _identity['user_jid'],
+                'user_id_namespace': _identity['user_id_namespace'],
                 'channel_id': ctx.channel_id,
                 'session_id': ctx.session_id,
                 'assigned_tool_ids': assigned_tool_ids,
                 'workspace': _workspace,
                 'workplace_id': _workplace_id,
+                'send_file_allowed_path_regex': agent.get('send_file_allowed_path_regex', ''),
                 'is_super': bool(agent.get('is_super')),
                 'is_subagent': bool(agent.get('is_subagent')),
+                'is_explorer': bool(agent.get('is_explorer')),
+                'is_simulation': bool(agent.get('is_simulation')),
+                'simulation_id': agent.get('simulation_id'),
+                'simulation_root': agent.get('simulation_root'),
                 'parent_id': agent.get('parent_id'),
+                '_sandbox_parent_session_id': agent.get('_sandbox_parent_session_id'),
+                '_sandbox_parent_workspace': agent.get('_sandbox_parent_workspace'),
                 'agent_messaging_enabled': bool(agent.get('agent_messaging_enabled')),
                 'sandbox_enabled': agent.get('sandbox_enabled', 1),
                 'safety_checker_enabled': agent.get('safety_checker_enabled', 1),
                 'disable_parallel_tool_execution': agent.get('disable_parallel_tool_execution', 0),
                 'disable_turn_prefetch': agent.get('disable_turn_prefetch', 0),
-                'variables': db.get_agent_variables_dict(db_agent_id),
+                'variables': sim_spec.variable_dict(agent, db_agent_id),
                 'run_as_user': agent.get('run_as_user'),
+                'vision_model_id': agent.get('vision_model_id'),
+                'vision_enabled': agent.get('vision_enabled', 1),
+                'audio_enabled': agent.get('audio_enabled', 0),
+                'messaging_acl': agent.get('messaging_acl'),
+                'messaging_acl_mode': agent.get('messaging_acl_mode', 'whitelist'),
+                'enable_cmp': bool(agent.get('enable_cmp')) and bool(agent.get('enable_agent_state')),
+                'workplace_switch_enabled': bool(agent.get('workplace_switch_enabled')),
             }
+        _last_user = chatlog.get_last_entry(types=frozenset({'user'}))
+        assigned_tool_ids, tools = _apply_restart_origin_guard(
+            agent_context, assigned_tool_ids, tools,
+            (_last_user or {}).get('metadata') or {},
+        )
+
+        # Propagate trusted identity metadata from the channel into agent_context
+        # so synchronous lifecycle gates (e.g. workflow_guard) receive stable,
+        # attested message/attachment identifiers.
+        _trusted_meta = (_last_user or {}).get('metadata') or {}
+        if isinstance(_trusted_meta, dict):
+            if _trusted_meta.get('channel_message_id'):
+                agent_context['trusted_message_id'] = str(_trusted_meta['channel_message_id'])
+            if _trusted_meta.get('attachment_info'):
+                _a_info = _trusted_meta['attachment_info']
+                _att_infos = _a_info if isinstance(_a_info, list) else [_a_info]
+                _att_ids = []
+                _att_mime_types = []
+                _att_paths = []
+                for _att in _att_infos:
+                    if not isinstance(_att, dict):
+                        continue
+                    _att_id = _att.get('id') or _att.get('attachment_id')
+                    if _att_id is not None:
+                        _att_ids.append(str(_att_id))
+                    if _att.get('mime_type'):
+                        _att_mime_types.append(str(_att['mime_type']))
+                    _att_path = _att.get('workplace_path') or _att.get('file_path')
+                    if _att_path:
+                        _att_paths.append(str(_att_path))
+                if _att_ids:
+                    agent_context['trusted_attachment_ids'] = _att_ids
+                if _att_mime_types:
+                    agent_context['trusted_attachment_mime_types'] = _att_mime_types
+                if _att_paths:
+                    agent_context['trusted_attachment_paths'] = _att_paths
+
         # Propagate agent_message_depth and from_agent_id from incoming message metadata
         if ctx.external_user_id.startswith("__agent__"):
             _last_user = chatlog.get_last_entry(types=frozenset({'user'}))
@@ -1789,6 +2629,11 @@ class AgentRuntime:
                         agent_context['agent_message_depth'] = _meta['agent_message_depth']
                     if _meta.get('from_agent_id'):
                         agent_context['from_agent_id'] = _meta['from_agent_id']
+                    if _meta.get('injected_system_vars') is not None:
+                        agent_context['injected_system_vars'] = _meta['injected_system_vars']
+                    for _key in ('report_to_id', 'report_to_channel_id', 'session_id', 'reply_to_id'):
+                        if _meta.get(_key) is not None:
+                            agent_context[f'origin_{_key}'] = _meta[_key]
             else:
                 # Fall back to SQLite for pre-migration sessions
                 _recent = db.get_session_messages(ctx.session_id, limit=5, agent_id=db_agent_id)
@@ -1800,6 +2645,11 @@ class AgentRuntime:
                                 agent_context['agent_message_depth'] = _meta['agent_message_depth']
                             if _meta.get('from_agent_id'):
                                 agent_context['from_agent_id'] = _meta['from_agent_id']
+                            if _meta.get('injected_system_vars') is not None:
+                                agent_context['injected_system_vars'] = _meta['injected_system_vars']
+                            for _key in ('report_to_id', 'report_to_channel_id', 'session_id', 'reply_to_id'):
+                                if _meta.get(_key) is not None:
+                                    agent_context[f'origin_{_key}'] = _meta[_key]
                         break
 
         # Agent state: restore or create, then check for user approval
@@ -1821,9 +2671,9 @@ class AgentRuntime:
                             _user_text = _c
                         break
                 if classify_task(_user_text) == "trivial":
-                    ms = AgentState(mode="execute", auto_trivial=True)
+                    ms = AgentState(mode="execute", auto_trivial=True, always_execute=bool(agent.get('always_execute')))
                 else:
-                    ms = AgentState()
+                    ms = AgentState(always_execute=bool(agent.get('always_execute')))
             # Hybrid approval: only check if state was restored (agent already presented a plan).
             # Skip for new sessions so the first user message never auto-approves a non-existent plan.
             if not is_new_session and ms.mode == 'plan':
@@ -1843,7 +2693,40 @@ class AgentRuntime:
                         # System-triggered task (e.g. from a plugin): reset to fresh plan mode
                         # so the agent can start a new plan cycle for this task
                         # instead of being stuck in a stale plan from a previous task.
-                        ms = AgentState()
+                        ms = AgentState(always_execute=bool(agent.get('always_execute')))
+            # Cross-task boundary handling. CMP (when enabled) owns it: the
+            # detector routes the turn (continue/return/branch) and a branch
+            # starts a fresh plan cycle on its own path.
+            _boundary_text = ""
+            if not agent.get('is_subagent'):
+                for _msg in reversed(messages):
+                    if _msg.get('role') == 'user':
+                        _c = _msg.get('content', '')
+                        _boundary_text = (
+                            next((p.get('text', '') for p in _c
+                                  if isinstance(p, dict) and p.get('type') == 'text'), '')
+                            if isinstance(_c, list) else _c)
+                        break
+            # The early hook (before context assembly) normally owns CMP; this
+            # late slot only covers turns it skipped — e.g. brand-new sessions
+            # where agent state didn't exist yet at assembly time (first-path
+            # init happens here, after the classifier created ms).
+            if (not _cmp_early_handled
+                    and agent.get('enable_cmp') and agent.get('enable_agent_state')
+                    and not agent.get('is_subagent')):
+                try:
+                    from backend.agent_runtime import cmp as _cmp_pkg
+                    _cmp_chatlog = chatlog_manager.get(db_agent_id, ctx.session_id)
+                    _cmp_res = _cmp_pkg.on_turn_boundary(
+                        agent, ms, _cmp_chatlog, _boundary_text,
+                        session_id=ctx.session_id, agent_id=agent['id'])
+                    if _cmp_res and _cmp_res.get('decision') not in ('continue', 'init'):
+                        _logger.info("CMP boundary: %s -> %s (layer %s) for session %s",
+                                     _cmp_res.get('decision'), _cmp_res.get('target'),
+                                     _cmp_res.get('layer'), ctx.session_id)
+                except Exception:
+                    _logger.exception("CMP boundary check failed — keeping current state")
+
             # Sub-agents receive delegated tasks from their parent and
             # should never require plan/approval cycles. Force execute mode.
             if agent.get('is_subagent'):
@@ -1887,7 +2770,8 @@ class AgentRuntime:
 
         # Apply preference wrapper prefix to user messages if enabled
         _apply_wrapper_prefix(messages, _should_wrap_user_message(agent),
-                              is_stale=is_stale, stale_threshold=stale_threshold)
+                              is_stale=is_stale, stale_threshold=stale_threshold,
+                              loaded_skills_count=len(self._session_skill_tools.get(ctx.session_id, {})))
 
         # Sub-agents run delegated tasks with plan/approval disabled (see force-execute
         # above). Tell the LLM explicitly so it doesn't emit a plan and stop.
@@ -1898,6 +2782,24 @@ class AgentRuntime:
             )
             if not _already_subagent_directive:
                 messages.insert(1, {"role": "system", "content": SUBAGENT_EXECUTE_DIRECTIVE})
+
+        # --- Background jobs injection ---
+        # The agent sees a background process once, in the bash result that
+        # spawned it; nothing surfaces it again. Re-state what is still running
+        # so it does not leave processes to go stale. Appended at the END: the
+        # list changes every turn, and inserting it up front would invalidate the
+        # prompt prefix cache for the whole history. Must run after
+        # _apply_wrapper_prefix, which identifies the current user message by
+        # position (last in the list).
+        if BACKGROUND_JOBS_INJECTION_ENABLED:
+            try:
+                from backend.agent_runtime.background_jobs import build_context_block
+                _bg_ctx = build_context_block(
+                    ctx.session_id, agent.get('agent_id') or agent.get('id') or '')
+                if _bg_ctx:
+                    messages.append({"role": "system", "content": _bg_ctx})
+            except Exception:
+                _logger.exception("[bgjob] context injection failed — continuing")
 
         # Call LLM with tool loop
         _inner_turn_start = time.time()
@@ -1919,20 +2821,28 @@ class AgentRuntime:
             _sa_heartbeat.start()
 
         try:
-            response_raw, tool_trace, timeline = _loop.run_tool_loop(
-                agent=agent,
-                agent_context=agent_context,
-                messages=messages,
-                tools=tools,
-                session_id=ctx.session_id,
-                llm_lock=self._llm_serializer._llm_lock,
-                stop_event=self._get_stop_event(ctx.session_id),
-                session_skill_mds=self._session_skill_mds,
-                session_skill_tools=self._session_skill_tools,
-                llm_log_path=_llm_log_path(db_agent_id),
-                inject_queue=self._get_inject_queue(ctx.session_id),
-                session_db_agent_id=db_agent_id,
-            )
+            from backend.llm_usage_events import usage_context
+            if agent.get('is_kb_organizer'):
+                _usage_source = 'kb_organizer'   # distinct usage category for the token monitor
+            elif agent.get('is_explorer'):
+                _usage_source = 'explorer'
+            else:
+                _usage_source = 'agent_turn'
+            with usage_context(_usage_source, agent_id, agent.get('name'), ctx.session_id):
+                response_raw, tool_trace, timeline = _loop.run_tool_loop(
+                    agent=agent,
+                    agent_context=agent_context,
+                    messages=messages,
+                    tools=tools,
+                    session_id=ctx.session_id,
+                    llm_lock=self._llm_serializer._llm_lock,
+                    stop_event=self._get_stop_event(ctx.session_id),
+                    session_skill_mds=self._session_skill_mds,
+                    session_skill_tools=self._session_skill_tools,
+                    llm_log_path=_llm_log_path(db_agent_id),
+                    inject_queue=self._get_inject_queue(ctx.session_id),
+                    session_db_agent_id=db_agent_id,
+                )
         finally:
             if _sa_heartbeat:
                 _sa_stop.set()
@@ -1967,6 +2877,15 @@ class AgentRuntime:
         if is_error:
             result["error"] = True
 
+        last_assistant = db.get_last_assistant_message(
+            ctx.session_id, agent_id=db_agent_id,
+        )
+        response_message_id = (
+            last_assistant.get('id')
+            if last_assistant and last_assistant.get('content') == response_text
+            else None
+        )
+        result['response_message_id'] = response_message_id
         # Emit turn_complete event
         event_stream.emit('turn_complete', {
             'agent_id': agent_id,
@@ -1978,12 +2897,9 @@ class AgentRuntime:
             'tool_trace': tool_trace,
             'is_error': is_error,
             'thinking_duration': round(time.time() - _inner_turn_start, 1),
+            'turn_id': ctx.turn_id,
+            'message_id': response_message_id,
         })
-        # Clean up per-session buffer after a delay to allow gap-fill requests to complete.
-        # Use executor to avoid timer leak (old timer never cancelled).
-        self._bg_executor.submit(
-            lambda sid=ctx.session_id: (time.sleep(SESSION_BUFFER_CLEANUP_DELAY), event_stream.cleanup_session_buffer(sid)),
-        )
 
         return result
 
@@ -2034,7 +2950,7 @@ class AgentRuntime:
             agent=agent,
             ctx=SessionContext(session_id, external_user_id, channel_id, session_db_agent_id),
         )
-        self._message_queue.put(task)
+        self._put_task(task)
 
     def get_compiled_context(self, agent_id: str, user_id: str = None) -> dict:
         """Return the compiled system prompt and tool definitions for an agent."""
@@ -2048,31 +2964,16 @@ class AgentRuntime:
         """
         entry = {"role": msg["role"]}
         _msg_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
-        msg_image = _msg_meta.get("image_url") if _msg_meta else None
-        msg_audio = _msg_meta.get("audio_url") if _msg_meta else None
         msg_video = _msg_meta.get("video_url") if _msg_meta else None
-        has_image = msg_image and agent.get("vision_enabled")
-        has_audio = msg_audio and agent.get("audio_enabled")
+        # Images are NEVER auto-fed — use describe_image tool instead.
+        # Audio is likewise never auto-fed — use transcribe_audio tool instead.
         has_video = msg_video and agent.get("video_enabled")
-        if has_image or has_audio or has_video:
+        if has_video:
             parts = []
             text_content = msg.get("content", "")
             if text_content and text_content not in ("[Image]", "[Audio]", "[Video]"):
                 parts.append({"type": "text", "text": text_content})
-            if has_image:
-                parts.append({"type": "image_url", "image_url": {"url": msg_image}})
-            if has_audio:
-                if msg_audio.startswith("data:"):
-                    try:
-                        header, b64data = msg_audio.split(",", 1)
-                        fmt = header.split(":")[1].split(";")[0].split("/")[1]
-                    except (ValueError, IndexError):
-                        fmt, b64data = "wav", msg_audio
-                    parts.append({"type": "input_audio", "input_audio": {"data": b64data, "format": fmt}})
-                else:
-                    parts.append({"type": "input_audio", "input_audio": {"data": msg_audio, "format": "wav"}})
-            if has_video:
-                parts.append({"type": "video_url", "video_url": {"url": msg_video}})
+            parts.append({"type": "video_url", "video_url": {"url": msg_video}})
             if not parts or parts[0].get("type") != "text":
                 parts.insert(0, {"type": "text", "text": "What is in this media?"})
             entry["content"] = parts
@@ -2170,12 +3071,26 @@ class AgentRuntime:
                 reply = (f"Sorry, I'm busy with {reason}. "
                          f"Want me to let you know when I'm done?")
 
-        _db_retry(db.add_chat_message, session_id, 'assistant', reply,
-                  agent_id=agent_id, metadata={"busy_rejection": True},
-                  label="save busy rejection")
+        message_id = _db_retry(
+            db.add_chat_message, session_id, 'assistant', reply,
+            agent_id=agent_id, metadata={"busy_rejection": True},
+            label="save busy rejection",
+        )
+        message_id = message_id if type(message_id) in (int, str) else None
         chatlog_manager.get(agent_id, session_id).append({'type': 'final', 'session_id': session_id,
                                                           'content': reply,
-                                                          'metadata': {'busy_rejection': True}})
+                                                          'metadata': {'busy_rejection': True},
+                                                          'message_id': message_id})
+        event_stream.emit('message_received', {
+            'agent_id': agent_id, 'session_id': session_id,
+            'external_user_id': external_user_id, 'channel_id': channel_id,
+            'message': reply, 'message_id': message_id,
+            'metadata': {'busy_rejection': True}, 'role': 'assistant',
+        })
+        # Record the deferral so the pending user message is auto-resumed once the
+        # agent is free and unfocused (drained in _send_free_notification). Queued
+        # on the opt-in branch too — the real answer supersedes the notification.
+        self._queue_deferred_resume(agent_id, session_id, external_user_id, channel_id)
         # Send via channel if applicable
         if channel_id:
             try:
@@ -2221,10 +3136,31 @@ class AgentRuntime:
                 'channel_id': channel_id,
             }
 
+    # Sessions rejected while the agent was focus-busy, awaiting auto-resume:
+    # agent_id -> {session_id: {'external_user_id': str, 'channel_id': str|None}}
+    # Drained by _send_free_notification once the agent is free and unfocused.
+    _deferred_resume_pending: dict = {}
+    _deferred_resume_lock = threading.Lock()
+
+    @classmethod
+    def _queue_deferred_resume(cls, agent_id: str, session_id: str,
+                                external_user_id: str, channel_id: Optional[str]) -> None:
+        """Record a busy-rejected session so it is re-run when the agent frees up."""
+        with cls._deferred_resume_lock:
+            cls._deferred_resume_pending.setdefault(agent_id, {})[session_id] = {
+                'external_user_id': external_user_id,
+                'channel_id': channel_id,
+            }
+
     def clear_session(self, agent_id: str, external_user_id: str, channel_id: Optional[str] = None) -> None:
         """Clear chat history for a user's session."""
         session_id = db.get_or_create_session(agent_id, external_user_id, channel_id)
         db.clear_session(session_id, agent_id=agent_id)
+        event_stream.emit('session_clear', {
+            'agent_id': agent_id,
+            'session_id': session_id,
+            'turn_id': None,
+        })
         self._session_skill_mds.pop(session_id, None)
         self._session_skill_tools.pop(session_id, None)
 
@@ -2245,15 +3181,35 @@ class AgentRuntime:
         return [{"skill_id": sk_id, "tool_count": len(tool_defs)}
                 for sk_id, tool_defs in skills_data.items()]
 
-    def send_as_bot(self, session_id: str, text: str) -> bool:
+    def send_as_bot(self, session_id: str, text: str,
+                    metadata: dict | None = None) -> bool:
         """Admin takeover: save message as assistant and send via channel."""
         session = db.get_session_with_details(session_id)
         if not session:
             return False
-        db.add_chat_message(session_id, 'assistant', text, agent_id=session['agent_id'])
+        meta = {'admin_takeover': True}
+        if metadata:
+            meta.update(metadata)
+        message_id = db.add_chat_message(
+            session_id, 'assistant', text,
+            agent_id=session['agent_id'], metadata=meta,
+        )
+        message_id = message_id if type(message_id) in (int, str) else None
         chatlog_manager.get(session['agent_id'], session_id).append(
             {'type': 'final', 'session_id': session_id, 'content': text,
-             'metadata': {'admin_takeover': True}})
+             'metadata': meta, 'message_id': message_id})
+        event_stream.emit('message_received', {
+            'agent_id': session['agent_id'],
+            'session_id': session_id,
+            'external_user_id': session.get('external_user_id', ''),
+            'channel_id': session.get('channel_id'),
+            'message': text,
+            'message_id': message_id,
+            'client_message_id': meta.get('client_message_id'),
+            'metadata': meta,
+            'role': 'assistant',
+            'sender': 'admin',
+        })
         # Send via channel if available
         if session.get('channel_id'):
             instance = channel_manager._active.get(session['channel_id'])
@@ -2321,25 +3277,100 @@ class AgentRuntime:
         }
 
         # 3. Write chat entry
-        if caption:
+        if is_image:
+            content = f"![{filename}](/api/attachments/{attachment_id}/view)"
+            if caption:
+                content = f"{caption}\n" + content
+        elif caption:
             content = f"{caption}\n[File: {filename}]"
         else:
             content = f"[File: {filename}]"
 
-        chatlog = chatlog_manager.get(agent_id, session_id)
-        chatlog.append({
-            'type': 'user',
+        # Also persist in main chat messages table
+        message_id = db.add_chat_message(
+            session_id, 'assistant', content, agent_id=agent_id,
+            metadata={'attachment_info': attachment_info},
+        )
+        message_id = message_id if type(message_id) in (int, str) else None
+        # Deferred when a tool batch is open: an assistant text row between a
+        # tool_call and its tool_output corrupts history reconstruction.
+        append_or_defer_chatlog_echo(agent_id, session_id, {
+            'type': 'final',
             'session_id': session_id,
             'content': content,
             'metadata': {'attachment_info': attachment_info, 'channel': channel_type},
+            'message_id': message_id,
+        })
+        event_stream.emit('message_received', {
+            'agent_id': agent_id, 'session_id': session_id,
+            'external_user_id': external_user_id, 'channel_id': channel_id,
+            'message': content, 'message_id': message_id,
+            'metadata': {'attachment_info': attachment_info},
+            'role': 'assistant', 'sender': agent_id,
         })
 
-        # Also persist in main chat messages table
-        db.add_chat_message(session_id, 'assistant', content,
-                            agent_id=agent_id,
-                            metadata={'attachment_info': attachment_info})
-
         return True
+
+    def _resolve_media_url(self, url: str) -> Optional[str]:
+        """Resolve an internal media URL to a local file path, or None.
+
+        Supports artifact URLs (/api/agents/<aid>/artifacts/<filename>) and
+        attachment URLs (/api/attachments/<id>/view). Only returns paths that
+        exist on disk and stay inside the artifact directory (no traversal).
+        """
+        if not url:
+            return None
+        url = url.split('?')[0].split('#')[0]
+
+        m = _ARTIFACT_URL_RE.match(url)
+        if m:
+            aid, filename = m.group(1), m.group(2)
+            if '..' in filename or '/' in filename:
+                return None
+            safe_root = os.path.realpath(
+                os.path.join(_BASE_DIR, 'shared', 'agents', aid, 'artifacts'))
+            candidate = os.path.realpath(os.path.join(safe_root, filename))
+            if candidate.startswith(safe_root + os.sep) and os.path.isfile(candidate):
+                return candidate
+            return None
+
+        m = _ATTACHMENT_URL_RE.match(url)
+        if m:
+            try:
+                row = db.get_attachment(int(m.group(1)))
+            except Exception:
+                return None
+            if row and row.get('file_path') and os.path.isfile(row['file_path']):
+                return row['file_path']
+        return None
+
+    def _strip_media_embeds(self, text: str, session_id: str) -> str:
+        """Safety net for external channels: convert HTML/Markdown image embeds
+        in a final reply into real file attachments.
+
+        Resolvable artifact/attachment URLs are delivered via send_file_as_bot()
+        and the embed markup is removed from the outgoing text so the chat client
+        shows a clean message plus the attachment. Unresolvable embeds are also
+        stripped (they would otherwise arrive as raw text).
+        """
+        if not text:
+            return text
+
+        def _handle(url: str) -> str:
+            path = self._resolve_media_url(url)
+            if path:
+                try:
+                    self.send_file_as_bot(session_id, path)
+                except Exception as e:
+                    _logger.warning("send_file_as_bot failed for embed %s: %s", url, e)
+            else:
+                _logger.info(
+                    "Stripped unresolvable media embed from outgoing channel text: %s", url)
+            return ''
+
+        text = _IMG_EMBED_RE.sub(lambda m: _handle(m.group(1)), text)
+        text = _MD_IMG_EMBED_RE.sub(lambda m: _handle(m.group(1)), text)
+        return text
 
     def send_as_user(self, session_id: str, text: str,
                      image_url: str | None = None,
@@ -2362,19 +3393,112 @@ class AgentRuntime:
                 cmd_name, cmd_args, session_id, agent_id,
                 external_user_id, channel_id,
             )
-            if response is not None:
+            if response is COMMAND_SUPPRESSED:
+                # Command recognized but suppressed by a per-agent setting
+                # (e.g. /help disabled) — save the user message for the record,
+                # emit message_received, then finalize the turn with an empty
+                # response so web clients clear the thinking bubble without
+                # rendering any reply. Never falls through to LLM processing.
+                command_meta = {'slash_command': True, 'suppressed': True}
+                if metadata and metadata.get('client_message_id'):
+                    command_meta['client_message_id'] = metadata['client_message_id']
+                message_id = db.add_chat_message(
+                    session_id, 'user', text,
+                    agent_id=agent_id, metadata=command_meta,
+                )
+                chatlog_manager.get(agent_id, session_id).append(
+                    {'type': 'user', 'session_id': session_id, 'content': text,
+                     'metadata': command_meta, 'message_id': message_id})
+                event_stream.emit('message_received', {
+                    'agent_id': agent_id, 'session_id': session_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'message': text, 'message_id': message_id,
+                    'client_message_id': command_meta.get('client_message_id'),
+                    'metadata': command_meta, 'role': 'user',
+                })
+                agent = db.get_agent(agent_id)
+                event_stream.emit('turn_complete', {
+                    'agent_id': agent_id,
+                    'agent_name': agent.get('name', '') if agent else '',
+                    'session_id': session_id,
+                    'external_user_id': external_user_id,
+                    'channel_id': channel_id,
+                    'response': '',
+                    'tool_trace': [],
+                    'is_error': False,
+                    'thinking_duration': 0.0,
+                    'slash_command': True,
+                    'message_id': message_id,
+                })
+                self._prefetcher.invalidate(session_id)
+                return True
+            if response is not None and cmd_name == "goal":
+                # Mirror handle_message: keep the literal command out of LLM
+                # context and drive the turn with the translated goal event.
+                command_meta = {"slash_command": True, "audit_only": True}
+                if metadata and metadata.get("client_message_id"):
+                    command_meta["client_message_id"] = metadata["client_message_id"]
+                audit_id = db.add_chat_message(
+                    session_id, "user", text,
+                    agent_id=agent_id, metadata=command_meta,
+                )
+                chatlog_manager.get(agent_id, session_id).append(
+                    {"type": "user", "session_id": session_id, "content": text,
+                     "metadata": command_meta, "message_id": audit_id})
+                event_stream.emit("message_received", {
+                    "agent_id": agent_id, "session_id": session_id,
+                    "external_user_id": external_user_id, "channel_id": channel_id,
+                    "message": text, "message_id": audit_id,
+                    "client_message_id": command_meta.get("client_message_id"),
+                    "metadata": command_meta, "role": "user",
+                })
+                self._prefetcher.invalidate(session_id)
+                text = str(response)
+            elif response is not None:
                 # Command was recognized — save command echo and response, then return
-                db.add_chat_message(session_id, 'user', text,
-                                    agent_id=agent_id, metadata={'slash_command': True})
-                db.add_chat_message(session_id, 'assistant', response,
-                                    agent_id=agent_id, metadata={'slash_command': True})
+                command_meta = {'slash_command': True}
+                if metadata and metadata.get('client_message_id'):
+                    command_meta['client_message_id'] = metadata['client_message_id']
+                message_id = db.add_chat_message(
+                    session_id, 'user', text,
+                    agent_id=agent_id, metadata=command_meta,
+                )
+                response_id = db.add_chat_message(
+                    session_id, 'assistant', response,
+                    agent_id=agent_id, metadata={'slash_command': True},
+                )
                 _cl = chatlog_manager.get(agent_id, session_id)
                 _cl.append({'type': 'user', 'session_id': session_id, 'content': text,
                             'sender_id': external_user_id,
-                            'metadata': {'slash_command': True}})
+                            'metadata': command_meta, 'message_id': message_id})
                 _cl.append({'type': 'system', 'session_id': session_id, 'content': response,
-                            'metadata': {'slash_command': True}})
+                            'metadata': {'slash_command': True}, 'message_id': response_id})
+                event_stream.emit('message_received', {
+                    'agent_id': agent_id, 'session_id': session_id,
+                    'external_user_id': external_user_id, 'channel_id': channel_id,
+                    'message': text, 'message_id': message_id,
+                    'client_message_id': command_meta.get('client_message_id'),
+                    'metadata': command_meta, 'role': 'user',
+                })
                 agent = db.get_agent(agent_id)
+                # Check for any attachments created by the handler (e.g. /dump)
+                attachment_info = None
+                try:
+                    attachments = db.list_session_attachments(session_id, agent_id)
+                    if attachments:
+                        att = attachments[0]
+                        guessed_mime = att.get('mime_type') or 'application/octet-stream'
+                        att_info = {
+                            'attachment_id': att['id'],
+                            'filename': att.get('filename', ''),
+                            'mime_type': guessed_mime,
+                            'size_bytes': att.get('size_bytes', 0),
+                            'is_image': guessed_mime.startswith('image/'),
+                            'file_path': att.get('file_path', ''),
+                        }
+                        attachment_info = att_info
+                except Exception:
+                    pass
                 # Emit turn_complete so SSE client shows the response
                 event_stream.emit('turn_complete', {
                     'agent_id': agent_id,
@@ -2387,13 +3511,9 @@ class AgentRuntime:
                     'is_error': False,
                     'thinking_duration': 0.0,
                     'slash_command': True,
+                    'attachment_info': attachment_info,
+                    'message_id': response_id,
                 })
-                # Signal the client to clear the chat UI when the clear command was used
-                if cmd_name == 'clear':
-                    event_stream.emit('session_clear', {
-                        'session_id': session_id,
-                        'agent_id': agent_id,
-                    })
                 self._prefetcher.invalidate(session_id)
                 return response  # return response text so caller can include it in API response
             # Unknown command — fall through to normal LLM processing
@@ -2407,10 +3527,12 @@ class AgentRuntime:
             meta['video_url'] = video_url
         if metadata:
             meta.update(metadata)
-        db.add_chat_message(session_id, 'user', text, agent_id=agent_id, metadata=meta)
+        message_id = db.add_chat_message(
+            session_id, 'user', text, agent_id=agent_id, metadata=meta,
+        )
         chatlog_manager.get(agent_id, session_id).append(
             {'type': 'user', 'session_id': session_id, 'content': text,
-             'metadata': meta})
+             'metadata': meta, 'message_id': message_id})
 
         # Invalidate prefetched context — a new message arrived
         self._prefetcher.invalidate(session_id)
@@ -2427,25 +3549,49 @@ class AgentRuntime:
             'image_url': image_url,
             'audio_url': audio_url,
             'video_url': video_url,
+            'message_id': message_id,
+            'client_message_id': meta.get('client_message_id'),
+            'metadata': meta,
+            'role': 'user',
         })
+
+        # Mid-loop injection: if session is currently processing, inject message
+        # into the active loop instead of queuing a new task.
+        if agent and self._is_busy(session_id):
+            self._get_inject_queue(session_id).put({
+                'role': 'user',
+                'content': _injected_user_content(text, meta, agent, agent_id),
+            })
+            event_stream.emit('message_injected', {
+                'agent_id': agent_id,
+                'agent_name': agent.get('name', ''),
+                'session_id': session_id,
+                'external_user_id': external_user_id,
+                'channel_id': channel_id,
+                'message': text,
+            })
+            return True
 
         # Enqueue for agent processing (fire-and-forget)
         if agent and agent.get('enabled', True):
             task = _QueueTask(agent, SessionContext(session_id, external_user_id, channel_id),
                               send_via_channel=False)
-            self._message_queue.put(task)
+            self._put_task(task)
 
         return True
 
     def resume_session(self, agent: dict, session_id: str,
-                       external_user_id: str, channel_id: str | None = None) -> None:
+                       external_user_id: str, channel_id: str | None = None,
+                       send_via_channel: bool = False) -> None:
         """Re-enqueue a session for agent processing without saving a new message.
 
         Used at startup to follow up on unreplied user messages that were left
-        pending after a server restart.
+        pending after a server restart, and by the deferred-resume drain to
+        answer messages rejected while the agent was focus-busy (pass
+        send_via_channel=True there so channel users receive the answer).
         """
         if not agent.get('enabled', True):
             return
         task = _QueueTask(agent, SessionContext(session_id, external_user_id, channel_id),
-                          send_via_channel=False)
-        self._message_queue.put(task)
+                          send_via_channel=send_via_channel)
+        self._put_task(task)

@@ -3,11 +3,12 @@ WorkplaceManager — manages execution backends for Workplace objects.
 
 Multiple agent sessions can share the same Workplace (same workplace_id).
 For local workplaces, separate backends are maintained for sandboxed
-vs. non-sandboxed execution. For tunnel and remote workplaces,
+vs. non-sandboxed execution. For tunnel, remote and bwrap workplaces,
 one backend instance per workplace_id is shared across sessions.
 
 Tunnel workplaces are 1:1 with an agent; their backend is created when Evonet connects.
-Local and Remote workplaces' backends are created on first access and cached.
+Local, Remote and Bwrap workplaces' backends are created on first access and cached.
+Bwrap workplaces run all commands inside a bubblewrap sandbox (Linux-only).
 """
 
 import json
@@ -51,6 +52,17 @@ class WorkplaceManager:
             self._set_status(workplace_id, 'connected')
             return backend
 
+        if workplace_type == 'bwrap':
+            bwrap_key = (workplace_id, False)   # sandbox flag is irrelevant for bwrap
+            with self._lock:
+                if bwrap_key in self._backends:
+                    return self._backends[bwrap_key]
+            backend = self._create_bwrap(workplace_id, workplace, config)
+            with self._lock:
+                self._backends[bwrap_key] = backend
+            self._set_status(workplace_id, 'connected')
+            return backend
+
         if workplace_type == 'remote':
             return self._connect_remote(workplace_id, config)
 
@@ -82,6 +94,20 @@ class WorkplaceManager:
                     self._backends[local_key] = self._create_local(config)
             self._set_status(workplace_id, 'connected')
             return {'ok': True, 'status': 'connected'}
+
+        if workplace_type == 'bwrap':
+            try:
+                bwrap_key = (workplace_id, False)
+                with self._lock:
+                    exists = bwrap_key in self._backends
+                if not exists:
+                    backend = self._create_bwrap(workplace_id, workplace, config)
+                    with self._lock:
+                        self._backends[bwrap_key] = backend
+                self._set_status(workplace_id, 'connected')
+                return {'ok': True, 'status': 'connected'}
+            except Exception as e:
+                return {'ok': False, 'error': str(e)}  # _create_bwrap already set status='error'
 
         if workplace_type == 'remote':
             try:
@@ -152,6 +178,17 @@ class WorkplaceManager:
             'last_connected_at': workplace.get('last_connected_at'),
         }
 
+    def set_backend_workspace(self, workplace_id: str, workspace: str) -> None:
+        """Update workspace path on any cached backends that support it.
+
+        Called by ``/cd`` slash command for remote/tunnel agents so the
+        in-memory backend reflects the new path immediately.
+        """
+        with self._lock:
+            for (wid, _sandbox), backend in self._backends.items():
+                if wid == workplace_id and hasattr(backend, 'set_workspace'):
+                    backend.set_workspace(workspace)
+
     # -------------------------------------------------------------------------
     # Tunnel connector callbacks (called by ConnectorRelay)
     # -------------------------------------------------------------------------
@@ -176,6 +213,8 @@ class WorkplaceManager:
                 self._backends[tunnel_key] = backend
         backend.on_ws_connected(ws, replay_ok=replay_ok)
         self._set_status(workplace_id, 'connected')
+        # Reconnected Evonet device: refresh the agent PATH from its rc files.
+        self._mark_path_stale(workplace_id)
         _logger.info("Tunnel workplace %s connected via Evonet", workplace_id)
 
     def on_connector_disconnected(self, workplace_id: str) -> None:
@@ -219,6 +258,15 @@ class WorkplaceManager:
                 return {}
         return cfg or {}
 
+    def _mark_path_stale(self, workplace_id: str) -> None:
+        """Ask shell_path to re-resolve the agent PATH after a (re)connect."""
+        try:
+            from backend.tools.lib.shell_path import mark_workplace_stale
+            mark_workplace_stale(workplace_id)
+        except Exception as e:
+            _logger.debug("PATH re-resolution flag failed for workplace %s: %s",
+                          workplace_id, e)
+
     def _set_status(self, workplace_id: str, status: str, error_msg: Optional[str] = None) -> None:
         try:
             from models.db import db
@@ -239,6 +287,21 @@ class WorkplaceManager:
         from backend.workplaces.backends.local_workplace import LocalWorkplaceBackend
         return LocalWorkplaceBackend(config=config, sandbox_enabled=sandbox_enabled)
 
+    def _create_bwrap(self, workplace_id: str, workplace: dict, config: dict) -> ExecutionBackend:
+        from backend.tools.lib.backends.bwrap_backend import BwrapBackend
+        backend = BwrapBackend(
+            session_id=f'workplace-bwrap-{workplace_id}',
+            workspace=config.get('workspace_path'),
+            agent_id=f'workplace-{workplace_id}',
+            agent_name=workplace.get('name') or workplace_id,   # sandbox hostname = workplace name
+        )
+        st = backend.status()
+        if not st.get('available'):
+            msg = st.get('error') or 'bubblewrap is not available on this host.'
+            self._set_status(workplace_id, 'error', msg)
+            raise RuntimeError(msg)
+        return backend
+
     def _connect_remote(self, workplace_id: str, config: dict) -> ExecutionBackend:
         self._set_status(workplace_id, 'connecting')
         try:
@@ -247,6 +310,9 @@ class WorkplaceManager:
             with self._lock:
                 self._backends[(workplace_id, False)] = backend
             self._set_status(workplace_id, 'connected')
+            # A fresh SSH session may see different rc-file state (e.g. ~/bin
+            # added to PATH), so re-resolve the agent PATH on the next bash call.
+            self._mark_path_stale(workplace_id)
             return backend
         except Exception as e:
             self._set_status(workplace_id, 'error', str(e))

@@ -3,6 +3,7 @@ from pathlib import Path
 """Plugin management routes — list, upload, toggle, configure, delete plugins."""
 
 import io
+import json
 import os
 import re
 import tempfile
@@ -10,6 +11,7 @@ import zipfile
 from flask import Blueprint, render_template, jsonify, request, redirect, send_file
 from backend.plugin_manager import plugin_manager
 from backend.plugin_lifecycle import PLUGINS_DIR
+from backend.audit_logger import audit
 from backend.zip_validator import validate_upload_zip, MAX_UPLOAD_BYTES
 
 plugins_bp = Blueprint('plugins', __name__)
@@ -38,7 +40,39 @@ def plugin_detail_page(plugin_id):
         return redirect('/plugins')
     plugin_template_dir = Path(PLUGINS_DIR) / plugin_id / 'templates'
     widget_files = sorted([f.name for f in plugin_template_dir.glob('*_widget.html')]) if plugin_template_dir.exists() else []
-    return render_template('plugin_detail.html', plugin_id=plugin_id, widgets=widget_files)
+    # Plugin-provided extra tabs: any `<slug>_tab.html` becomes a tab whose id
+    # is the slug and whose label is the slug in Title Case
+    # (e.g. `manage_tab.html` -> id "manage", label "Manage"). The partial is
+    # included into the detail page's tab area; it may lazily initialise itself
+    # by defining `window.tabInit_<slug>()`.
+    tab_files = []
+    if plugin_template_dir.exists():
+        for path in sorted(plugin_template_dir.glob('*_tab.html')):
+            slug = path.name[: -len('_tab.html')]
+            if not re.fullmatch(r'[a-z0-9_-]+', slug):
+                continue
+            tab_files.append({
+                'id': slug,
+                'label': slug.replace('_', ' ').replace('-', ' ').title(),
+                'file': path.name,
+            })
+
+    # Compute model_agent_map for agentapi plugin token widget
+    # Embed server-side so the widget JS doesn't need an async fetch
+    model_agent_map = {}
+    if plugin_id == 'agentapi':
+        cfg = plugin_manager.get_plugin_config('agentapi')
+        raw = cfg.get('MODEL_AGENT_MAP', '{}')
+        try:
+            model_agent_map = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            model_agent_map = {}
+
+    return render_template('plugin_detail.html',
+                           plugin_id=plugin_id,
+                           widgets=widget_files,
+                           tabs=tab_files,
+                           model_agent_map=model_agent_map)
 
 
 @plugins_bp.route('/api/plugins/<plugin_id>')
@@ -84,6 +118,9 @@ def api_upload_plugin():
             status = 409 if 'already installed' in result['error'] else 400
             return jsonify(result), status
         result.pop('_dir', None)
+        installed_id = result.get('id', '')
+        if installed_id:
+            audit.log_plugin(user_id='admin', plugin_id=installed_id, action='install', ip=request.remote_addr or '')
         return jsonify({'success': True, 'plugin': result})
     finally:
         os.unlink(tmp_path)
@@ -188,6 +225,7 @@ def api_delete_plugin(plugin_id):
     result = plugin_manager.uninstall_plugin(plugin_id)
     if 'error' in result:
         return jsonify(result), 400
+    audit.log_plugin(user_id='admin', plugin_id=plugin_id, action='uninstall', ip=request.remote_addr or '')
     return jsonify(result)
 
 

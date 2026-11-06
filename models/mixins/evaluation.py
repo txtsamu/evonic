@@ -98,7 +98,7 @@ class EvaluationMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT * FROM evaluation_runs
+                """SELECT run_id, started_at, completed_at, model_name, summary, overall_score, total_tokens, total_duration_ms, notes, status, selected_domains FROM evaluation_runs
                    WHERE status = 'interrupted'
                    ORDER BY started_at DESC"""
             )
@@ -110,7 +110,7 @@ class EvaluationMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM evaluation_runs WHERE run_id = ?",
+                "SELECT run_id, started_at, completed_at, model_name, summary, overall_score, total_tokens, total_duration_ms, notes, status, selected_domains FROM evaluation_runs WHERE run_id = ?",
                 (run_id,)
             )
             row = cursor.fetchone()
@@ -122,7 +122,7 @@ class EvaluationMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM test_results WHERE run_id = ? ORDER BY domain, level",
+                "SELECT id, run_id, timestamp, model_name, domain, level, prompt, response, expected, score, status, details, duration_ms FROM test_results WHERE run_id = ? ORDER BY domain, level",
                 (run_id,)
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -177,6 +177,62 @@ class EvaluationMixin:
             conn.commit()
             return count
 
+    def get_incomplete_count(self) -> int:
+        """Get count of evaluation runs where completed_at IS NULL (incomplete)."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM evaluation_runs WHERE completed_at IS NULL"
+            )
+            return cursor.fetchone()[0]
+
+    def clear_incomplete_runs(self) -> int:
+        """Delete all incomplete evaluation runs (completed_at IS NULL) and related data.
+        Returns count of deleted runs."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT run_id FROM evaluation_runs WHERE completed_at IS NULL"
+            )
+            incomplete_ids = [row[0] for row in cursor.fetchall()]
+            count = len(incomplete_ids)
+
+            if count == 0:
+                return 0
+
+            placeholders = ",".join("?" for _ in incomplete_ids)
+
+            # Delete related data in dependency order
+            cursor.execute(
+                f"DELETE FROM generated_training_data WHERE cycle_id IN "
+                f"(SELECT cycle_id FROM improvement_cycles "
+                f" WHERE base_run_id IN ({placeholders}) OR improved_run_id IN ({placeholders}))",
+                incomplete_ids + incomplete_ids,
+            )
+            cursor.execute(
+                f"DELETE FROM improvement_cycles "
+                f"WHERE base_run_id IN ({placeholders}) OR improved_run_id IN ({placeholders})",
+                incomplete_ids + incomplete_ids,
+            )
+            cursor.execute(
+                f"DELETE FROM individual_test_results WHERE run_id IN ({placeholders})",
+                incomplete_ids,
+            )
+            cursor.execute(
+                f"DELETE FROM level_scores WHERE run_id IN ({placeholders})",
+                incomplete_ids,
+            )
+            cursor.execute(
+                f"DELETE FROM test_results WHERE run_id IN ({placeholders})",
+                incomplete_ids,
+            )
+            cursor.execute(
+                f"DELETE FROM evaluation_runs WHERE run_id IN ({placeholders})",
+                incomplete_ids,
+            )
+            conn.commit()
+            return count
+
     def update_run_notes(self, run_id: int, notes: str) -> bool:
         """Update notes for an evaluation run"""
         with self._connect() as conn:
@@ -192,6 +248,33 @@ class EvaluationMixin:
             cursor.execute("UPDATE evaluation_runs SET summary = ? WHERE run_id = ?", (summary, run_id))
             conn.commit()
             return cursor.rowcount > 0
+
+    def update_run_model_name(self, run_id: int, model_name: str) -> bool:
+        """Update the model name of an evaluation run.
+
+        The run's stored results (domain-level ``test_results`` and
+        ``individual_test_results``) keep their own ``model_name`` snapshot, so
+        the new label is cascaded to them as well.  This keeps the history
+        detail view (header + per-cell test modals) consistent after a rename.
+        """
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE evaluation_runs SET model_name = ? WHERE run_id = ?",
+                (model_name, run_id)
+            )
+            updated = cursor.rowcount > 0
+            if updated:
+                cursor.execute(
+                    "UPDATE test_results SET model_name = ? WHERE run_id = ?",
+                    (model_name, run_id)
+                )
+                cursor.execute(
+                    "UPDATE individual_test_results SET model_name = ? WHERE run_id = ?",
+                    (model_name, run_id)
+                )
+            conn.commit()
+            return updated
 
     def get_runs_count(self) -> int:
         """Get total count of evaluation runs"""
@@ -278,7 +361,7 @@ class EvaluationMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM improvement_cycles WHERE cycle_id = ?",
+                "SELECT cycle_id, base_run_id, improved_run_id, created_at, completed_at, status, analysis, training_data_path, examples_count, comparison, recommendation FROM improvement_cycles WHERE cycle_id = ?",
                 (cycle_id,)
             )
             row = cursor.fetchone()
@@ -290,7 +373,7 @@ class EvaluationMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM improvement_cycles ORDER BY created_at DESC LIMIT ?",
+                "SELECT cycle_id, base_run_id, improved_run_id, created_at, completed_at, status, analysis, training_data_path, examples_count, comparison, recommendation FROM improvement_cycles ORDER BY created_at DESC LIMIT ?",
                 (limit,)
             )
             return [dict(row) for row in cursor.fetchall()]

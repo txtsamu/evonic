@@ -119,6 +119,7 @@ class ChatLog:
                     f.write(line)
             else:
                 self._fh.write(line)
+                self._fh.flush()  # make visible to concurrent readers immediately
 
     def close(self) -> None:
         with self._lock:
@@ -386,6 +387,122 @@ class ChatLog:
 
         return _reconstruct_llm_messages(raw_entries)
 
+    def get_entries_for_llm_trail(self, after_ts: Optional[int] = None,
+                                   limit: int = 50) -> List[Dict[str, Any]]:
+        """Like get_entries_for_llm, but strips tool_call and tool_output entries.
+
+        In trail mode, only semantic messages (user, intermediate, final, error,
+        system, thinking) are kept. Mechanical tool invocations and results are
+        dropped — the assistant's intermediate/final text already summarizes
+        the findings. This reduces context window usage for subsequent turns.
+        """
+        raw_entries: List[dict] = []
+
+        if after_ts is not None:
+            for raw in self._iter_lines_forward():
+                entry = self._parse(raw)
+                if entry is None:
+                    continue
+                if entry.get('ts', 0) <= after_ts:
+                    continue
+                if entry.get('type') in _LLM_CONTEXT_TYPES:
+                    raw_entries.append(entry)
+        else:
+            collected = []
+            semantic_count = 0
+            for raw in self._iter_lines_reverse():
+                entry = self._parse(raw)
+                if entry is None:
+                    continue
+                if entry.get('type') in _LLM_CONTEXT_TYPES:
+                    collected.append(entry)
+                    if entry.get('type') in _SUMMARY_COUNT_TYPES:
+                        semantic_count += 1
+                        if semantic_count >= limit:
+                            break
+            collected.reverse()
+            raw_entries = collected
+
+        return _reconstruct_llm_messages(raw_entries, trail_mode=True)
+
+    def get_entries_for_llm_segments(self, segments: List[list],
+                                     after_ts: Optional[int] = None,
+                                     closed_tail_semantic: int = 6,
+                                     extra_groups: Optional[List[tuple]] = None) -> List[Dict[str, Any]]:
+        """CMP: LLM messages scoped to a path's transcript segments.
+
+        segments: the ACTIVE path's [[start, end|None], ...] ts ranges with
+        exclusive-start semantics (start < ts <= end); end None = the open
+        segment. Entries from CLOSED segments (earlier visits) are trimmed to
+        the last `closed_tail_semantic` semantic messages — the rehydration
+        tail — while the open segment loads in full.
+
+        extra_groups: optional [(segments, tail_semantic), ...] for the active
+        path's dependency ancestors — their transcripts stay loaded (bounded
+        per-group tail) so a child task keeps its parents' detail in memory.
+        after_ts (summary watermark) lower-bounds everything.
+
+        Filtering happens on RAW entries (reconstruction drops ts); all kept
+        entries merge in chronological order through the one
+        _reconstruct_llm_messages pass, so tool-call grouping and
+        orphan-dropping behave exactly like get_entries_for_llm at segment
+        and watermark edges.
+        """
+        def _norm(segs):
+            return [s for s in (segs or []) if s and s[0] is not None]
+
+        # (segments, tail, open_loads_full)
+        groups = [(_norm(segments), closed_tail_semantic, True)]
+        for extra_segs, extra_tail in (extra_groups or []):
+            groups.append((_norm(extra_segs), extra_tail, False))
+
+        collected = [{'open': [], 'closed': []} for _ in groups]
+        for raw in self._iter_lines_forward():
+            entry = self._parse(raw)
+            if entry is None or entry.get('type') not in _LLM_CONTEXT_TYPES:
+                continue
+            ts = entry.get('ts', 0)
+            if after_ts is not None and ts <= after_ts:
+                continue
+            placed = False
+            for gi, (segs, _tail, open_full) in enumerate(groups):
+                for start, end in segs:
+                    if ts > start and (end is None or ts <= end):
+                        bucket = 'open' if (end is None and open_full) else 'closed'
+                        collected[gi][bucket].append(entry)
+                        placed = True
+                        break
+                if placed:
+                    break
+
+        def _tail_trim(entries, tail):
+            """Rehydration tail: the last `tail` SEMANTIC messages only
+            (user/final/intermediate). Mechanical entries (tool calls/outputs,
+            thinking) are dropped — the paper's card-first rehydration: the
+            IPPC card carries the facts, the tail is conversational
+            continuity. Seen live: a tool-heavy closed segment dragged ~50k
+            tokens of tool outputs back into context through the tail."""
+            if not entries or tail < 0:
+                return entries
+            kept: List[dict] = []
+            semantic = 0
+            for entry in reversed(entries):
+                if entry.get('type') not in _SUMMARY_COUNT_TYPES:
+                    continue
+                kept.append(entry)
+                semantic += 1
+                if semantic >= tail:
+                    break
+            kept.reverse()
+            return kept
+
+        merged: List[dict] = []
+        for gi, (_segs, tail, _open_full) in enumerate(groups):
+            merged.extend(_tail_trim(collected[gi]['closed'], tail))
+            merged.extend(collected[gi]['open'])
+        merged.sort(key=lambda e: e.get('ts', 0))
+        return _reconstruct_llm_messages(merged)
+
     def clear(self) -> None:
         """Truncate the session log file, removing all entries."""
         with self._lock:
@@ -406,58 +523,69 @@ class ChatLog:
 # ------------------------------------------------------------------
 
 def _fix_interleaved_user_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Fix user/system messages recorded between a tool_call and its tool_output.
+    """Fix non-tool messages recorded between a tool_call and its tool_output.
 
     When a user sends a message while a tool is still executing, the chatlog records
     the user message before the tool_output (by wall-clock order). But the LLM
     actually received them in the opposite order: tool result first, then user message
     on the next iteration. Reorder so tool responses immediately follow their
     assistant/tool_calls message, with deferred user/system messages placed after.
+
+    Plain assistant text messages (no ``tool_calls``) are deferred for the same
+    reason. The runtime echoes a ``final`` row for tools that produce a
+    user-visible message (e.g. ``send_file``'s attachment note) at the moment the
+    tool runs, which is *inside* the still-open batch. Reconstructing that row in
+    place splits ``assistant(tool_calls)`` from its results and the provider (and
+    ``validate_tool_pairs``) rejects the payload as out-of-order — permanently,
+    because the row order lives in the persisted transcript.
+
+    Synthetic results for genuinely missing outputs are emitted in *declared*
+    call order (never set-iteration order, which is hash-seed dependent) and real
+    results are restored to declared order as well.
     """
     result: List[Dict[str, Any]] = []
     i = 0
     while i < len(msgs):
         msg = msgs[i]
         if msg.get('role') == 'assistant' and msg.get('tool_calls'):
-            tc_ids = {tc['id'] for tc in msg.get('tool_calls', [])}
+            declared_ids = [tc.get('id') for tc in msg.get('tool_calls', []) if tc.get('id')]
+            tc_ids = set(declared_ids)
             j = i + 1
             deferred: List[Dict[str, Any]] = []
-            tool_responses: List[Dict[str, Any]] = []
-            found_ids: set = set()
+            responses: Dict[str, Dict[str, Any]] = {}
             while j < len(msgs):
                 next_msg = msgs[j]
                 next_role = next_msg.get('role', '')
                 next_tc_id = next_msg.get('tool_call_id', '')
-                if next_role == 'tool' and next_tc_id in tc_ids:
-                    tool_responses.append(next_msg)
-                    found_ids.add(next_tc_id)
+                if next_role == 'tool' and next_tc_id in tc_ids and next_tc_id not in responses:
+                    responses[next_tc_id] = next_msg
                     j += 1
-                elif next_role in ('user', 'system'):
-                    # Defer: user/system message was recorded out-of-order due to
-                    # mid-execution injection. This can happen before ANY tool response
-                    # OR between tool responses (e.g., tc1 done, user sends message,
-                    # tc2 still running). Always defer to after all tool responses so
-                    # the API sees tool messages immediately following the tool_calls
+                elif next_role in ('user', 'system') or (
+                        next_role == 'assistant' and not next_msg.get('tool_calls')):
+                    # Defer: recorded out-of-order due to mid-execution injection or a
+                    # tool that echoed an assistant message while the batch was open.
+                    # This can happen before ANY tool response OR between tool
+                    # responses (e.g., tc1 done, user sends message, tc2 still
+                    # running). Always defer to after all tool responses so the API
+                    # sees tool messages immediately following the tool_calls
                     # assistant message.
                     deferred.append(next_msg)
                     j += 1
                 else:
                     break
-                if found_ids == tc_ids:
+                if len(responses) == len(tc_ids):
                     break  # All expected tool responses collected
             # If some tool responses are missing (agent interrupted before recording
             # outputs, or history limit cut them off), inject synthetic error
             # responses so the API contract is satisfied: every tool_call_id in the
             # assistant message must have a corresponding tool response.
-            missing_ids = tc_ids - found_ids
-            for mid in missing_ids:
-                tool_responses.append({
+            result.append(msg)
+            for mid in declared_ids:
+                result.append(responses.get(mid) or {
                     'role': 'tool',
                     'tool_call_id': mid,
                     'content': '{"error": "Tool execution was interrupted before completion."}',
                 })
-            result.append(msg)
-            result.extend(tool_responses)
             result.extend(deferred)
             i = j
         else:
@@ -466,11 +594,42 @@ def _fix_interleaved_user_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str,
     return result
 
 
-def _reconstruct_llm_messages(entries: List[dict]) -> List[Dict[str, Any]]:
+def _compact_tool_output(content: str) -> str:
+    """Re-apply the live-turn tool-output safety passes when history is
+    rebuilt from the chatlog. The chatlog stores tool outputs RAW (the UI
+    detail view needs them), but the live call only ever sent a compressed/
+    truncated version — without this, a single oversized output re-enters
+    the NEXT turn's prompt at full size (live: one 281k-char Explore result
+    blew a 16k-token prompt up to 339k and tripped the provider's context
+    limit, forcing emergency compaction)."""
+    if not content:
+        return content or ''
+    from config import AGENT_MAX_TOOL_RESULT_CHARS
+    if len(content) <= AGENT_MAX_TOOL_RESULT_CHARS:
+        return content
+    try:
+        from backend.token_compressor.base64_filter import strip_base64_blobs
+        content = strip_base64_blobs(content)
+    except Exception:
+        pass
+    if len(content) > AGENT_MAX_TOOL_RESULT_CHARS:
+        remaining = len(content) - AGENT_MAX_TOOL_RESULT_CHARS
+        content = (content[:AGENT_MAX_TOOL_RESULT_CHARS] +
+                   f"\n...[truncated — {remaining} chars omitted]")
+    return content
+
+
+def _reconstruct_llm_messages(entries: List[dict],
+                              trail_mode: bool = False) -> List[Dict[str, Any]]:
     """Convert a list of JSONL entries to the OpenAI messages array format.
 
     Groups consecutive tool_call entries into a single assistant message with
     tool_calls array, matching what the LLM originally produced.
+
+    trail_mode: When True, skip tool_call and tool_output entries — only keep
+    user, intermediate, final, error, system, and thinking. This reduces
+    context window usage by removing mechanical tool invocations and results
+    from subsequent turns.
     """
     messages: List[Dict[str, Any]] = []
     i = 0
@@ -510,6 +669,12 @@ def _reconstruct_llm_messages(entries: List[dict]) -> List[Dict[str, Any]]:
             wrapped = _meta.get('wrapped')
             if wrapped:
                 msg['_wrapped'] = True
+            atts = _meta.get('attachment_infos')
+            if isinstance(atts, list):
+                msg['attachment_infos'] = atts
+            att = _meta.get('attachment_info')
+            if att:
+                msg['attachment_info'] = att
             messages.append(msg)
             i += 1
 
@@ -540,6 +705,12 @@ def _reconstruct_llm_messages(entries: List[dict]) -> List[Dict[str, Any]]:
             i += 1
 
         elif etype == 'tool_call':
+            if trail_mode:
+                # In trail mode, skip all tool_call entries. Clear pending
+                # reasoning since reasoning is tied to tool calls in this mode.
+                _pending_reasoning = ''
+                i += 1
+                continue
             # Collect the immediately preceding intermediate content (if any) and
             # all consecutive tool_call entries into one assistant message.
             preceding_content = ''
@@ -586,6 +757,10 @@ def _reconstruct_llm_messages(entries: List[dict]) -> List[Dict[str, Any]]:
             messages.append(asst_msg)
 
         elif etype == 'tool_output':
+            if trail_mode:
+                # In trail mode, skip all tool output entries.
+                i += 1
+                continue
             tc_id = entry.get('tool_call_id', '') or ''
             if not tc_id.strip():
                 if _pending_tool_ids:
@@ -596,7 +771,7 @@ def _reconstruct_llm_messages(entries: List[dict]) -> List[Dict[str, Any]]:
             messages.append({
                 'role': 'tool',
                 'tool_call_id': tc_id,
-                'content': content,
+                'content': _compact_tool_output(content),
             })
             i += 1
 
@@ -604,6 +779,8 @@ def _reconstruct_llm_messages(entries: List[dict]) -> List[Dict[str, Any]]:
             # Skip turn_begin, turn_end, pending
             i += 1
 
+    if trail_mode:
+        return _fix_interleaved_user_messages(messages)
     return _drop_orphaned_tool_messages(
         _fix_interleaved_user_messages(messages))
 

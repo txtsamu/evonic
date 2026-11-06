@@ -1,26 +1,20 @@
 import os
 import re
-import sys
 import sqlite3
 
 import logging
 import threading
-import time
 
 from flask import Blueprint, render_template, jsonify, request, redirect
 
 from models.db import db
 from backend.plugin_manager import plugin_manager
 from backend.skills_manager import skills_manager
-from backend.skillsets import list_skillsets
-from backend.setup import (run_setup, test_connection, PROVIDER_DEFAULTS,
-                            LANGUAGE_PRESETS, check_docker_available)
-import config
 
-# `resource` is a POSIX-only stdlib module — absent on Windows.
-# Guarded so the app can boot; restart-time FD cleanup is skipped there.
-if sys.platform != 'win32':
-    import resource
+from backend.setup import (run_setup, test_connection, PROVIDER_DEFAULTS,
+                            LANGUAGE_PRESETS, DEFAULT_SUPER_AGENT_NAME,
+                            check_docker_available)
+import config
 
 dashboard_bp = Blueprint('dashboard', __name__)
 
@@ -54,6 +48,7 @@ def api_setup():
         sandbox_enabled = data.get('sandbox_enabled', False)
         if 'sandbox_enabled' not in data:
             sandbox_enabled = check_docker_available().get('available', False)
+        install_evomem = data.get('install_evomem', True)
         result = run_setup(
             provider=data.get('provider', ''),
             model_name=data.get('model_name', '').strip(),
@@ -73,35 +68,26 @@ def api_setup():
         _log = logging.getLogger(__name__)
         _log.info("Setup complete — scheduling auto-restart")
 
-        def _do_restart():
-            time.sleep(1.5)
-            try:
-                from backend.channels.registry import channel_manager
-                channel_manager.stop_all()
-                time.sleep(1.0)
-                if sys.platform != 'win32':
-                    maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-                    if maxfd == resource.RLIM_INFINITY or maxfd > 65535:
-                        maxfd = 4096
-                    os.closerange(3, maxfd)
-            except Exception as e:
-                _log.error("Error during restart cleanup: %s", e, exc_info=True)
-            _log.info("Re-executing server process")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+        def _provision_then_restart():
+            if install_evomem:
+                try:
+                    from backend.evomem_provision import ensure_evomem
+                    ensure_evomem()
+                except Exception as e:
+                    _log.error("evomem provisioning failed: %s", e)
+            from backend.restart import restart_in_place
+            restart_in_place()
 
-        t = threading.Thread(target=_do_restart, daemon=True)
-        t.start()
+        threading.Thread(target=_provision_then_restart, daemon=True).start()
 
         return jsonify(result)
 
     # Legacy payload (backward compat): {id, name, description, system_prompt, model}
     from routes.agents import _ensure_kb_dir, _write_system_prompt
-    agent_id = data.get('id', '').strip().lower()
-    name = data.get('name', '').strip()
-    if not agent_id or not re.match(r'^[a-z0-9_]+$', agent_id):
+    name = (data.get('name') or '').strip() or DEFAULT_SUPER_AGENT_NAME
+    agent_id = (data.get('id') or '').strip().lower() or 'super_agent'
+    if not re.match(r'^[a-z0-9_]+$', agent_id):
         return jsonify({'error': 'Invalid ID. Use only lowercase alphanumeric characters and underscores (snake_case).'}), 400
-    if not name:
-        return jsonify({'error': 'Name is required.'}), 400
     if db.get_agent(agent_id):
         return jsonify({'error': 'Agent ID already exists.'}), 400
     sandbox_enabled = data.get('sandbox_enabled', check_docker_available().get('available', False))
@@ -132,7 +118,7 @@ def api_setup():
             'skill:scheduler:cancel_schedule',
             'skill:scheduler:list_schedules',
         ])
-        db.set_agent_skills(agent_id, ['scheduler'])
+        db.set_agent_skills(agent_id, ['explorer', 'scheduler'])
         return jsonify({'success': True, 'agent_id': agent_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -169,12 +155,7 @@ def api_dashboard_data():
         leaderboard = db.get_model_leaderboard(limit=5, _conn=conn)
         model_usage = db.get_model_usage(_conn=conn)
 
-    all_skills = skills_manager.list_skills()
-    skill_stats = {
-        'total': len(all_skills),
-        'enabled': sum(1 for s in all_skills if s.get('enabled')),
-        'skillset_count': len(list_skillsets()),
-    }
+    skill_stats = skills_manager.get_skill_stats()
 
     all_plugins = plugin_manager.list_plugins()
     plugin_stats = {
@@ -187,9 +168,23 @@ def api_dashboard_data():
         'total': len(all_schedules),
         'active': sum(1 for s in all_schedules if s.get('enabled')),
     }
+    # Display-only fields for the dashboard "Scheduled Tasks" widget (5 most recent).
+    _sched_fields = ('id', 'name', 'enabled', 'trigger_type', 'next_run_at', 'owner_type', 'owner_id')
+    schedules = [{k: s.get(k) for k in _sched_fields} for s in all_schedules[:5]]
 
     # Plugin-provided dashboard cards (zero core-plugin coupling)
     plugin_cards = plugin_manager.get_dashboard_cards()
+
+    # "Needs attention": invalid workspaces, overdue schedules, a very low latest evaluation
+    try:
+        from backend.dashboard_attention import build_attention
+        every_agent = db.get_recent_agents(limit=500)
+        attention = build_attention(
+            every_agent, all_schedules, recent_runs[0] if recent_runs else None,
+            workplace_type=lambda wid: (db.get_workplace(wid) or {}).get('type'),
+        )
+    except Exception:
+        attention = []
 
     return jsonify({
         'stats': stats,
@@ -200,7 +195,9 @@ def api_dashboard_data():
         'skill_stats': skill_stats,
         'plugin_stats': plugin_stats,
         'schedule_stats': schedule_stats,
+        'schedules': schedules,
         'plugin_cards': plugin_cards,
+        'attention': attention,
     })
 
 

@@ -1,5 +1,6 @@
 """Base channel abstraction."""
 
+import os
 import re
 import time
 import threading
@@ -13,6 +14,30 @@ _SYSTEM_TAG_RE = re.compile(r'\[(?:SYSTEM(?:/[^\]]*)?|System/[^\]]*)\]\s*')
 def strip_system_tags(text: str) -> str:
     """Remove SYSTEM tags from user-supplied channel messages to prevent impersonation."""
     return _SYSTEM_TAG_RE.sub('', text).strip()
+
+
+_attachment_stamp_lock = threading.Lock()
+_last_attachment_stamp = 0
+
+
+def unique_attachment_path(target_dir: str, name: str) -> str:
+    """Return a fresh ``<target_dir>/<stamp>_<name>`` path for an inbound attachment.
+
+    A per-second prefix let media that arrived in the same second (a burst of
+    WhatsApp photos) overwrite each other while every DB row still pointed at
+    the shared file. The stamp is a strictly increasing nanosecond counter, so
+    two attachments saved by this process never share a name, and an existing
+    file (another process) is skipped. Creates *target_dir* if missing.
+    """
+    global _last_attachment_stamp
+    os.makedirs(target_dir, exist_ok=True)
+    while True:
+        with _attachment_stamp_lock:
+            stamp = max(time.time_ns(), _last_attachment_stamp + 1)
+            _last_attachment_stamp = stamp
+        path = os.path.join(target_dir, f"{stamp}_{name}")
+        if not os.path.exists(path):
+            return path
 
 
 class BaseChannel(ABC):
@@ -51,7 +76,7 @@ class BaseChannel(ABC):
         """Stop listening."""
         pass
 
-    def send_message_buffered(self, external_user_id: str, text: str):
+    def send_message_buffered(self, external_user_id: str, text: str, session_id: str = None):
         """Coalescing path: accumulate text, reset debounce timer, flush after window.
 
         Use this for high-frequency intermediate responses to avoid flooding the
@@ -67,12 +92,12 @@ class BaseChannel(ABC):
             old = self._buf_timers.pop(external_user_id, None)
             if old:
                 old.cancel()
-            t = Timer(self._outbound_buffer_seconds, self._flush_buffer, args=[external_user_id])
+            t = Timer(self._outbound_buffer_seconds, self._flush_buffer, args=[external_user_id, session_id])
             t.daemon = True
             self._buf_timers[external_user_id] = t
             t.start()
 
-    def _flush_buffer(self, external_user_id: str):
+    def _flush_buffer(self, external_user_id: str, session_id: str = None):
         """Timer callback: send accumulated text, respecting the rate limit."""
         with self._buf_lock:
             text = self._buf.pop(external_user_id, None)
@@ -86,12 +111,15 @@ class BaseChannel(ABC):
         if wait > 0:
             time.sleep(wait)
         try:
-            self._do_send(external_user_id, text)
+            if session_id is None:
+                self._do_send(external_user_id, text)
+            else:
+                self._do_send(external_user_id, text, session_id=session_id)
             self._last_sent[external_user_id] = time.time()
         except Exception as e:
             self._store_send_error(external_user_id, str(e))
 
-    def send_message(self, external_user_id: str, text: str):
+    def send_message(self, external_user_id: str, text: str, session_id: str = None):
         """Immediate path: cancel any pending buffer for this chat, merge + send now.
 
         Use this for final responses and bot-initiated messages. Flushes any
@@ -105,13 +133,16 @@ class BaseChannel(ABC):
         if pending:
             text = pending + "\n\n" + text
         try:
-            self._do_send(external_user_id, text)
+            if session_id is None:
+                self._do_send(external_user_id, text)
+            else:
+                self._do_send(external_user_id, text, session_id=session_id)
             self._last_sent[external_user_id] = time.time()
         except Exception as e:
             self._store_send_error(external_user_id, str(e))
 
     @abstractmethod
-    def _do_send(self, external_user_id: str, text: str):
+    def _do_send(self, external_user_id: str, text: str, session_id: str = None):
         """Actual delivery implementation — subclasses must implement this."""
         pass
 
@@ -227,6 +258,19 @@ class BaseChannel(ABC):
             expires_at=expires_at,
         )
         return False, pair_code
+
+    def _is_super_agent_channel(self) -> bool:
+        """True only if this channel belongs to the platform's super agent.
+
+        Approval requests/resolutions must reach only the super agent's channel;
+        regular agents' channels must never surface them to their end-users.
+        """
+        try:
+            from models.db import db
+            sup = db.get_super_agent()
+            return bool(sup and sup.get('id') == self.agent_id)
+        except Exception:
+            return False
 
     @property
     def is_running(self) -> bool:

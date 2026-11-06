@@ -43,6 +43,16 @@ def api_eval_settings():
             capped = max(1, min(16, raw_value))
             db.set_setting('evaluator_workers', str(capped))
             return jsonify({'success': True, 'value': capped})
+        if key == 'eval_model_id':
+            model_id = str(value or '').strip()
+            if model_id:
+                model = db.get_model_by_id(model_id)
+                if not model:
+                    return jsonify({'success': False, 'error': 'Model not found'}), 400
+                model_id = model['id']
+            db.set_setting('eval_model_id', model_id)
+            db.invalidate_settings_cache('eval_model_id')
+            return jsonify({'success': True, 'value': model_id})
         return jsonify({'success': False, 'error': f'Unknown setting: {key}'}), 400
     # GET
     evaluator_workers = os.environ.get('EVALUATOR_WORKERS', '4')
@@ -53,7 +63,8 @@ def api_eval_settings():
     except Exception:
         pass
     return jsonify({
-        'evaluator_workers': int(evaluator_workers)
+        'evaluator_workers': int(evaluator_workers),
+        'eval_model_id': db.get_setting('eval_model_id', '') or ''
     })
 
 
@@ -66,6 +77,17 @@ def evaluate_two_pass_docs():
     with open(doc_path, encoding='utf-8') as f:
         body = f.read()
     return render_template('evaluate_doc.html', title='Two-Pass Evaluation', body=body)
+
+
+@evaluation_bp.route('/evaluate/docs/public-history')
+def evaluate_public_history_docs():
+    """Serve public history documentation."""
+    doc_path = os.path.join(_ROOT, 'docs', 'public-history.md')
+    if not os.path.isfile(doc_path):
+        abort(404)
+    with open(doc_path, encoding='utf-8') as f:
+        body = f.read()
+    return render_template('evaluate_doc.html', title='Public History — Implications & Guidance', body=body)
 
 
 @evaluation_bp.route('/evaluate')
@@ -208,9 +230,10 @@ def api_incomplete_runs():
 
 @evaluation_bp.route('/api/reset', methods=['POST'])
 def api_reset():
-    """Reset engine state to idle"""
+    """Reset engine state to idle and clear incomplete runs"""
     try:
         evaluation_engine.reset_state()
+        db.clear_incomplete_runs()
         return jsonify({
             'success': True,
             'message': 'State reset'
@@ -222,7 +245,7 @@ def api_reset():
         }), 400
 
 
-@evaluation_bp.route('/api/test_matrix')
+@evaluation_bp.route('/api/evaluator/test_matrix')
 def api_test_matrix():
     """Get test matrix for current run"""
     run_id = request.args.get('run_id', type=int)
@@ -298,7 +321,9 @@ def api_replay_test():
         db.delete_individual_test_result(run_id, test_id)
 
         # Run the test using the global engine (reuses global llm_client)
-        result = evaluation_engine._run_single_configurable_test(test, domain, level, model_name, run_id)
+        from backend.llm_usage_events import usage_context
+        with usage_context('evaluator', session_id=str(run_id)):
+            result = evaluation_engine._run_single_configurable_test(test, domain, level, model_name, run_id)
 
         # Fetch the saved result to return the full object the modal expects
         results = db.get_individual_test_results(run_id, domain=domain, level=level)
@@ -364,7 +389,7 @@ def api_summary(run_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@evaluation_bp.route('/api/log_poll')
+@evaluation_bp.route('/api/evaluator/log_poll')
 def log_poll():
     """Poll for new log messages - returns batch of pending messages"""
     messages = []

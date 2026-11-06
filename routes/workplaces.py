@@ -4,11 +4,9 @@ import os
 import secrets
 import string
 import uuid
+from urllib.parse import urlencode
 
-import queue
-import threading
-
-from flask import Blueprint, Response, jsonify, render_template, request, stream_with_context
+from flask import Blueprint, Response, jsonify, render_template, request, redirect
 
 from models.db import db
 
@@ -38,6 +36,9 @@ def workplace_detail(workplace_id):
 
 @workplaces_bp.route('/api/workplaces', methods=['GET'])
 def api_list_workplaces():
+    # ?summary=1: lightweight picker list (single query, no agent lists or tokens)
+    if request.args.get('summary') in ('1', 'true'):
+        return jsonify(db.get_workplace_summaries())
     workplaces = db.get_workplaces()
     for w in workplaces:
         w['agents'] = db.get_workplace_agents(w['id'])
@@ -56,8 +57,8 @@ def api_create_workplace():
 
     if not name:
         return jsonify({'error': 'name is required'}), 400
-    if workplace_type not in ('local', 'remote', 'tunnel'):
-        return jsonify({'error': 'type must be local, remote, or tunnel'}), 400
+    if workplace_type not in ('local', 'remote', 'tunnel', 'bwrap'):
+        return jsonify({'error': 'type must be local, remote, tunnel, or bwrap'}), 400
 
     config = data.get('config', {})
     if isinstance(config, str):
@@ -133,6 +134,26 @@ def api_delete_workplace(workplace_id):
     return jsonify({'ok': True})
 
 
+@workplaces_bp.route('/api/workplaces/<workplace_id>/clone', methods=['POST'])
+def api_clone_workplace(workplace_id):
+    """Clone a workplace: copy type and config into a new disconnected workplace."""
+    source = db.get_workplace(workplace_id)
+    if not source:
+        return jsonify({'error': 'Workplace not found'}), 404
+
+    data = request.get_json() or {}
+    new_name = (data.get('name') or '').strip()
+    if not new_name:
+        new_name = f"{source.get('name', workplace_id)} (Clone)"
+
+    new_id = db.clone_workplace(workplace_id, new_name)
+    if not new_id:
+        return jsonify({'error': 'Failed to clone workplace'}), 500
+
+    workplace = db.get_workplace(new_id)
+    return jsonify(workplace), 201
+
+
 # ---------------------------------------------------------------------------
 # API — Workplace connection control
 # ---------------------------------------------------------------------------
@@ -154,53 +175,16 @@ def api_workplace_status(workplace_id):
 def api_workplace_events(workplace_id):
     """SSE stream for real-time workplace status changes (connector connect/disconnect, status).
     DEPRECATED: Use unified GET /api/realtime/stream?workplace=<id> instead."""
-    import logging as _log_depr
-    _log_depr.getLogger(__name__).warning(
-        "DEPRECATED endpoint /api/workplaces/<id>/events used — "
-        "migrate to /api/realtime/stream?workplace=<id>")
     workplace = db.get_workplace(workplace_id)
     if not workplace:
         return jsonify({'error': 'Not found'}), 404
-
-    # Release the thread-local DB connection — this SSE thread is long-lived.
-    db.close()
-
-    q = queue.Queue(maxsize=20)
-
-    _WATCHED = ('connector_connected', 'connector_disconnected', 'connector_paired', 'workplace_status_changed')
-
-    def handler(data):
-        if data.get('workplace_id') == workplace_id:
-            try:
-                q.put_nowait(data)
-            except queue.Full:
-                pass
-
-    from backend.event_stream import event_stream
-    for ev in _WATCHED:
-        event_stream.on(ev, handler)
-
-    @stream_with_context
-    def generate():
-        try:
-            while True:
-                try:
-                    data = q.get(timeout=30)
-                    yield f"event: {data['_event']}\ndata: {json.dumps(data)}\n\n"
-                except queue.Empty:
-                    yield ": heartbeat\n\n"
-        finally:
-            for ev in _WATCHED:
-                event_stream.off(ev, handler)
-
-    return Response(
-        generate(),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no',
-            'Connection': 'keep-alive',
-        }
+    return redirect(
+        '/api/realtime/stream?' + urlencode({
+            'workplace': workplace_id,
+            'legacy': 'workplace',
+            'snapshot': 1,
+        }),
+        code=307,
     )
 
 

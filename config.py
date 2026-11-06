@@ -46,6 +46,19 @@ def _get_env_bool(name: str, default: bool, invert: bool = False) -> bool:
     return not result if invert else result
 
 
+def get_two_factor_auth_override():
+    """Return the explicit ``ENABLE_2FA`` override, or ``None`` when unset.
+
+    An explicitly supplied environment value always wins over the database
+    setting. This is evaluated on access so test/deployment environments that
+    inject environment variables before process start behave predictably.
+    """
+    raw = os.getenv("ENABLE_2FA")
+    if raw is None:
+        return None
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _get_env_int(name: str, default: int, min_val: int = None, max_val: int = None) -> int:
     """Read an integer environment variable with validation and bounds clamping."""
     try:
@@ -58,6 +71,22 @@ def _get_env_int(name: str, default: int, min_val: int = None, max_val: int = No
         return min_val
     if max_val is not None and value > max_val:
         _logger.warning("%s=%d above maximum %d, clamping to %d", name, value, max_val, max_val)
+        return max_val
+    return value
+
+
+def _get_env_float(name: str, default: float, min_val: float = None, max_val: float = None) -> float:
+    """Read a float environment variable with validation and bounds clamping."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        _logger.warning("Invalid %s, using default %s", name, default)
+        return default
+    if min_val is not None and value < min_val:
+        _logger.warning("%s=%f below minimum %f, clamping to %f", name, value, min_val, min_val)
+        return min_val
+    if max_val is not None and value > max_val:
+        _logger.warning("%s=%f above maximum %f, clamping to %f", name, value, max_val, max_val)
         return max_val
     return value
 
@@ -97,28 +126,13 @@ def get_evaluator_type(domain: str) -> str:
 # Database paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
-def _resolve_app_root(base_dir: str) -> str:
-    """Return the app root directory.
-
-    In release mode the running code lives under ``<app_root>/releases/<tag>/``.
-    Mutable state (``shared/``, ``current`` symlink) lives at the app root, so
-    config must resolve to the grandparent in that case. In flat-repo mode the
-    app root *is* the directory containing this file.
-    """
-    parent = os.path.dirname(base_dir)
-    if os.path.basename(parent) == "releases":
-        return os.path.dirname(parent)
-    return base_dir
-
-
-APP_ROOT = _resolve_app_root(BASE_DIR)
+APP_ROOT = BASE_DIR
 _shared_db_dir = os.path.join(APP_ROOT, "shared", "db")
 if not os.path.isdir(_shared_db_dir):
     os.makedirs(_shared_db_dir, exist_ok=True)
 
 DB_PATH = os.path.join(_shared_db_dir, "evonic.db")
-TEST_DB_PATH = os.path.join(BASE_DIR, "seed", "test_db.sqlite")
+TEST_DB_PATH = os.path.join(BASE_DIR, "evaluator", "test_db.sqlite")
 
 # Flask — SECRET_KEY: auto-generate once and persist to .env if missing.
 # The previous manual .env regex scanner (added when load_dotenv() was absent
@@ -163,7 +177,23 @@ if not _SECRET_KEY_ENV:
 SECRET_KEY = _SECRET_KEY_ENV
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _get_env_int("PORT", 8080, min_val=1, max_val=65535)
+
+# Default avatars for agents without an uploaded image (generated from the agent's name, Boring Avatars style).
+# AVATAR_STYLE: initials | marble | beam | pixel | sunset | ring | bauhaus.  AVATAR_COLORS: comma-separated #RRGGBB list
+# (empty = the built-in palette).
+AVATAR_STYLE = os.getenv("AVATAR_STYLE", "initials").strip().lower() or "initials"
+AVATAR_COLORS = [c.strip() for c in os.getenv("AVATAR_COLORS", "").split(",") if c.strip()]
 DEBUG = os.getenv("DEBUG", "0") == "1"
+
+# External service manager. When unset, Evonic manages its own process.
+SERVICE_SYSTEM = os.getenv("SERVICE_SYSTEM", "").strip().lower()
+SYSTEMD_SERVICE_NAME = os.getenv("SYSTEMD_SERVICE_NAME", "").strip()
+
+# Cookie security — FORCE_INSECURE_COOKIES=true disables the Secure flag
+# for all cookies (session + CSRF). Intended for local development without
+# HTTPS. Default False: cookies ALWAYS have Secure=True regardless of DEBUG.
+FORCE_INSECURE_COOKIES = os.getenv("FORCE_INSECURE_COOKIES", "0") == "1"
+SESSION_COOKIE_SECURE = not FORCE_INSECURE_COOKIES
 
 # Authentication
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "")
@@ -189,8 +219,22 @@ SANDBOX_CPU_LIMIT = os.getenv("SANDBOX_CPU_LIMIT", "1")
 SANDBOX_NETWORK = os.getenv("SANDBOX_NETWORK", "bridge")  # 'none' or 'bridge'
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "evonic-sandbox:latest")
 SANDBOX_MAX_CONTAINERS = _get_env_int("SANDBOX_MAX_CONTAINERS", 10, min_val=1, max_val=100)
+# When True (default), the main agent's Docker sandbox container is keyed by
+# agent_id instead of session_id, runs with --restart=unless-stopped, and is
+# stopped (not removed) on `evonic stop` so installed packages and state survive
+# across sessions. Subagents and explorer sub-workspaces remain session-scoped.
+SANDBOX_PERSISTENT_CONTAINER_ENABLED = _get_env_bool(
+    "SANDBOX_PERSISTENT_CONTAINER_ENABLED", True)
 
-# SSH backend configuration (used by sshc tool / SSHBackend)
+# Sandbox backend selector: 'docker' (default) or 'bwrap' (Linux-only, bubblewrap).
+# 'bwrap' runs each command in a lightweight namespace sandbox (no daemon/image) —
+# suited for small VPS deployments without Docker.
+SANDBOX_BACKEND = os.getenv("SANDBOX_BACKEND", "docker").strip().lower()
+# Opt-in virtual-memory ulimit (MB) for bwrap sandboxes; 0 disables. Hard cgroup
+# limits (systemd-run --scope) are a follow-up.
+SANDBOX_BWRAP_ULIMIT_V_MB = _get_env_int("SANDBOX_BWRAP_ULIMIT_V_MB", 0, min_val=0, max_val=65536)
+
+# SSH backend configuration (used by RemoteWorkplace / portals / SSHBackend)
 SSH_DEFAULT_TIMEOUT = _get_env_int("SSH_DEFAULT_TIMEOUT", 30, min_val=1, max_val=3600)   # seconds per command
 SSH_IDLE_TIMEOUT = _get_env_int("SSH_IDLE_TIMEOUT", 1800, min_val=1, max_val=43200)       # 30 min idle disconnect
 
@@ -201,9 +245,85 @@ CONNECTOR_PING_INTERVAL = _get_env_int("CONNECTOR_PING_INTERVAL", 30, min_val=5,
 CONNECTOR_PING_TIMEOUT = _get_env_int("CONNECTOR_PING_TIMEOUT", 10, min_val=1, max_val=60)
 CONNECTOR_PAIRING_CODE_TTL = _get_env_int("CONNECTOR_PAIRING_CODE_TTL", 300, min_val=60, max_val=3600)  # seconds
 
+# ---- Cross-agent binary artifact sharing (task #806) --------------------------
+# Enables the `share_artifact` tool and the artifact-share download plugin.
+# Runtime precedence for every value below is: system setting (app_settings
+# table, editable in the UI) -> environment variable -> the default here.
+# The env vars document the supported overrides; the authoritative defaults
+# also live in backend/tools/lib/artifact_delivery.py.
+
+# Global kill switch. When disabled, both the sender tool and the token
+# download endpoint fail closed.
+ARTIFACT_SHARE_ENABLED = _get_env_bool("ARTIFACT_SHARE_ENABLED", True)
+
+# Lifetime of a tokenized download URL, in seconds. Default and expected value
+# is 300 seconds (5 minutes); the helper clamps to a sane 30..3600 range.
+ARTIFACT_SHARE_TOKEN_TTL = _get_env_int("ARTIFACT_SHARE_TOKEN_TTL", 300, min_val=30, max_val=3600)
+
+# Maximum size (MB) of an artifact that may be shared over a download URL.
+# Host-local direct-path shares use the same bound for consistency.
+ARTIFACT_SHARE_MAX_MB = _get_env_int("ARTIFACT_SHARE_MAX_MB", 100, min_val=1, max_val=10240)
+
+# Server-side spool that holds opaque snapshots of shared artifacts until they
+# are downloaded or expire. Defaults under APP_ROOT/data/spool/artifact_share.
+ARTIFACT_SHARE_SPOOL_DIR = os.getenv(
+    "ARTIFACT_SHARE_SPOOL_DIR",
+    os.path.join(APP_ROOT, "data", "spool", "artifact_share"),
+)
+
+# Maximum total bytes the spool may hold before new shares are refused (MB).
+ARTIFACT_SHARE_SPOOL_QUOTA_MB = _get_env_int(
+    "ARTIFACT_SHARE_SPOOL_QUOTA_MB", 2048, min_val=1, max_val=1048576)
+
+# Optional comma-separated allowlist of artifact file extensions that may be
+# shared (e.g. ".pdf,.png,.zip"). Empty means "allow any type".
+ARTIFACT_SHARE_ALLOWED_EXTENSIONS = os.getenv("ARTIFACT_SHARE_ALLOWED_EXTENSIONS", "").strip()
+
+# Public base URL used to build token download links. Must be set to the
+# externally reachable origin (no trailing slash) in production; when unset the
+# helper falls back to http://127.0.0.1:8080.
+EVONIC_PUBLIC_URL = os.getenv("EVONIC_PUBLIC_URL", "").strip()
+
+
 AGENT_MAX_TOOL_ITERATIONS = _get_env_int("AGENT_MAX_TOOL_ITERATIONS", 100, min_val=1, max_val=1000)
 EVAL_MAX_TOOL_ITERATIONS = _get_env_int("EVAL_MAX_TOOL_ITERATIONS", 30, min_val=1, max_val=500)
+# Bounded continuation budget for an active `/goal` (see backend.goal_runtime).
+# Keeps an unfinished or impossible goal from looping the agent forever.
+AGENT_MAX_GOAL_NUDGES = _get_env_int("AGENT_MAX_GOAL_NUDGES", 5, min_val=0, max_val=50)
 AGENT_MAX_TOOL_RESULT_CHARS = _get_env_int("AGENT_MAX_TOOL_RESULT_CHARS", 8000, min_val=1, max_val=1_048_576)
+# Stream the model's reasoning to the browser live (OpenAI-compatible endpoints). Set AGENT_STREAM_THINKING=0 to fall back to one non-streaming call per step.
+AGENT_STREAM_THINKING = _get_env_bool("AGENT_STREAM_THINKING", True)
+# Maximum time the agent loop waits for each parallel tool, measured from
+# submission. Running Python threads cannot be terminated, so expired workers
+# are abandoned while pending work is cancelled during non-blocking cleanup.
+AGENT_PARALLEL_TOOL_WAIT_TIMEOUT = _get_env_int(
+    "AGENT_PARALLEL_TOOL_WAIT_TIMEOUT", 300, min_val=1, max_val=3600)
+
+# Same-turn context projection. Enforced mode sends the validated bounded payload;
+# shadow mode emits attribution while sending canonical messages, and off disables
+# compaction. Projection failures always fail open to canonical messages.
+ACTIVE_CONTEXT_MODE = os.getenv("ACTIVE_CONTEXT_MODE", "enforced").strip().lower()
+if ACTIVE_CONTEXT_MODE not in ("off", "shadow", "enforced"):
+    _logger.warning("Invalid ACTIVE_CONTEXT_MODE=%r, using off", ACTIVE_CONTEXT_MODE)
+    ACTIVE_CONTEXT_MODE = "off"
+ACTIVE_CONTEXT_SOFT_TOKENS = _get_env_int(
+    "ACTIVE_CONTEXT_SOFT_TOKENS", 12000, min_val=0, max_val=10_000_000)
+# When the active model declares a context window, start projecting completed
+# tool-call groups before the request consumes this share of that capacity.
+ACTIVE_CONTEXT_CAPACITY_PERCENT = _get_env_int(
+    "ACTIVE_CONTEXT_CAPACITY_PERCENT", 85, min_val=1, max_val=100)
+ACTIVE_CONTEXT_RECENT_GROUPS = _get_env_int(
+    "ACTIVE_CONTEXT_RECENT_GROUPS", 2, min_val=0, max_val=100)
+ACTIVE_CONTEXT_RECEIPT_MAX_CHARS = _get_env_int(
+    "ACTIVE_CONTEXT_RECEIPT_MAX_CHARS", 4000, min_val=128, max_val=100_000)
+# Hard request-wide preflight. Shadow/canary measure only; enforced refuses an
+# over-budget provider call after deterministic reductions are exhausted.
+REQUEST_BUDGET_MODE = os.getenv("REQUEST_BUDGET_MODE", "enforced").strip().lower()
+if REQUEST_BUDGET_MODE not in ("off", "shadow", "canary", "enforced"):
+    _logger.warning("Invalid REQUEST_BUDGET_MODE=%r, using enforced", REQUEST_BUDGET_MODE)
+    REQUEST_BUDGET_MODE = "enforced"
+REQUEST_BUDGET_SAFETY_MARGIN = _get_env_int(
+    "REQUEST_BUDGET_SAFETY_MARGIN", 512, min_val=0, max_val=100_000)
 
 # RTK token compression — per-agent toggle with env var control
 # TOOL_COMPRESSION_ENABLED: True unless RTK_NO_COMPRESS=1 (env var force-disables)
@@ -217,12 +337,67 @@ TOOL_COMPRESSION_VERBOSE = _get_env_bool("RTK_VERBOSE", False)
 # override this at runtime via the system settings UI.
 LONG_RUNNING_GUARD_ENABLED = _get_env_bool("LR_GUARD_DISABLED", False, invert=True)
 
+# Root filesystem scan guard -- True unless RFS_GUARD_DISABLED=1 (env var force-disables).
+# When enabled, root scans (`find /`, `tree /`) are auto-rejected (no approval prompt)
+# so the agent explores a narrower path instead, because a full-root scan is a
+# performance hazard that can stall the turn. This guard lives OUTSIDE the safety pipeline (see backend/tools/bash.py) --
+# it is a performance control, not a trust decision -- so the per-agent "Safety Checker"
+# toggle (safety_checker_enabled) does NOT affect it. In addition to the env var, the
+# DB setting root_fs_scan_guard_enabled can override this at runtime via the
+# System > Settings UI (like the long-running guard).
+ROOT_FS_SCAN_GUARD_ENABLED = _get_env_bool("RFS_GUARD_DISABLED", False, invert=True)
+
+# ---- WhatsApp safe outbound delivery (global, system-wide) ----
+# These settings apply to ALL agents using WhatsApp channels.
+# They can be overridden at runtime via the System Settings UI (app_settings table).
+
+# Master toggle: when disabled (0), all safe-delivery features are bypassed.
+WHATSAPP_SAFE_DELIVERY_ENABLED = _get_env_bool("WHATSAPP_SAFE_DELIVERY_ENABLED", True)
+
+# Pooling window in seconds: text chunks arriving within this window are merged
+# before sending, reducing bursty multi-message delivery.
+WHATSAPP_POOL_WINDOW_SECONDS = _get_env_float("WHATSAPP_POOL_WINDOW_SECONDS", 2.0, min_val=0.1, max_val=30.0)
+
+# Hard minimum interval (seconds) between sends to the same chat, independent of
+# the cosmetic typing delay.
+WHATSAPP_MIN_SEND_INTERVAL_SECONDS = _get_env_float("WHATSAPP_MIN_SEND_INTERVAL_SECONDS", 2.0, min_val=0.1, max_val=60.0)
+
+# Characters-per-second used to estimate a bounded typing delay from content length.
+WHATSAPP_TYPING_CHARS_PER_SECOND = _get_env_float("WHATSAPP_TYPING_CHARS_PER_SECOND", 20.0, min_val=1.0, max_val=100.0)
+
+# Hard upper bound (seconds) on the computed typing delay so users are not left
+# waiting indefinitely for long messages.
+WHATSAPP_MAX_TYPING_DELAY_SECONDS = _get_env_float("WHATSAPP_MAX_TYPING_DELAY_SECONDS", 15.0, min_val=1.0, max_val=120.0)
+
+# Fraction of the computed delay that is added/subtracted as random jitter to
+# break up mechanical timing patterns. 0.15 means ±15% variation.
+WHATSAPP_DELAY_JITTER_RATIO = _get_env_float("WHATSAPP_DELAY_JITTER_RATIO", 0.15, min_val=0.0, max_val=0.5)
+
+# Per-channel rolling outbound cap (messages/minute). Exceeding this triggers
+# throttling warnings and circuit-breaker behavior.
+WHATSAPP_MAX_OUTBOUND_PER_MINUTE = _get_env_int("WHATSAPP_MAX_OUTBOUND_PER_MINUTE", 30, min_val=1, max_val=600)
+
+# Master toggle for WhatsApp-native text formatting (headings→labels, bullets→•,
+# [label](url)→"label: url", code blocks→CODE, etc.). When disabled (0), the
+# original _strip_markdown is used.
+WHATSAPP_NATURAL_FORMATTING_ENABLED = _get_env_bool("WHATSAPP_NATURAL_FORMATTING_ENABLED", True)
+
 # Session archiving on /clear — when enabled, session data (messages, JSONL,
 # summaries, state) is saved to shared/db/session_archive.db before clearing.
 # Only active when EVONIC_SESSION_ARCHIVE=1 (or true/True/TRUE).
 SESSION_ARCHIVE = _get_env_bool("EVONIC_SESSION_ARCHIVE", False)
 
 AGENT_MAX_SUMMARIZE_BATCH = _get_env_int("AGENT_MAX_SUMMARIZE_BATCH", 20, min_val=1, max_val=500)
+
+# Hard character cap for a persisted session summary. Enforced by *semantic*
+# compaction (see backend/agent_runtime/summary_compactor.py) — never by naive
+# mid-text truncation. Stale/irrelevant details are dropped first so the summary
+# stays useful as it condenses.
+AGENT_MAX_SUMMARY_CHARS = _get_env_int("AGENT_MAX_SUMMARY_CHARS", 2000, min_val=200, max_val=100_000)
+
+# Max LLM compaction attempts before the deterministic line-level fallback runs.
+AGENT_SUMMARY_COMPACT_ATTEMPTS = _get_env_int("AGENT_SUMMARY_COMPACT_ATTEMPTS", 2, min_val=0, max_val=5)
+
 AGENT_TIMEOUT_RETRIES = _get_env_int("AGENT_TIMEOUT_RETRIES", 2, min_val=0, max_val=20)
 AGENT_QUEUE_WORKERS = _get_env_int("AGENT_QUEUE_WORKERS", 5, min_val=1, max_val=32)
 AGENT_SIDEBAR_LIMIT = _get_env_int("AGENT_SIDEBAR_LIMIT", 10, min_val=1, max_val=500)
@@ -237,6 +412,10 @@ STALE_SESSION_THRESHOLD_SECONDS = _get_env_int("STALE_SESSION_THRESHOLD_SECONDS"
 # Long gap injection — inject system context when user hasn't messaged in N+ weeks.
 # Separate from STALE_SESSION which checks gap between consecutive messages.
 LONG_GAP_WEEKS = _get_env_int("LONG_GAP_WEEKS", 3, min_val=1, max_val=52)
+
+# Background jobs injection — list the session's still-running background
+# processes each turn, so the agent does not forget what it started.
+BACKGROUND_JOBS_INJECTION_ENABLED = _get_env_bool("BACKGROUND_JOBS_INJECTION_ENABLED", True)
 
 # Thinking budget cap for small reasoning models (tokens per turn).
 # Only active when explicitly set per-model via thinking_budget field in DB.

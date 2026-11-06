@@ -9,7 +9,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from werkzeug.security import generate_password_hash
 
 TEST_PASSWORD = "test123"
-TEST_PASSWORD_HASH = generate_password_hash(TEST_PASSWORD)
+# Use pbkdf2 (not werkzeug's scrypt default) to match the app's own hashing in
+# backend/setup.py and avoid hashlib.scrypt, which is unavailable on Python
+# builds without OpenSSL scrypt support (e.g. CI's setup-python 3.9).
+TEST_PASSWORD_HASH = generate_password_hash(TEST_PASSWORD, method="pbkdf2:sha256")
 
 
 class TestOpenRedirectPrevention(unittest.TestCase):
@@ -30,6 +33,9 @@ class TestOpenRedirectPrevention(unittest.TestCase):
         # load_dotenv() during reload may overwrite our env var with .env values,
         # so force the config attribute to the test hash directly.
         config.ADMIN_PASSWORD_HASH = TEST_PASSWORD_HASH
+        # Same for the Turnstile secret: a real .env value re-enables captcha
+        # verification on POST /login, so force it empty to disable captcha.
+        config.TURNSTILE_SECRET_KEY = ""
 
         from routes.auth import auth_bp
         from flask import Flask

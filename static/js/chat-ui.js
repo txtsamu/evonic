@@ -588,6 +588,150 @@ function retrofitImageForLazy($img, $scrollContainer) {
     setupImageForLazy($img, $scrollContainer || _findScrollContainer($img));
 }
 
+// ── icons.js ────────────────────────────────────────────────────
+
+const _UI_ICONS = {
+    'brain': '<path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/>',
+    'wrench': '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+    'message': '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+    'retry': '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+    'check': '<path d="M20 6 9 17l-5-5"/>',
+    'x': '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+    'check-circle': '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+    'x-circle': '<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>',
+    'lock': '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    'alert': '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+    'chevron-right': '<path d="m9 18 6-6-6-6"/>',
+    'chevron-down': '<path d="m6 9 6 6 6-6"/>',
+    'server': '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/>',
+};
+
+function uiIcon(name, size) {
+    const s = size || 14;
+    return '<svg class="ui-ic" width="' + s + '" height="' + s + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (_UI_ICONS[name] || '') + '</svg>';
+}
+
+// ── badges.js ───────────────────────────────────────────────────
+
+const TONE_CLASS = {
+    green: 'text-green-700 border-green-300 bg-green-50 dark:text-green-300 dark:border-green-800 dark:bg-green-950/40',
+    red: 'text-red-700 border-red-300 bg-red-50 dark:text-red-300 dark:border-red-800 dark:bg-red-950/40',
+    amber: 'text-orange-700 border-orange-300 bg-orange-50 dark:text-orange-300 dark:border-orange-800 dark:bg-orange-950/40',
+    neutral: 'text-gray-600 border-gray-300 bg-gray-50 dark:text-gray-300 dark:border-gray-700 dark:bg-gray-800/60',
+};
+
+const TONE_ICON = { green: 'check', red: 'x', amber: 'alert', neutral: 'lock' };
+
+const SOURCE_LABEL = { dmss: 'DMSS', rules: 'Rules', guard: 'Guard' };
+
+function _decidedByLabel(approval) {
+    const by = String(approval.decided_by || '');
+    if (by.indexOf('agent:') === 0) return 'agent ' + by.slice(6);
+    if (by === 'timeout') return 'Timeout';
+    if (by === 'system:stopped') return 'Stopped';
+    if (by === 'policy:api') return 'API policy';
+    if (by.indexOf('user:') === 0) return 'You';
+    return 'You';
+}
+
+function approvalLabel(approval) {
+    if (!approval || !approval.decision) return null;
+    const by = String(approval.decided_by || '');
+    const who = _decidedByLabel(approval);
+    if (approval.decision === 'approve') {
+        if (by === 'timeout') return 'Timed out';
+        return who === 'You' ? 'You approved' : 'Approved by ' + who;
+    }
+    if (by === 'timeout') return 'Timed out — rejected';
+    if (by === 'policy:api') return 'Rejected (API policy)';
+    if (by === 'system:stopped') return 'Stopped — rejected';
+    return who === 'You' ? 'You declined' : 'Declined by ' + who;
+}
+
+function _safetyLabel(safety) {
+    const source = SOURCE_LABEL[safety.source] || 'Rules';
+    const decision = safety.decision || safety.level || 'allow';
+    const word = decision === 'block' ? 'block'
+        : decision === 'review' ? 'review'
+        : 'allow';
+    return source + ' ' + word;
+}
+
+function _toneFor(decision, source) {
+    if (decision === 'block') return 'red';
+    if (decision === 'review') return 'amber';
+    // Only a model-backed verdict earns a positive tone; a plain rule pass is neutral.
+    return source === 'dmss' ? 'green' : 'neutral';
+}
+
+function _safetyTooltip(safety) {
+    const parts = [];
+    parts.push((SOURCE_LABEL[safety.source] || 'Rules') + ' verdict');
+    if (safety.mode) parts.push('mode ' + safety.mode);
+    if (safety.model_decision) parts.push('model ' + safety.model_decision);
+    if (safety.confidence != null) parts.push('confidence ' + safety.confidence);
+    if (safety.event_id) parts.push('event ' + String(safety.event_id).slice(0, 12));
+    if (safety.blocked_patterns && safety.blocked_patterns.length) {
+        parts.push('flagged: ' + safety.blocked_patterns.join(', '));
+    }
+    if (safety.reasons && safety.reasons.length) {
+        parts.push(safety.reasons[0]);
+    }
+    return parts.join(' · ');
+}
+
+function describeBadge(safety, approval) {
+    if (approval && approval.decision) {
+        const label = approvalLabel(approval);
+        const tone = approval.decision === 'approve' ? 'green' : 'red';
+        const title = 'Decision: ' + label +
+            (approval.decided_by ? ' (' + approval.decided_by + ')' : '') +
+            (safety ? ' · ' + _safetyTooltip(safety) : '');
+        return { label: label, tone: tone, title: title, icon: TONE_ICON[tone] };
+    }
+    if (!safety || !safety.source) return null;
+    const decision = safety.decision || 'allow';
+    // A plain rule pass with no model involvement is the boring default: no
+    // badge, so the timeline stays quiet unless something actually decided.
+    const hasModelContext = !!(safety.mode && safety.mode !== null) ||
+        (safety.blocked_patterns && safety.blocked_patterns.length > 0);
+    if (decision === 'allow' && safety.source !== 'dmss' && !hasModelContext) return null;
+    const tone = _toneFor(decision, safety.source);
+    return {
+        label: _safetyLabel(safety),
+        tone: tone,
+        title: _safetyTooltip(safety),
+        icon: tone === 'neutral' && decision === 'allow' ? 'check' : TONE_ICON[tone],
+    };
+}
+
+function buildBadge(safety, approval) {
+    const desc = describeBadge(safety, approval);
+    if (!desc) return null;
+    const toneClass = TONE_CLASS[desc.tone] || TONE_CLASS.neutral;
+    const $label = $('<span>').text(desc.label);
+    return $('<span class="safety-badge inline-flex items-center gap-1 ml-auto pl-2 text-[10px] font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap">')
+        .addClass(toneClass)
+        .attr('title', desc.title)
+        .attr('data-safety-tone', desc.tone)
+        .append(uiIcon(desc.icon, 11), $label);
+}
+
+function applyBadge($entry, safety, approval) {
+    if (!$entry || !$entry.length) return;
+    const $badge = buildBadge(safety, approval);
+    if (!$badge) return;
+    const key = $badge.attr('title') + '|' + $badge.text();
+    if ($entry.find('.safety-badge').attr('data-safety-key') === key) return;
+    $entry.find('.safety-badge').remove();
+    $badge.attr('data-safety-key', key);
+    const $status = $entry.find('.tl-status').first().parent();
+    const $header = ($status && $status.length) ? $status : $entry.children().first();
+    if ($header && $header.length) $header.append($badge);
+    else $entry.append($badge);
+}
+
 // ── renderers.js ────────────────────────────────────────────────
 
 // ── Sanitizer ─────────────────────────────────────────────────────────────────
@@ -601,7 +745,9 @@ const ALLOWED_ATTRS = {
     a:    ['href', 'title', 'target'],
     code: ['class'],
     pre:  ['class'],
+    span: ['class', 'style', 'aria-hidden'],
     img:  ['src', 'alt', 'class', 'loading'],
+    ol:   ['start'],
 };
 
 function _walkSanitize(node) {
@@ -619,13 +765,30 @@ function _walkSanitize(node) {
             const allowed = (ALLOWED_ATTRS[tag] || []).concat(ALLOWED_ATTRS['*'] || []);
             const attrsToRemove = [...child.attributes].filter(a => !allowed.includes(a.name));
             attrsToRemove.forEach(a => child.removeAttribute(a.name));
-            // Sanitize hrefs
+            // Sanitize hrefs / image sources: only web URLs, mailto:, anchors,
+            // and same-origin /api/ paths are user-accessible. Local filesystem
+            // paths and custom URI schemes (file:, sandbox:, ...) render as
+            // broken links in the browser, so they are neutralized here.
             if (tag === 'a') {
                 const href = child.getAttribute('href') || '';
-                if (/^javascript:/i.test(href) || /^data:/i.test(href)) {
+                if (!/^(https?:\/\/|mailto:|#|\/api\/)/i.test(href)) {
                     child.setAttribute('href', '#');
+                    child.setAttribute('title', 'Local path — not accessible via link');
                 }
                 child.setAttribute('rel', 'noopener noreferrer');
+                // Open external links in a new tab
+                if (/^https?:\/\//i.test(href)) {
+                    child.setAttribute('target', '_blank');
+                }
+            }
+            if (tag === 'img') {
+                const src = child.getAttribute('src') || '';
+                if (!/^(https?:\/\/|\/api\/|data:image\/)/i.test(src)) {
+                    // Neutralize unsafe image sources (local paths, file:/sandbox:)
+                    child.removeAttribute('src');
+                    const alt = child.getAttribute('alt') || '';
+                    child.setAttribute('alt', alt ? alt + ' (unavailable)' : '(unavailable)');
+                }
             }
             _walkSanitize(child);
         }
@@ -647,9 +810,198 @@ function escape(text) {
     return div.innerHTML;
 }
 
+function normalizeTimestamp(timestamp) {
+    if (timestamp == null || timestamp === '') return null;
+    let value = timestamp;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+        if (/^\d+(?:\.\d+)?$/.test(trimmed)) value = Number(trimmed);
+        else value = trimmed;
+    }
+    if (typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 1e12) value *= 1000;
+    const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+// -- KaTeX math rendering ----------------------------------------------------------
+
+// Renders LaTeX math delimiters in HTML content. Runs after marked.parse() and
+// before DOM insertion. The currency-safe rules live in js/markdown-math.js
+// (EvMarkdownMath.render) so chat, KB previews and template scripts share one
+// implementation; without that script math is simply left untouched.
+function renderMath(html) {
+    if (!html) return html || '';
+    const math = typeof window !== 'undefined' ? window.EvMarkdownMath : null;
+    if (math && typeof math.render === 'function') return math.render(html);
+    return html;
+}
+
 function truncateLine(text, max) {
     const first = (text || '').split('\n')[0].trim();
     return first.length > max ? first.slice(0, max) + '\u2026' : first;
+}
+
+// \u2500\u2500 Wiki-link transform \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+function transformWikiLinks(html) {
+    return (html || '').replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m, target, display) => {
+        const t = (target || '').trim();
+        const label = ((display || target) || '').trim();
+        const attr = escape(t).replace(/"/g, '&quot;');
+        return '<a href="#" class="kb-wikilink text-indigo-600 dark:text-indigo-400 font-medium no-underline hover:underline" data-wikilink="' + attr + '">' + escape(label) + '</a>';
+    });
+}
+
+// \u2500\u2500 KB doc preview rendering \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+function kbSplitFrontmatter(content) {
+    const m = (content || '').match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+    if (!m) return { fm: null, body: content || '' };
+    return { fm: m[1], body: m[2] };
+}
+
+function kbParseFM(raw) {
+    const fm = {};
+    (raw || '').split('\n').forEach(function (line) {
+        const i = line.indexOf(':');
+        if (i < 0) return;
+        const k = line.slice(0, i).trim();
+        if (!k) return;
+        let v = line.slice(i + 1).trim();
+        if (v.startsWith('[') && v.endsWith(']')) {
+            v = v.slice(1, -1).split(',').map(function (s) { return s.trim().replace(/^["']|["']$/g, ''); }).filter(Boolean);
+        } else {
+            v = v.replace(/^["']|["']$/g, '');
+        }
+        fm[k] = v;
+    });
+    return fm;
+}
+
+function kbRenderFrontmatter(raw) {
+    const fm = kbParseFM(raw);
+    const asList = function (v) { return Array.isArray(v) ? v : (v ? [v] : []); };
+    const tags = asList(fm.tags), aliases = asList(fm.aliases);
+    const known = new Set(['title', 'type', 'description', 'tags', 'aliases', 'created', 'updated']);
+    let h = '<div class="mb-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-4">';
+    h += '<div class="flex items-center gap-2 flex-wrap mb-1">';
+    if (fm.type) h += '<span class="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-300">' + escape(fm.type) + '</span>';
+    if (fm.title) h += '<span class="text-base font-semibold text-gray-800 dark:text-gray-100">' + escape(fm.title) + '</span>';
+    h += '</div>';
+    if (fm.description) h += '<p class="text-sm text-gray-600 dark:text-gray-300 mt-1 mb-2">' + escape(fm.description) + '</p>';
+    if (tags.length) h += '<div class="flex flex-wrap gap-1 mb-2">' + tags.map(function (t) { return '<span class="text-xs px-2 py-0.5 rounded bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300">#' + escape(t) + '</span>'; }).join('') + '</div>';
+    if (aliases.length) h += '<div class="text-xs text-gray-500 dark:text-gray-400 mb-1">aliases: ' + aliases.map(escape).join(', ') + '</div>';
+    const meta = [];
+    if (fm.created) meta.push('created ' + escape(String(fm.created)));
+    if (fm.updated) meta.push('updated ' + escape(String(fm.updated)));
+    Object.keys(fm).forEach(function (k) {
+        if (!known.has(k)) meta.push(escape(k) + ': ' + escape(Array.isArray(fm[k]) ? fm[k].join(', ') : fm[k]));
+    });
+    if (meta.length) h += '<div class="text-xs text-gray-400 dark:text-gray-500">' + meta.join(' &middot; ') + '</div>';
+    h += '</div>';
+    return h;
+}
+
+function renderKBDocPreview(content) {
+    const parts = kbSplitFrontmatter(content);
+    const cardHtml = parts.fm !== null ? kbRenderFrontmatter(parts.fm) : '';
+    const bodyHtml = typeof marked !== 'undefined'
+        ? transformWikiLinks(sanitize(renderMath(marked.parse(parts.body))))
+        : escape(parts.body);
+    return cardHtml + bodyHtml;
+}
+
+// \u2500\u2500 Wiki-link preview modal \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+var _wikilinkHistory = [];
+
+function _getOrCreateWikilinkModal() {
+    let $modal = $('#wikilink-preview-modal');
+    if ($modal.length) return $modal;
+
+    $modal = $([
+        '<div id="wikilink-preview-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-[150] p-4">',
+        '  <div class="wikilink-modal-dialog bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-[700px] flex flex-col overflow-hidden" style="max-height:85vh;">',
+        '    <div class="flex items-center justify-between px-5 py-3 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">',
+        '      <div class="flex items-center gap-2 min-w-0">',
+        '        <button class="wikilink-modal-back hidden text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex-shrink-0" aria-label="Back">',
+        '          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>',
+        '        </button>',
+        '        <h3 class="wikilink-modal-title text-sm font-semibold text-gray-800 dark:text-gray-200 truncate"></h3>',
+        '      </div>',
+        '      <button class="wikilink-modal-close text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex-shrink-0" aria-label="Close">&times;</button>',
+        '    </div>',
+        '    <div class="wikilink-modal-body prose dark:prose-invert text-sm max-w-none p-5 overflow-y-auto flex-1" style="max-height:70vh;"></div>',
+        '    <div class="px-5 py-3 border-t border-gray-200 dark:border-gray-700 flex justify-end flex-shrink-0">',
+        '      <button class="wikilink-modal-close px-4 py-1.5 text-xs font-medium text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg">Close</button>',
+        '    </div>',
+        '  </div>',
+        '</div>',
+    ].join('\n'));
+
+    function _closeModal() { $modal.addClass('hidden'); _wikilinkHistory = []; }
+
+    $modal.on('click', function (e) { if (e.target === this) _closeModal(); });
+    $modal.find('.wikilink-modal-dialog').on('click', '.wikilink-modal-close', function () { _closeModal(); });
+    $modal.find('.wikilink-modal-dialog').on('click', '.wikilink-modal-back', function () {
+        if (_wikilinkHistory.length) {
+            var prev = _wikilinkHistory.pop();
+            _renderWikilinkModal(prev.title, prev.html, false);
+        }
+    });
+    $modal.find('.wikilink-modal-dialog').on('click', '.kb-wikilink', function (e) {
+        e.preventDefault();
+        var t = $(this).attr('data-wikilink');
+        if (t) document.dispatchEvent(new CustomEvent('evonic:wikilink-click', { detail: { title: t, _fromModal: true } }));
+    });
+    $modal.find('.wikilink-modal-body').on('click', 'a[href^="http://"], a[href^="https://"]', function (e) {
+        e.preventDefault();
+        window.open(this.href, '_blank', 'noopener,noreferrer');
+    });
+    $(document).on('keydown.wikilinkModal', function (e) {
+        if (e.key === 'Escape' && !$modal.hasClass('hidden')) _closeModal();
+    });
+
+    $('body').append($modal);
+    return $modal;
+}
+
+function _renderWikilinkModal(title, htmlContent, pushHistory) {
+    var $modal = _getOrCreateWikilinkModal();
+
+    if (pushHistory) {
+        var curTitle = $modal.find('.wikilink-modal-title').text();
+        var curHtml = $modal.find('.wikilink-modal-body').html();
+        if (curTitle) _wikilinkHistory.push({ title: curTitle, html: curHtml });
+    }
+
+    $modal.find('.wikilink-modal-title').text(title);
+
+    if (htmlContent === null || htmlContent === undefined) {
+        $modal.find('.wikilink-modal-body').html(
+            '<div class="flex flex-col items-center justify-center py-12 text-gray-400 dark:text-gray-500">' +
+            '<svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12 mb-3 text-gray-300 dark:text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>' +
+            '<p class="text-sm font-medium">Dokumen belum tersedia</p>' +
+            '<p class="text-xs mt-1">Informasi ini belum ada di knowledge base.</p>' +
+            '</div>'
+        );
+    } else {
+        $modal.find('.wikilink-modal-body').html(htmlContent);
+    }
+
+    var $back = $modal.find('.wikilink-modal-back');
+    if (_wikilinkHistory.length) $back.removeClass('hidden');
+    else $back.addClass('hidden');
+
+    $modal.find('.wikilink-modal-body').scrollTop(0);
+}
+
+function showWikilinkPreview(title, htmlContent, fromModal) {
+    var $modal = _getOrCreateWikilinkModal();
+    var isOpen = !$modal.hasClass('hidden');
+    _renderWikilinkModal(title, htmlContent, isOpen && fromModal);
+    $modal.removeClass('hidden');
 }
 
 // ── Syntax highlighters ───────────────────────────────────────────────────────
@@ -699,19 +1051,138 @@ function highlightPython(code) {
     return result;
 }
 
+function _diffTokens(text) {
+    return text.match(/\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || [];
+}
+
+function _intralineDiff(oldText, newText) {
+    const oldTokens = _diffTokens(oldText);
+    const newTokens = _diffTokens(newText);
+    const cellCount = oldTokens.length * newTokens.length;
+
+    // Do not allocate a large LCS table for unusually long generated lines.
+    if (cellCount > 60000) return [escape(oldText), escape(newText)];
+
+    const dp = Array.from({ length: oldTokens.length + 1 }, () => new Int32Array(newTokens.length + 1));
+    for (let i = 1; i <= oldTokens.length; i++) {
+        for (let j = 1; j <= newTokens.length; j++) {
+            dp[i][j] = oldTokens[i - 1] === newTokens[j - 1]
+                ? dp[i - 1][j - 1] + 1
+                : Math.max(dp[i - 1][j], dp[i][j - 1]);
+        }
+    }
+
+    const unchangedOld = new Set();
+    const unchangedNew = new Set();
+    for (let i = oldTokens.length, j = newTokens.length; i > 0 && j > 0;) {
+        if (oldTokens[i - 1] === newTokens[j - 1]) {
+            unchangedOld.add(--i);
+            unchangedNew.add(--j);
+        } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+            i--;
+        } else {
+            j--;
+        }
+    }
+
+    const render = (tokens, unchanged, className) => tokens.map((token, index) => {
+        const html = escape(token);
+        return unchanged.has(index) ? html : `<span class="${className}">${html}</span>`;
+    }).join('');
+    return [
+        render(oldTokens, unchangedOld, 'hl-diff-remove-change'),
+        render(newTokens, unchangedNew, 'hl-diff-add-change'),
+    ];
+}
+
+function _renderDiffLine(type, text, content = escape(text)) {
+    const className = type === 'add' ? 'hl-diff-add' : type === 'remove' ? 'hl-diff-remove' : 'hl-diff-context';
+    const prefix = type === 'add' ? '+' : type === 'remove' ? '-' : ' ';
+    return `<span class="${className}">${prefix}${content}</span>`;
+}
+
+function _renderDiffChangeBlock(removed, added) {
+    const rendered = [];
+    const pairs = Math.min(removed.length, added.length);
+    for (let i = 0; i < pairs; i++) {
+        const [oldHtml, newHtml] = _intralineDiff(removed[i], added[i]);
+        rendered.push(_renderDiffLine('remove', removed[i], oldHtml));
+        rendered.push(_renderDiffLine('add', added[i], newHtml));
+    }
+    for (let i = pairs; i < removed.length; i++) rendered.push(_renderDiffLine('remove', removed[i]));
+    for (let i = pairs; i < added.length; i++) rendered.push(_renderDiffLine('add', added[i]));
+    return rendered;
+}
+
 function highlightDiff(patch) {
     if (!patch) return '';
-    return escape(patch).split('\n').map(line => {
-        if (line.startsWith('@@'))   return `<span class="hl-diff-header">${line}</span>`;
-        if (line.startsWith('--- ') || line.startsWith('+++ ')) return `<span class="hl-diff-filename">${line}</span>`;
-        if (line.startsWith('+'))   return `<span class="hl-diff-add">${line}</span>`;
-        if (line.startsWith('-'))   return `<span class="hl-diff-remove">${line}</span>`;
-        if (line.startsWith('\\')) return `<span class="hl-diff-meta">${line}</span>`;
-        return `<span class="hl-diff-context">${line}</span>`;
-    }).join('\n');
+    const lines = String(patch).split('\n');
+    const rendered = [];
+    for (let index = 0; index < lines.length;) {
+        const line = lines[index];
+        if (line.startsWith('-') && !line.startsWith('--- ')) {
+            const removed = [];
+            while (index < lines.length && lines[index].startsWith('-') && !lines[index].startsWith('--- ')) {
+                removed.push(lines[index++].slice(1));
+            }
+            const added = [];
+            while (index < lines.length && lines[index].startsWith('+') && !lines[index].startsWith('+++ ')) {
+                added.push(lines[index++].slice(1));
+            }
+            rendered.push(..._renderDiffChangeBlock(removed, added));
+            continue;
+        }
+        if (line.startsWith('@@')) rendered.push(`<span class="hl-diff-header">${escape(line)}</span>`);
+        else if (line.startsWith('--- ') || line.startsWith('+++ ')) rendered.push(`<span class="hl-diff-filename">${escape(line)}</span>`);
+        else if (line.startsWith('+')) rendered.push(_renderDiffLine('add', line.slice(1)));
+        else if (line.startsWith('\\')) rendered.push(`<span class="hl-diff-meta">${escape(line)}</span>`);
+        else rendered.push(_renderDiffLine('context', line.slice(1)));
+        index++;
+    }
+    return rendered.join('\n');
 }
 
 // ── Tool result rendering helpers ─────────────────────────────────────────────
+
+function _truncateToolResultText(value, maxLength = 240) {
+    const text = String(value);
+    return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function _serializeToolResult(value) {
+    try {
+        return _truncateToolResultText(JSON.stringify(value));
+    } catch (error) {
+        return '[Unserializable tool result]';
+    }
+}
+
+function _extractToolError(result) {
+    if (!result || typeof result !== 'object') return null;
+    const error = result.error;
+    if (typeof error === 'string' && error.trim()) return error.trim();
+    if (!error || typeof error !== 'object') return null;
+
+    const message = typeof error.message === 'string' && error.message.trim() ? error.message.trim() : null;
+    const code = error.code === null || error.code === undefined ? null : _truncateToolResultText(error.code, 80);
+    if (message && code) return `${code}: ${message}`;
+    if (message) return message;
+    if (code) return code;
+    return _serializeToolResult(error);
+}
+
+function _summarizeToolResultValue(value) {
+    // Preserve concise scalar arrays (such as validation reason_code) while
+    // continuing to suppress nested objects and potentially verbose payloads.
+    if (value === null || value === undefined || typeof value === 'object' && !Array.isArray(value)) return null;
+    if (Array.isArray(value)) {
+        const scalarValues = value.filter(item => item !== null && item !== undefined && typeof item !== 'object');
+        if (!scalarValues.length) return null;
+        const summary = scalarValues.slice(0, 4).map(String).join(', ');
+        return scalarValues.length > 4 ? `${summary}, …` : summary;
+    }
+    return String(value);
+}
 
 function summarizeToolResult(result) {
     if (result === null || result === undefined) return 'OK';
@@ -719,6 +1190,12 @@ function summarizeToolResult(result) {
     if (typeof result === 'object') {
         const keys = Object.keys(result);
         if (!keys.length) return 'OK';
+
+        const error = _extractToolError(result);
+        if (error) {
+            const status = result.status === null || result.status === undefined ? null : _truncateToolResultText(result.status, 80);
+            return status ? `${status}: ${error}` : error;
+        }
         if ('status' in result) {
             const s = String(result.status);
             return ('message' in result && String(result.message).length < 100)
@@ -728,14 +1205,13 @@ function summarizeToolResult(result) {
         if ('count'   in result && typeof result.count === 'number') return `${result.count} item${result.count !== 1 ? 's' : ''}`;
         const parts = [];
         for (const k of keys.slice(0, 3)) {
-            const v = result[k];
-            if (v !== null && v !== undefined && typeof v !== 'object') parts.push(`${k}: ${String(v)}`);
+            const summary = _summarizeToolResultValue(result[k]);
+            if (summary !== null) parts.push(`${k}: ${summary}`);
         }
         if (parts.length) return parts.join(' · ');
-        return `${keys.length} field${keys.length !== 1 ? 's' : ''}`;
+        return _serializeToolResult(result);
     }
-    const s = String(result);
-    return s.length > 120 ? s.slice(0, 117) + '...' : s;
+    return _truncateToolResultText(result, 120);
 }
 
 function _renderRunpyResult(r) {
@@ -744,7 +1220,7 @@ function _renderRunpyResult(r) {
     const hasError  = r.exit_code !== 0;
     const statusColor = hasError ? 'text-red-600' : 'text-green-600';
     const statusBg    = hasError ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200';
-    const statusIcon  = hasError ? '&#10060;' : '&#9989;';
+    const statusIcon  = hasError ? uiIcon('x-circle', 12) : uiIcon('check-circle', 12);
     const $wrap = $('<div>');
     const $badge = $(`<div class="flex items-center gap-2 mb-1.5 text-[10px] font-mono border rounded px-2 py-1">`).addClass(statusColor).addClass(statusBg);
     $badge.append(
@@ -770,7 +1246,7 @@ function _renderBashResult(r) {
     const hasError  = r.exit_code !== 0;
     const statusColor = hasError ? 'text-red-600' : 'text-green-600';
     const statusBg    = hasError ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200';
-    const statusIcon  = hasError ? '&#10060;' : '&#9989;';
+    const statusIcon  = hasError ? uiIcon('x-circle', 12) : uiIcon('check-circle', 12);
     const $wrap = $('<div>');
     const $badge = $(`<div class="flex items-center gap-2 mb-1.5 text-[10px] font-mono border rounded px-2 py-1">`).addClass(statusColor).addClass(statusBg);
     $badge.append(
@@ -791,46 +1267,135 @@ function _renderBashResult(r) {
     return $wrap;
 }
 
+function _recallText(value) {
+    return value === null || value === undefined ? '' : String(value).trim();
+}
+
+function _recallDate(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+}
+
+function _recallHeader(label, count, engine) {
+    const $header = $('<div class="recall-header">');
+    const $title = $('<div class="recall-title">').append($('<span class="recall-dot">'), $('<span>').text(label));
+    const $meta = $('<div class="recall-header-meta">');
+    if (_recallText(engine)) $meta.append($('<span class="recall-chip">').text(engine));
+    if (Number.isFinite(count)) $meta.append($('<span class="recall-count">').text(count));
+    return $header.append($title, $meta);
+}
+
+function _recallEmpty(message) {
+    return $('<div class="recall-empty">').text(message);
+}
+
+function _recallBody(text) {
+    const value = _recallText(text) || 'No preview available.';
+    const $body = $('<div class="recall-body">').text(value);
+    if (value.length <= 360 && value.split('\n').length <= 6) return $body;
+    $body.addClass('is-clamped');
+    const $button = $('<button type="button" class="recall-more">').text('Show more').on('click', function () {
+        const expanded = $body.toggleClass('is-clamped').hasClass('is-clamped') === false;
+        $(this).text(expanded ? 'Show less' : 'Show more');
+    });
+    return $('<div>').append($body, $button);
+}
+
+function _recallMeta(items) {
+    const $meta = $('<div class="recall-meta">');
+    items.filter(item => item.value).forEach(item => $meta.append($('<span>').addClass(item.className || '').text(item.value)));
+    return $meta;
+}
+
 function _renderRecallResult(result) {
-    const $wrap = $('<div>');
-    const memories = result.memories || [];
+    const $wrap = $('<div class="recall-ui">');
+    const memories = Array.isArray(result.memories) ? result.memories : [];
+    $wrap.append(_recallHeader('Memory recall', memories.length, result.engine));
+    if (!memories.length) return $wrap.append(_recallEmpty(_recallText(result.result) || 'No memories found.'));
 
-    if (!memories.length) {
-        const msg = result.result || 'No memories found.';
-        return $('<div class="text-xs text-gray-500 italic px-2 py-1">').text(msg);
+    const $list = $('<div class="recall-list">');
+    memories.forEach((memory, index) => {
+        const m = memory && typeof memory === 'object' ? memory : {};
+        const identity = _recallText(m.slug) || (m.id !== null && m.id !== undefined ? '#' + m.id : 'Memory ' + (index + 1));
+        const content = _recallText(m.snippet) || _recallText(m.content) || _recallText(m.title);
+        const score = m.score === null || m.score === undefined || m.score === '' ? NaN : Number(m.score);
+        const $top = $('<div class="recall-card-top">').append($('<span class="recall-card-title">').text(identity));
+        const $chips = $('<span class="recall-card-chips">');
+        if (_recallText(m.category)) $chips.append($('<span class="recall-chip">').text(m.category));
+        if (_recallText(m.evidence)) $chips.append($('<span class="recall-chip recall-chip-accent">').text(m.evidence));
+        if (Number.isFinite(score)) $chips.append($('<span class="recall-chip recall-score">').text(score.toFixed(3)));
+        $top.append($chips);
+        const $card = $('<div class="recall-card">').append($top, _recallBody(content));
+        const meta = [
+            {value: _recallText(m.source_file), className: 'recall-path'},
+            {value: _recallDate(m.created_at), className: 'recall-time'}
+        ];
+        if (meta.some(item => item.value)) $card.append(_recallMeta(meta));
+        $list.append($card);
+    });
+    return $wrap.append($list);
+}
+
+function _renderRecallThinkResult(result) {
+    const $wrap = $('<div class="recall-ui">');
+    const facts = Array.isArray(result.facts) ? result.facts : [];
+    const gaps = Array.isArray(result.gaps) ? result.gaps : [];
+    $wrap.append(_recallHeader('Memory synthesis', facts.length, result.engine));
+
+    const $list = $('<div class="recall-list">');
+    facts.forEach((fact, index) => {
+        const f = fact && typeof fact === 'object' ? fact : {};
+        const $top = $('<div class="recall-card-top">').append($('<span class="recall-card-title">').text('Fact ' + (index + 1)));
+        if (_recallText(f.evidence)) $top.append($('<span class="recall-chip recall-chip-accent">').text(f.evidence));
+        const $card = $('<div class="recall-card">').append($top, _recallBody(_recallText(f.fact) || _recallText(f.snippet)));
+        const meta = [
+            {value: _recallText(f.source), className: 'recall-source'},
+            {value: _recallText(f.source_file), className: 'recall-path'}
+        ];
+        if (meta.some(item => item.value)) $card.append(_recallMeta(meta));
+        $list.append($card);
+    });
+    if (facts.length) $wrap.append($list);
+    if (gaps.length) {
+        const $gaps = $('<details class="recall-gaps">').append($('<summary>').text('Knowledge gaps · ' + gaps.length));
+        gaps.forEach(gap => $gaps.append($('<div>').text(_recallText(gap))));
+        $wrap.append($gaps);
     }
-
-    // Count badge
-    $wrap.append(
-        $('<div class="text-[10px] font-semibold text-purple-600 dark:text-purple-300 mb-1.5">').text(
-            `${memories.length} memory item${memories.length !== 1 ? 's' : ''}`
-        )
-    );
-
-    for (const m of memories) {
-        const $item = $('<div class="mb-1.5 border border-purple-200 rounded px-2 py-1.5 bg-purple-50/50 dark:bg-purple-900/20 dark:border-purple-700">');
-        const $meta = $('<div class="flex items-center gap-2 text-[10px] text-purple-400 mb-0.5">');
-        $meta.append(
-            $('<span class="font-semibold">').text('#' + m.id),
-            $('<span>').text(m.category || 'general')
-        );
-        if (m.created_at) {
-            $meta.append($('<span>').text(new Date(m.created_at).toLocaleString()));
-        }
-        $item.append($meta);
-        $item.append(
-            $('<div class="text-xs text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-words">').text(m.content)
-        );
-        $wrap.append($item);
-    }
+    if (!facts.length && !gaps.length) $wrap.append(_recallEmpty('No synthesis results.'));
     return $wrap;
+}
+
+function _renderRecallGraphResult(result) {
+    const $wrap = $('<div class="recall-ui">');
+    const edges = Array.isArray(result.edges) ? result.edges : [];
+    $wrap.append(_recallHeader('Knowledge graph', edges.length, result.engine));
+    if (_recallText(result.start)) $wrap.append($('<div class="recall-query">').text('From: ' + result.start));
+    if (!edges.length) return $wrap.append(_recallEmpty(_recallText(result.result) || 'No connections found.'));
+
+    const $list = $('<div class="recall-list">');
+    edges.forEach(edge => {
+        const e = edge && typeof edge === 'object' ? edge : {};
+        const $row = $('<div class="recall-edge">').append(
+            $('<span>').text(_recallText(e.from) || 'Unknown source'),
+            $('<span class="recall-relation">').text(_recallText(e.edge) || 'related to'),
+            $('<span>').text(_recallText(e.to) || 'Unknown target')
+        );
+        if (e.hop !== null && e.hop !== undefined) $row.append($('<span class="recall-hop">').text('hop ' + e.hop));
+        $list.append($('<div class="recall-card recall-card-edge">').append($row));
+    });
+    return $wrap.append($list);
 }
 
 function buildToolResultDetail(ev) {
     if (ev.error) {
         let msg = typeof ev.error === 'string' && ev.error.length > 1 ? ev.error : null;
+        if (!msg && typeof ev.error === 'object') msg = _extractToolError({ error: ev.error });
         if (!msg && typeof ev.result === 'string') msg = ev.result;
-        if (!msg && ev.result && typeof ev.result === 'object') msg = ev.result.error || ev.result.message || null;
+        if (!msg && ev.result && typeof ev.result === 'object') {
+            msg = _extractToolError(ev.result)
+                || (typeof ev.result.message === 'string' ? ev.result.message : null);
+        }
         if (!msg) msg = 'Tool error';
         return $('<div class="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1 font-mono whitespace-pre-wrap">').text(msg);
     }
@@ -851,9 +1416,12 @@ function buildToolResultDetail(ev) {
     if (typeof ev.result === 'object' && ev.result !== null && Object.keys(ev.result).length === 1 && 'data' in ev.result && typeof ev.result.data === 'string') {
         return $('<pre class="text-xs bg-gray-50 dark:bg-gray-900 dark:text-gray-300 border border-gray-200 rounded p-2 overflow-x-auto font-mono text-gray-700 max-h-[300px] whitespace-pre-wrap">').text(ev.result.data);
     }
-    // recall — show full memory contents
-    if (ev.tool === 'recall' && typeof ev.result === 'object' && ev.result !== null && 'memories' in ev.result) {
-        return _renderRecallResult(ev.result);
+    // recall — show full memory contents for all modes (fts, think, graph)
+    if (ev.tool === 'recall' && typeof ev.result === 'object' && ev.result !== null) {
+        if ('memories' in ev.result) return _renderRecallResult(ev.result);
+        if ('facts' in ev.result)    return _renderRecallThinkResult(ev.result);
+        if ('edges' in ev.result)    return _renderRecallGraphResult(ev.result);
+        return $('<div class="text-xs text-purple-700 bg-purple-50 border border-purple-200 rounded px-2 py-1">').text(summarizeToolResult(ev.result));
     }
     return $('<div class="text-xs text-green-700 bg-green-50 border border-green-200 rounded px-2 py-1">').text(summarizeToolResult(ev.result));
 }
@@ -899,12 +1467,18 @@ function _renderStrReplaceDiff(oldStr, newStr, filePath) {
         let oldC=0,newC=0;
         for (let k=lo;k<=hi;k++) { if(ops[k].type!=='add') oldC++; if(ops[k].type!=='remove') newC++; }
         html += `<span class="hl-diff-header">@@ -${oldLn},${oldC} +${newLn},${newC} @@</span>\n`;
-        for (let k=lo;k<=hi;k++) {
-            const {type,line} = ops[k];
-            const esc = escape(line);
-            if (type==='add') html += `<span class="hl-diff-add">+${esc}</span>\n`;
-            else if (type==='remove') html += `<span class="hl-diff-remove">-${esc}</span>\n`;
-            else html += `<span class="hl-diff-context"> ${esc}</span>\n`;
+        for (let k = lo; k <= hi;) {
+            const { type, line } = ops[k];
+            if (type === 'remove') {
+                const removed = [];
+                while (k <= hi && ops[k].type === 'remove') removed.push(ops[k++].line);
+                const added = [];
+                while (k <= hi && ops[k].type === 'add') added.push(ops[k++].line);
+                html += _renderDiffChangeBlock(removed, added).join('\n') + '\n';
+                continue;
+            }
+            html += _renderDiffLine(type, line) + '\n';
+            k++;
         }
     }
     return $('<pre class="diff-code-block mt-0.5" style="max-height:400px;overflow-y:auto">').html(html);
@@ -985,24 +1559,24 @@ function buildTimelineEntry(ev, isActive) {
     let borderClass, icon, label, labelClass, $summary, $detail, spinnerColor, extraAttrs = {};
 
     if (ev.type === 'thinking') {
-        borderClass = 'border-purple-300'; icon = '&#129504;'; label = 'Thinking'; labelClass = 'text-purple-500'; spinnerColor = '#a855f7';
+        borderClass = 'border-purple-300'; icon = uiIcon('brain', 14); label = 'Thinking'; labelClass = 'text-purple-500'; spinnerColor = '#a855f7';
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(truncateLine(ev.content, 80));
         $detail = _buildThinkingContent(ev.content);
 
     } else if (ev.type === 'tool_call') {
-        borderClass = 'border-blue-300'; icon = '&#128295;'; label = 'Tool Call'; labelClass = 'text-blue-500'; spinnerColor = '#3b82f6';
+        borderClass = 'border-blue-300'; icon = uiIcon('wrench', 14); label = 'Tool Call'; labelClass = 'text-blue-500'; spinnerColor = '#3b82f6';
         extraAttrs['data-tool-type'] = 'tool_call';
         extraAttrs['data-tool-name'] = ev.tool;
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(ev.tool + '(' + truncateLine(JSON.stringify(ev.args), 60) + ')');
         $detail = _buildToolCallDetail(ev.tool, ev.args || {}, ev.param_types || {});
 
     } else if (ev.type === 'response') {
-        borderClass = 'border-gray-300'; icon = '&#128172;'; label = 'Response'; labelClass = 'text-gray-500'; spinnerColor = '#6b7280';
+        borderClass = 'border-gray-300'; icon = uiIcon('message', 14); label = 'Response'; labelClass = 'text-gray-500'; spinnerColor = '#6b7280';
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(truncateLine(ev.content, 80));
         $detail = $('<pre class="whitespace-pre-wrap dark:text-gray-200 break-words overflow-x-auto max-w-full text-[11px] text-gray-700">').text(ev.content);
 
     } else if (ev.type === 'retry') {
-        borderClass = 'border-yellow-300'; icon = '&#128260;'; label = 'Mencoba Ulang'; labelClass = 'text-yellow-600'; spinnerColor = '#f59e0b';
+        borderClass = 'border-yellow-300'; icon = uiIcon('retry', 14); label = 'Mencoba Ulang'; labelClass = 'text-yellow-600'; spinnerColor = '#f59e0b';
         $summary = $('<span class="text-[11px] text-gray-400 truncate max-w-[780px]">').text(ev.message || `Mencoba ulang... (${ev.retry_count}/${ev.max_retries})`);
         $detail = null;
 
@@ -1022,7 +1596,7 @@ function buildTimelineEntry(ev, isActive) {
     }
 
     const $headerRow = $('<div class="flex items-center gap-1 cursor-pointer select-none">');
-    const $chev = $('<span class="tl-chev tool-trace-chevron text-[9px] text-gray-300">').html('&#9656;');
+    const $chev = $('<span class="tl-chev tool-trace-chevron text-gray-300">').html(uiIcon('chevron-right', 11));
     const $iconSpan = $('<span class="text-[10px] font-semibold">').addClass(labelClass).html(icon);
     $headerRow.append($chev, $iconSpan);
 
@@ -1058,7 +1632,7 @@ function _buildSysBalloon(tag, content, tagColorClass, fullColorClass, truncateL
     const $tagSpan = $('<span class="text-xs font-semibold mr-1.5">').addClass(tagColorClass).text(tag);
     const $preview = $('<span class="sys-balloon-content block">').append($tagSpan, document.createTextNode(truncated));
     $header.append($preview);
-    if (needsCollapse) $header.append($('<span class="sys-chevron text-[10px] flex-shrink-0 mt-0.5">').addClass(fullColorClass).html('&#9660;'));
+    if (needsCollapse) $header.append($('<span class="sys-chevron text-[10px] flex-shrink-0 mt-0.5 ml-auto">').addClass(fullColorClass).html(uiIcon('chevron-down', 12)));
 
     const $full = $('<div class="sys-balloon-full whitespace-pre-wrap">').css('display','none').append(
         $('<span class="text-xs font-semibold mr-1.5">').addClass(tagColorClass).text(tag),
@@ -1171,7 +1745,126 @@ function _wrapImageWithDownload($img) {
     });
 }
 
+const _COPY_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const _CHECK_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+
+function _copyText(text, onDone) {
+    const fallback = () => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); onDone(); } catch (_) {}
+        document.body.removeChild(ta);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(onDone).catch(fallback);
+    } else {
+        fallback();
+    }
+}
+
+// Applies highlight.js syntax highlighting to every <pre><code> block in a
+// rendered markdown bubble. Runs on the live DOM (after sanitize), so the
+// injected token <span>s never pass through the sanitizer. No-op if hljs is
+// not loaded. Each block is guarded so one bad block can't break the bubble.
+function _highlightCode($bubble) {
+    if (typeof window === 'undefined' || !window.hljs) return;
+    $bubble.find('pre code').each(function () {
+        if (this.dataset.highlighted) return;
+        try {
+            window.hljs.highlightElement(this);
+        } catch (e) {
+            this.dataset.highlighted = 'error';
+        }
+    });
+}
+
+// Adds a hover-revealed copy button to the bottom-right of every <pre> code block
+// and <blockquote> inside a rendered markdown bubble.
+function _addCopyButtons($bubble) {
+    $bubble.find('pre, blockquote').each(function () {
+        const $el = $(this);
+        if ($el.data('copyAttached')) return;
+        $el.data('copyAttached', true);
+
+        // Wrap so the button stays pinned even when a <pre> scrolls horizontally.
+        $el.wrap($('<div>').css({ position: 'relative' }));
+        const $container = $el.parent();
+
+        const $btn = $('<button type="button">')
+            .attr('title', 'Copy')
+            .attr('aria-label', 'Copy to clipboard')
+            .css({
+                position: 'absolute',
+                bottom: '6px',
+                right: '6px',
+                zIndex: 5,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '28px',
+                height: '28px',
+                padding: '0',
+                borderRadius: '6px',
+                border: 'none',
+                cursor: 'pointer',
+                color: 'currentColor',
+                backgroundColor: 'rgba(128,128,128,0.25)',
+                opacity: 0,
+                transition: 'opacity 150ms ease',
+            })
+            .html(_COPY_ICON)
+            .on('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const text = $el.is('pre') ? ($el.find('code').text() || $el.text()) : $el.text();
+                _copyText(text, function () {
+                    $btn.html(_CHECK_ICON).css('color', '#22c55e');
+                    setTimeout(function () { $btn.html(_COPY_ICON).css('color', 'currentColor'); }, 1500);
+                });
+            });
+        $container.append($btn);
+
+        $container.on('mouseenter', function () { $btn.css('opacity', 1); });
+        $container.on('mouseleave', function () { if (!$btn.is(':focus')) $btn.css('opacity', 0); });
+        $btn.on('mouseenter', function () { $(this).css('backgroundColor', 'rgba(128,128,128,0.4)'); });
+        $btn.on('mouseleave', function () { $(this).css('backgroundColor', 'rgba(128,128,128,0.25)'); });
+        $btn.on('focus', function () { $(this).css({ opacity: 1, outline: '2px solid rgba(128,128,128,0.7)', outlineOffset: '1px' }); });
+        $btn.on('blur', function () {
+            $(this).css({ outline: 'none', outlineOffset: '0' });
+            if (!$container.is(':hover')) $btn.css('opacity', 0);
+        });
+    });
+}
+
+// Divider for a workplace switch note. The note's text is for the agent; the
+// user gets a compact "from → to" marker built from its metadata.
+function buildWorkplaceSwitchMarker(sw, opts, cfg) {
+    const name = side => (side && side.name) ? side.name : 'local workspace';
+    const $label = $('<span class="chat-wp-switch-label">')
+        .append(uiIcon('server', 12), ' Workplace switched: ')
+        .append($('<b>').text(name(sw.from)), ' → ', $('<b>').text(name(sw.to)));
+    const date = opts.timestamp != null ? normalizeTimestamp(opts.timestamp) : null;
+    if (date) {
+        let label = '';
+        try {
+            label = cfg.formatTimestamp ? cfg.formatTimestamp(date)
+                : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } catch (e) {}
+        // Not <time>: '#chat-messages time' styles bubble timestamps as blocks
+        if (label) $label.append($('<span class="chat-wp-switch-time">').attr('title', date.toLocaleString()).text(' · ' + label));
+    }
+    return $('<div class="chat-wp-switch" role="note" data-msg-role="system">')
+        .append('<span class="chat-wp-switch-line"></span>', $label, '<span class="chat-wp-switch-line"></span>');
+}
+
 function buildMessageBubble(role, content, opts = {}, cfg = {}) {
+    if (opts.metadata && opts.metadata.workplace_switch) {
+        return buildWorkplaceSwitchMarker(opts.metadata.workplace_switch, opts, cfg);
+    }
     const {
         userAlign = 'right',
         assistantAlign = 'left',
@@ -1212,8 +1905,7 @@ function buildMessageBubble(role, content, opts = {}, cfg = {}) {
         const agentTag = agentMatch ? agentMatch[1] : '';
         const agentContent = agentTag ? content.slice(agentMatch[0].length) : content;
         $bubble = $('<div class="bg-blue-100 text-blue-900 border border-blue-300 rounded-2xl px-4 py-2.5 text-sm break-words">');
-        if (agentTag) $bubble.append($('<span class="text-xs font-semibold text-blue-500 mr-1.5">').text(agentTag));
-        $bubble.append(document.createTextNode(agentContent));
+        $bubble.append(_buildSysBalloon(agentTag, agentContent, 'text-blue-500', 'text-blue-400', 120));
 
     } else if (isSystemUser) {
         const sysMatch = content.match(/^(\[(?:SYSTEM(?:\/[^\]]*)?|System\/[^\]]*)\])\s*/);
@@ -1224,27 +1916,53 @@ function buildMessageBubble(role, content, opts = {}, cfg = {}) {
 
     } else if (isUser) {
         $bubble = $('<div class="rounded-2xl px-4 py-2.5 text-sm whitespace-pre-wrap break-words">').addClass(userBubbleClass);
-        // Render image attachment if present
         const meta = opts.metadata || {};
-        if (meta.image_url) {
-            const $img = createLazyImage(meta.image_url);
+        const attachmentInfos = Array.isArray(meta.attachment_infos)
+            ? meta.attachment_infos
+            : (meta.attachment_info ? [meta.attachment_info] : []);
+        const imageInfos = attachmentInfos.filter(info => info && info.is_image);
+        const imageUrls = Array.isArray(meta.image_urls)
+            ? meta.image_urls
+            : (meta.image_url ? [meta.image_url] : imageInfos.map(info =>
+                `/api/attachments/${encodeURIComponent(info.attachment_id)}/view`));
+        const addImage = (slot) => {
+            const imageUrl = imageUrls[slot - 1];
+            if (!imageUrl) return false;
+            const $img = createLazyImage(imageUrl);
             $bubble.append($img);
             _wrapImageWithDownload($img);
             setupImageForLazy($img);
+            return true;
+        };
+        const referenced = new Set();
+        const tokenPattern = /\[Image #(\d+)\]/g;
+        let cursor = 0;
+        let match;
+        while ((match = tokenPattern.exec(content || ''))) {
+            const slot = Number(match[1]);
+            if (!imageUrls[slot - 1]) continue;
+            if (match.index > cursor) $bubble.append(document.createTextNode(content.slice(cursor, match.index)));
+            addImage(slot);
+            referenced.add(slot);
+            cursor = match.index + match[0].length;
         }
-        // Render non-image file badge
-        if (meta.attachment_info && !meta.attachment_info.is_image) {
-            const info = meta.attachment_info;
+        if (content && cursor < content.length) $bubble.append(document.createTextNode(content.slice(cursor)));
+        for (let slot = 1; slot <= imageUrls.length; slot++) {
+            if (!referenced.has(slot)) addImage(slot);
+        }
+        // Render non-image file badges
+        attachmentInfos.filter(info => info && !info.is_image).forEach(info => {
             const $badge = $('<div class="flex items-center gap-1.5 mb-1 px-2 py-1 bg-white/20 rounded text-xs">')
                 .append($('<svg class="w-3.5 h-3.5 flex-shrink-0" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M3 3.5A1.5 1.5 0 0 1 4.5 2h6.879a1.5 1.5 0 0 1 1.06.44l4.122 4.12A1.5 1.5 0 0 1 17 7.622V16.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 16.5v-13Z"/></svg>'))
                 .append($('<span class="truncate">').text(info.filename));
-            $bubble.append($badge);
-        }
-        if (content) $bubble.append(document.createTextNode(content));
+            $bubble.prepend($badge);
+        });
 
     } else if (isError) {
         const $icon = $('<svg class="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clip-rule="evenodd"/></svg>');
-        $bubble = $('<div class="bg-red-50 text-red-700 border border-red-200 rounded-lg px-4 py-2 text-sm flex items-start gap-2">').append($icon, $('<span>').text(content));
+        // min-width:0 + overflow-wrap:anywhere: a flex child cannot shrink below its longest unbroken token, so long
+        // error payloads (JSON without spaces) used to stretch the bubble and the whole message list sideways.
+        $bubble = $('<div class="bg-red-50 text-red-700 border border-red-200 rounded-lg px-4 py-2 text-sm flex items-start gap-2 min-w-0 max-w-full">').append($icon, $('<span style="min-width:0;overflow-wrap:anywhere">').text(content));
 
     } else if (isSystem) {
         const sysMatch = content.match(/^\[system[^\]]*\]\s*/i);
@@ -1256,18 +1974,18 @@ function buildMessageBubble(role, content, opts = {}, cfg = {}) {
     } else if (isBashExec) {
         // Bash exec (!) command output — dark terminal with hacker green text
         const rendered = typeof marked !== 'undefined'
-            ? sanitize(marked.parse((content || ''))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
+            ? sanitize(renderMath(marked.parse((content || '')))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
             : escape(content);
         $bubble = $('<div class="chat-prose terminal-output rounded-2xl px-4 py-2.5 text-sm break-words">');
         $bubble.css({
-            'background-color': '#080e0f',
+            'background-color': '#152022',
             'color': '#359635',
             'border': '1px solid #174217'
         });
         $bubble.attr('role', 'article');
         $bubble.html(rendered);
         $bubble.find('pre').css({
-            'background-color': '#030607',
+            'background-color': '#0d1517',
             'border': '1px solid #174217',
             'border-radius': '0.375rem'
         });
@@ -1281,10 +1999,11 @@ function buildMessageBubble(role, content, opts = {}, cfg = {}) {
             _wrapImageWithDownload($img);
             retrofitImageForLazy($img);
         });
+        _addCopyButtons($bubble);
     } else if (isSlashCmd) {
         // Slash command response — blue styling, visible to user only (not sent to LLM)
         const rendered = typeof marked !== 'undefined'
-            ? sanitize(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
+            ? sanitize(renderMath(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>'))
             : escape(content);
         $bubble = $('<div class="chat-prose rounded-2xl px-4 py-2.5 text-sm break-words text-blue-800 border border-blue-200 dark:bg-blue-950 dark:text-blue-200 dark:border-blue-800">');
         $bubble.attr('role', 'article');
@@ -1294,10 +2013,12 @@ function buildMessageBubble(role, content, opts = {}, cfg = {}) {
             _wrapImageWithDownload($img);
             retrofitImageForLazy($img);
         });
+        _highlightCode($bubble);
+        _addCopyButtons($bubble);
     } else {
         // assistant: markdown with sanitizer
         const rendered = typeof marked !== 'undefined'
-            ? sanitize(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')
+            ? transformWikiLinks(sanitize(renderMath(marked.parse((content || '').replace(/[\u201c\u201d\u00ab\u00bb]/g, '"'))).replace(/<table/g, '<div class="table-wrapper"><table').replace(/<\/table>/g, '</table></div>')))
             : escape(content);
         $bubble = $('<div class="chat-prose rounded-2xl px-4 py-2.5 border-gray-300 text-sm break-words">').addClass(assistantBubbleClass);
         $bubble.attr('role', 'article');
@@ -1307,22 +2028,47 @@ function buildMessageBubble(role, content, opts = {}, cfg = {}) {
             _wrapImageWithDownload($img);
             retrofitImageForLazy($img);
         });
+        _highlightCode($bubble);
+        _addCopyButtons($bubble);
+        $bubble.on('click', '.kb-wikilink', function (e) {
+            e.preventDefault();
+            var title = $(this).attr('data-wikilink');
+            if (title) document.dispatchEvent(new CustomEvent('evonic:wikilink-click', { detail: { title: title } }));
+        });
+        // Render non-image file (send_file) as a type-aware, previewable card.
+        // Images stay inline via the markdown body.
+        if (meta.attachment_info && !meta.attachment_info.is_image) {
+            $bubble.prepend($('<div class="mb-2">').append(buildAttachmentCard(meta.attachment_info)));
+        }
     }
 
     const $inner = $('<div class="max-w-[80%] min-w-0">').append($bubble);
 
-    if (showTimestamps && opts.timestamp) {
-        let tsStr = '';
-        try {
-            tsStr = formatTimestamp
-                ? formatTimestamp(opts.timestamp)
-                : new Date(opts.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-        } catch(e) {}
-        if (tsStr) {
+    if (showTimestamps && (isUser || role === 'assistant') && opts.timestamp != null) {
+        const date = normalizeTimestamp(opts.timestamp);
+        let label = '';
+        if (date) {
+            try {
+                label = formatTimestamp
+                    ? formatTimestamp(date)
+                    : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } catch (e) {}
+        }
+        if (date && label) {
             const tsAlign = isUser
                 ? (userAlign === 'left' ? 'text-left' : 'text-right')
                 : (assistantAlign === 'left' ? 'text-left' : 'text-right');
-            $inner.append($('<div class="text-[10px] text-gray-300 mt-0.5 px-1">').addClass(tsAlign).text(tsStr));
+            const accessibleLabel = date.toLocaleString([], {
+                dateStyle: 'long',
+                timeStyle: 'short',
+            });
+            const $time = $('<time class="block text-[10px] leading-4 text-gray-500 dark:text-gray-400 mt-0.5 px-1 tabular-nums">')
+                .addClass(tsAlign)
+                .attr('datetime', date.toISOString())
+                .attr('aria-label', accessibleLabel)
+                .attr('title', accessibleLabel)
+                .text(label);
+            $inner.append($time);
         }
     }
 
@@ -1339,6 +2085,8 @@ const DEFAULT_RENDERERS = {
     sanitize,
     highlightPython,
     highlightDiff,
+    renderKBDocPreview,
+    showWikilinkPreview,
 };
 
 // ── artifacts.js ────────────────────────────────────────────────
@@ -1422,6 +2170,7 @@ function _iconEl(category, sizeClass) {
 }
 
 const _DOWNLOAD_SVG = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>';
+const _TRASH_SVG = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>';
 
 function buildSavedArtifactsBlock(artifacts, opts = {}) {
     const items = (artifacts || []).filter(a => a && a.filename);
@@ -1497,7 +2246,7 @@ function _buildCard(item, agentIdFallback, imageUrls) {
     return $card;
 }
 
-function openSavedArtifact(url, filename, category, gallery) {
+function openSavedArtifact(url, filename, category, gallery, opts = {}) {
     if (category === 'image') {
         const urls = (gallery && gallery.urls && gallery.urls.length) ? gallery.urls : [url];
         let idx = (gallery && typeof gallery.index === 'number') ? gallery.index : 0;
@@ -1506,10 +2255,56 @@ function openSavedArtifact(url, filename, category, gallery) {
         lb.open(urls, idx);
         return;
     }
-    _openViewerModal(url, filename, category);
+    _openViewerModal(url, filename, category, opts);
+}
+
+function buildAttachmentCard(info) {
+    const filename = info.filename || 'file';
+    const viewUrl = `/api/attachments/${encodeURIComponent(info.attachment_id)}/view`;
+    const downloadUrl = `/api/attachments/${encodeURIComponent(info.attachment_id)}/download`;
+    const category = info.is_image ? 'image' : categorizeArtifact(filename);
+    const sizeStr = _formatSize(info.size_bytes);
+
+    const open = () => openSavedArtifact(viewUrl, filename, category, null, {
+        downloadUrl, allowDelete: false,
+    });
+
+    const $card = $('<div class="bg-gray-50 dark:bg-gray-700/50 border border-gray-200 dark:border-gray-600 rounded-lg p-2 hover:border-indigo-300 dark:hover:border-indigo-500 transition-colors flex items-center gap-2.5 group max-w-sm">');
+
+    let $thumb;
+    if (category === 'image') {
+        $thumb = $('<div class="w-10 h-10 rounded-md overflow-hidden flex-shrink-0 bg-gray-100 dark:bg-gray-800 flex items-center justify-center cursor-pointer">');
+        const $img = $('<img class="w-full h-full object-cover" alt="">').attr('src', viewUrl);
+        $img.on('error', function () {
+            $(this).remove();
+            $thumb.append(_iconEl('image', 'w-10 h-10').addClass('rounded-md'));
+        });
+        $thumb.append($img);
+    } else {
+        $thumb = _iconEl(category, 'w-10 h-10').addClass('cursor-pointer');
+    }
+    $thumb.on('click', open);
+    $card.append($thumb);
+
+    const $meta = $('<div class="flex-1 min-w-0 cursor-pointer">');
+    $meta.append(
+        $('<p class="text-sm font-medium text-gray-800 dark:text-gray-200 truncate">').attr('title', filename).text(filename),
+        $('<p class="text-xs text-gray-400">').text(sizeStr)
+    );
+    $meta.on('click', open);
+    $card.append($meta);
+
+    const $dl = $('<a class="p-1.5 text-indigo-500 hover:text-indigo-700 rounded hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-colors opacity-0 group-hover:opacity-100 flex-shrink-0" title="Download">')
+        .attr({ href: downloadUrl, download: filename })
+        .html(_DOWNLOAD_SVG);
+    $dl.on('click', (e) => e.stopPropagation());
+    $card.append($dl);
+
+    return $card;
 }
 
 let _escHandler = null;
+let _viewerRawContent = null;
 
 function _closeViewerModal() {
     const modal = document.getElementById('chat-artifact-viewer-modal');
@@ -1517,8 +2312,78 @@ function _closeViewerModal() {
     if (_escHandler) { document.removeEventListener('keydown', _escHandler); _escHandler = null; }
 }
 
-function _openViewerModal(url, filename, category) {
+async function _copyViewerContent() {
+    const $btn = $(this);
+    if (!_viewerRawContent) {
+        (window.toast?.warning || console.warn)('No content to copy.');
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(_viewerRawContent);
+    } catch(e) {
+        // Fallback for older browsers or non-HTTPS
+        const textarea = document.createElement('textarea');
+        textarea.value = _viewerRawContent;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+    }
+    // Visual feedback
+    const $span = $btn.find('span');
+    const origText = $span.text();
+    $btn.find('svg').replaceWith('<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>');
+    $span.text(' Copied!');
+    $btn.removeClass('text-indigo-600 dark:text-indigo-400').addClass('text-green-600 dark:text-green-400');
+    setTimeout(() => {
+        $btn.find('svg').replaceWith('<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>');
+        $span.text(origText);
+        $btn.removeClass('text-green-600 dark:text-green-400').addClass('text-indigo-600 dark:text-indigo-400');
+    }, 2000);
+}
+
+async function _deleteArtifactFromViewer(url, filename) {
+    const m = url.match(/agents\/([^/]+)\/artifacts/);
+    const agentId = m ? m[1] : '';
+    if (!agentId) {
+        (window.toast?.error || alert)('Could not determine agent ID.');
+        return;
+    }
+
+    let ok = false;
+    try {
+        ok = await window.showConfirm({
+            title: 'Delete Artifact',
+            message: `Delete "${filename}"? This cannot be undone.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+    } catch (_) {
+        ok = confirm(`Delete "${filename}"? This cannot be undone.`);
+    }
+    if (!ok) return;
+
+    const deleteUrl = `/api/agents/${encodeURIComponent(agentId)}/artifacts/${encodeURIComponent(filename)}`;
+    try {
+        const res = await fetch(deleteUrl, { method: 'DELETE' });
+        if (res.ok) {
+            (window.toast?.success || console.log)('Artifact deleted.');
+            _closeViewerModal();
+        } else {
+            const msg = res.status === 404 ? 'Artifact not found.' : `Server error (${res.status}).`;
+            (window.toast?.error || alert)(msg);
+        }
+    } catch (_) {
+        (window.toast?.error || alert)('Network error. Please try again.');
+    }
+}
+
+function _openViewerModal(url, filename, category, opts = {}) {
     _closeViewerModal();
+    const downloadUrl = opts.downloadUrl || url;
+    const allowDelete = opts.allowDelete !== false;
 
     const $overlay = $('<div id="chat-artifact-viewer-modal" class="fixed inset-0 flex items-center justify-center p-4" style="z-index:200;background:rgba(0,0,0,0.6);">');
     $overlay.on('click', (e) => { if (e.target === $overlay[0]) _closeViewerModal(); });
@@ -1533,12 +2398,21 @@ function _openViewerModal(url, filename, category) {
     );
     const $actions = $('<div class="flex items-center gap-2 flex-shrink-0">');
     const $dl = $('<a class="flex items-center gap-1.5 px-3 py-1.5 text-xs text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 rounded-md transition-colors" title="Download">')
-        .attr({ href: url, download: filename })
+        .attr({ href: downloadUrl, download: filename })
         .html(_DOWNLOAD_SVG + '<span>Download</span>');
+    const $copy = $('<button class="flex items-center gap-1.5 px-3 py-1.5 text-xs text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 rounded-md transition-colors" title="Copy content">')
+        .html('<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg><span>Copy</span>');
+    $copy.on('click', _copyViewerContent);
     const $close = $('<button class="flex items-center justify-center w-8 h-8 rounded-md text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors" title="Close">')
         .html('<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>');
     $close.on('click', _closeViewerModal);
-    $actions.append($dl, $close);
+    $actions.append($dl, $copy);
+    if (allowDelete) {
+        const $delete = $('<button class="flex items-center justify-center w-8 h-8 rounded-md text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 dark:hover:text-red-400 transition-colors" title="Delete">').html(_TRASH_SVG);
+        $delete.on('click', (e) => { e.stopPropagation(); _deleteArtifactFromViewer(url, filename); });
+        $actions.append($delete);
+    }
+    $actions.append($close);
     $head.append($title, $actions);
 
     const $body = $('<div class="flex-1 overflow-y-auto p-6">');
@@ -1559,6 +2433,7 @@ async function _renderViewerContent($body, url, filename, category) {
     try {
         if (ext === 'md') {
             const text = await (await fetch(url)).text();
+            _viewerRawContent = text;
             $body.html('<div class="recap-prose max-w-none">' + sanitize(marked.parse(text)) + '</div>');
         } else if (ext === 'pdf') {
             $body.html(`<iframe src="${url}" class="w-full rounded-md border border-gray-200 dark:border-gray-600" style="min-height:70vh;"></iframe>`);
@@ -1572,6 +2447,7 @@ async function _renderViewerContent($body, url, filename, category) {
             $body.html(`<div class="flex justify-center"><img src="${url}" alt="${_escape(filename)}" class="max-w-full max-h-[70vh] rounded-md shadow-lg object-contain"></div>`);
         } else if (_TEXT_EXTS.includes(ext) || category === 'text') {
             const text = await (await fetch(url)).text();
+            _viewerRawContent = text;
             $body.html(`<pre class="bg-gray-50 dark:bg-gray-900 rounded-md p-4 text-sm text-gray-800 dark:text-gray-200 overflow-x-auto max-h-[70vh] whitespace-pre-wrap font-mono">${_escape(text)}</pre>`);
         } else {
             $body.html(
@@ -1592,10 +2468,10 @@ async function _renderViewerContent($body, url, filename, category) {
 // ── SSEAdapter ────────────────────────────────────────────────────────────────
 
 const SSE_EVENTS = [
-    'turn_begin', 'turn_split', 'thinking', 'tool_call_started', 'tool_executed',
-    'response_chunk', 'done', 'approval_required', 'approval_resolved', 'retry',
-    'message_injected', 'message_injection_applied', 'session_clear',
-    'heartbeat',
+    'turn_begin', 'turn_split', 'thinking', 'thinking_delta', 'thinking_reset', 'tool_call_started', 'tool_executed',
+    'state:changed', 'tasks:auto_transition', 'tasks:stale', 'response_chunk', 'done', 'approval_required', 'approval_resolved', 'retry',
+    'message_injected', 'message_injection_applied', 'message_received', 'whatsapp_restriction_warning', 'session_clear',
+    'state_changed', 'turn_queued', 'ready', 'heartbeat', 'auth_expired',
 ];
 
 // If no event (including heartbeats) arrives within this window, the connection
@@ -1611,12 +2487,12 @@ class SSEAdapter {
         this._lastSeq = opts.afterSeq || 0;
         this._handler = null;
         this._es = null;
-        this._fillingGap = false;
-        this._pendingQueue = [];
         this._log = log('sse');
         this._lastEventAt = 0;
         this._livenessInterval = null;
-        this._usingUnified = false; // true when using unified /api/realtime/stream
+        this._usingUnified = url.indexOf('/api/realtime/stream') !== -1;
+        this._reconnectAttempts = 0; // consecutive immediate failures (for backoff)
+        this._connectStartTime = 0;  // when the current EventSource was opened
     }
 
     start(handler) {
@@ -1644,7 +2520,7 @@ class SSEAdapter {
             const agentId = this._agentId || (url.match(/\/agents\/([^/?]+)\//) || [])[1] || '';
             const sessionId = this._sessionId || u.searchParams.get('session_id') || '';
             const after = this._lastSeq;
-            let newUrl = '/api/realtime/stream?chat=1';
+            let newUrl = '/api/realtime/stream?chat=1&cursor_version=2&snapshot=1';
             if (agentId) newUrl += '&agent_id=' + encodeURIComponent(agentId);
             if (sessionId) newUrl += '&session_id=' + encodeURIComponent(sessionId);
             if (after > 0) newUrl += '&after=' + after;
@@ -1656,6 +2532,7 @@ class SSEAdapter {
         const es = new EventSource(url);
         this._es = es;
         this._lastEventAt = Date.now();
+        this._connectStartTime = Date.now();
 
         // Clear any previous liveness interval before starting a new one
         if (this._livenessInterval) clearInterval(this._livenessInterval);
@@ -1670,7 +2547,8 @@ class SSEAdapter {
                 if (this._usingUnified) {
                     const agentId = this._agentId || '';
                     const sessionId = this._sessionId || '';
-                    resumeUrl = '/api/realtime/stream?chat=1';
+                    resumeUrl = '/api/realtime/stream?chat=1&cursor_version=2&snapshot=' +
+                        (this._lastSeq > 0 ? '0' : '1');
                     if (agentId) resumeUrl += '&agent_id=' + encodeURIComponent(agentId);
                     if (sessionId) resumeUrl += '&session_id=' + encodeURIComponent(sessionId);
                     if (this._lastSeq > 0) resumeUrl += '&after=' + this._lastSeq;
@@ -1686,6 +2564,7 @@ class SSEAdapter {
         for (const evtName of SSE_EVENTS) {
             es.addEventListener(evtName, (e) => {
                 this._lastEventAt = Date.now();
+                this._reconnectAttempts = 0; // a message arrived → connection is healthy
                 let data;
                 try { data = JSON.parse(e.data); } catch (err) { data = {}; }
                 this._log.debug('event', evtName, 'seq', data.seq, 'size', e.data.length);
@@ -1696,13 +2575,32 @@ class SSEAdapter {
 
         es.onerror = () => {
             this._log.warn('SSE error/closed', url);
-            console.warn('[sse] error/closed _lastSeq=', this._lastSeq, '_fillingGap=', this._fillingGap, '_pendingQueue=', this._pendingQueue.length);
+            console.warn('[sse] error/closed _lastSeq=', this._lastSeq);
             es.close();
             if (this._es === es) this._es = null;
-            // Only reconnect if this was NOT an intentional stop (e.g. after 'done')
+            // Only reconnect if this adapter was not explicitly stopped.
             if (this._intentionallyStopped) {
                 this._log.info('intentionally stopped — no reconnect');
                 return;
+            }
+            // Back off when the connection fails almost immediately (e.g. the server
+            // rejects it with 429 too_many_sse_connections or 503 server-busy).
+            // EventSource doesn't expose the HTTP status, so use the open duration:
+            // a connection that survived a while was healthy → reconnect promptly;
+            // one that died right away → exponential backoff up to 30s (matching the
+            // server's retry_after) so a reconnect storm can't keep the SSE limit pegged.
+            const openMs = Date.now() - this._connectStartTime;
+            let delay;
+            if (openMs > 10_000) {
+                this._reconnectAttempts = 0;
+                delay = 2000;
+            } else {
+                this._reconnectAttempts++;
+                delay = Math.min(2000 * Math.pow(2, this._reconnectAttempts - 1), 30_000);
+                if (this._reconnectAttempts > 1) {
+                    this._log.warn('repeated immediate SSE failure — backing off', delay, 'ms', 'attempt', this._reconnectAttempts);
+                    console.warn('[sse] backing off', delay, 'ms after', this._reconnectAttempts, 'immediate failures');
+                }
             }
             setTimeout(() => {
                 if (this._intentionallyStopped) return;
@@ -1711,7 +2609,8 @@ class SSEAdapter {
                 if (this._usingUnified) {
                     const agentId = this._agentId || '';
                     const sessionId = this._sessionId || '';
-                    resumeUrl = '/api/realtime/stream?chat=1';
+                    resumeUrl = '/api/realtime/stream?chat=1&cursor_version=2&snapshot=' +
+                        (this._lastSeq > 0 ? '0' : '1');
                     if (agentId) resumeUrl += '&agent_id=' + encodeURIComponent(agentId);
                     if (sessionId) resumeUrl += '&session_id=' + encodeURIComponent(sessionId);
                     if (this._lastSeq > 0) resumeUrl += '&after=' + this._lastSeq;
@@ -1721,97 +2620,45 @@ class SSEAdapter {
                     resumeUrl = u.pathname + u.search;
                 }
                 this._log.info('reconnecting from seq', this._lastSeq, resumeUrl);
-                console.warn('[sse] reconnecting _lastSeq=', this._lastSeq, '_fillingGap=', this._fillingGap, '_pendingQueue=', this._pendingQueue.length, 'url=', resumeUrl);
+                console.warn('[sse] reconnecting _lastSeq=', this._lastSeq, 'url=', resumeUrl);
                 this._connect(resumeUrl);
-            }, 2000);
+            }, delay);
         };
     }
 
     _handleRaw(evtName, data) {
         const seq = data.seq || 0;
-
-        if (this._fillingGap) {
-            this._log.debug('queued while filling gap', evtName, 'seq', seq, 'queueLen', this._pendingQueue.length);
-            if (this._pendingQueue.length >= 1 && this._pendingQueue.length % 10 === 0) {
-                console.warn('[sse] pendingQueue grew to', this._pendingQueue.length, 'while filling gap — possible reconnect storm');
-            }
-            this._pendingQueue.push({ evtName, data });
-            return;
-        }
-
         if (seq && seq <= this._lastSeq) {
             this._log.debug('dedup skip', evtName, 'seq', seq, '≤ lastSeq', this._lastSeq);
-            console.log('[sse] dedup skip', evtName, 'seq=', seq, '_lastSeq=', this._lastSeq);
             return;
         }
-
-        if (seq && this._lastSeq > 0 && seq > this._lastSeq + 1) {
-            this._log.warn('seq gap detected', this._lastSeq, '→', seq, '— filling');
-            this._fillingGap = true;
-            this._pendingQueue.push({ evtName, data });
-            this._fillGap(this._lastSeq, seq).then(() => {
-                this._fillingGap = false;
-                console.warn('[sse] draining pendingQueue len=', this._pendingQueue.length, '_lastSeq=', this._lastSeq);
-                this._drainQueue();
-            });
-            return;
-        }
-
         if (seq) this._lastSeq = seq;
+        if (evtName === 'ready') return;
         this._dispatch(evtName, data);
     }
 
-    async _fillGap(afterSeq, upToSeq) {
-        try {
-            const agentId = this._agentId || this._url.match(/\/agents\/([^/?]+)\//)?.[1] || '';
-            const res = await $.getJSON(
-                `/api/agents/${encodeURIComponent(agentId)}/chat/events?session_id=${encodeURIComponent(this._sessionId)}&after=${afterSeq}&up_to=${upToSeq}`
-            );
-            const evts = res.events || [];
-            this._log.warn('gap-fill response: afterSeq=' + afterSeq + ' upToSeq=' + upToSeq + ' returned=' + evts.length + ' seqs=' + evts.map(e=>e.seq).join(','));
-            console.warn('[gap-fill] returned', evts.length, 'events for after=', afterSeq, 'up_to=', upToSeq, 'seqs:', evts.map(e=>e.seq).join(','));
-            for (const ev of evts) {
-                if (ev.seq <= this._lastSeq) continue;
-                this._lastSeq = ev.seq;
-                this._dispatch(ev.event, ev.data);
-            }
-        } catch (err) {
-            this._log.warn('gap-fill failed', err, '— skipping gap');
-            this._lastSeq = upToSeq - 1;
-        }
-    }
-
-    // Drain _pendingQueue asynchronously — one event per animation frame so we
-    // never block the main thread with a large synchronous burst.
-    _drainQueue() {
-        if (this._pendingQueue.length === 0) {
-            console.warn('[sse] queue drain done _lastSeq=', this._lastSeq);
-            return;
-        }
-        const item = this._pendingQueue.shift();
-        const itemSeq = item.data.seq || 0;
-        if (itemSeq && itemSeq <= this._lastSeq) {
-            console.log('[sse] queue dedup skip', item.evtName, 'seq=', itemSeq);
-            // Skip but continue draining without waiting — dedup is cheap
-            this._drainQueue();
-            return;
-        }
-        if (itemSeq) this._lastSeq = itemSeq;
-        this._dispatch(item.evtName, item.data);
-        // Yield to the browser between each real event
-        requestAnimationFrame(() => this._drainQueue());
-    }
-
     _dispatch(evtName, data) {
+        if (evtName === 'auth_expired') {
+            this.stop();
+            window.location.href = '/login';
+            return;
+        }
+        if (evtName === 'state_changed') {
+            // Not turn-scoped — bridge straight to the document-level event that
+            // agent_detail.html / sessions.html already listen for (debounced refresh).
+            document.dispatchEvent(new CustomEvent('evonic:agent-state-changed', { detail: data }));
+            return;
+        }
+        if (evtName === 'message_received') {
+            document.dispatchEvent(new CustomEvent('evonic:message-received', { detail: data }));
+            return;
+        }
         if (evtName === 'session_clear') {
             this._handler({ event: 'session_clear', data, seq: data.seq || 0 });
             return;
         }
-        // done: stop reconnecting after this
         if (evtName === 'done') {
-            console.warn('[sse] _dispatch done _lastSeq=', this._lastSeq, 'data.seq=', data.seq);
             this._handler({ event: 'done', data, seq: data.seq || 0 });
-            this.stop();
             return;
         }
         this._handler({ event: evtName, data, seq: data.seq || 0 });
@@ -1890,7 +2737,9 @@ class PollingAdapter {
         if (entry.type === 'tool_output') {
             let result;
             try { result = JSON.parse(entry.content); } catch (e) { result = { data: entry.content }; }
-            return { event: 'tool_executed', data: { tool: entry.function, result, error: !!entry.error }, seq: 0 };
+            return { event: 'tool_executed', data: { tool: entry.function, result, error: !!entry.error,
+                                                      safety: entry.safety || null,
+                                                      approval: entry.approval || null }, seq: 0 };
         }
         if (entry.type === 'intermediate') {
             return { event: 'response_chunk', data: { content: entry.content, is_final: false }, seq: 0 };
@@ -1938,21 +2787,26 @@ class ReplayAdapter {
 
 // ── turn.js ─────────────────────────────────────────────────────
 
-const STALE_TIMEOUT_MS = 300_000; // 5 minutes — safety net for truly abandoned turns
-
 const TERMINAL_PHASES = new Set(['final', 'done', 'aborted']);
 
-function reduceTurn(phase, eventKind) {
+function reduceTurn(phase, eventKind, isFinal = false) {
+    // A response only ENDS the turn when it is the FINAL response. Intermediate
+    // response_chunks (is_final=false, emitted before further tool calls) must NOT
+    // move the turn to the terminal 'final' phase — otherwise every subsequent
+    // tool_call/tool_executed/thinking/real-final is absorbed as a no-op and the
+    // live turn freezes at the first intermediate message.
+    const isTerminalResponse = eventKind === 'done' ||
+        (eventKind === 'response_chunk' && isFinal);
     if (phase === 'pending') {
         if (eventKind === 'turn_begin')        return 'thinking';
         if (eventKind === 'thinking')          return 'thinking';
         if (eventKind === 'tool_call_started') return 'tool_running';
-        if (eventKind === 'response_chunk' || eventKind === 'done') return 'final';
+        if (isTerminalResponse)                return 'final';
         if (eventKind === 'approval_required') return 'awaiting_approval';
     }
     if (phase === 'thinking') {
         if (eventKind === 'tool_call_started') return 'tool_running';
-        if (eventKind === 'response_chunk' || eventKind === 'done') return 'final';
+        if (isTerminalResponse)                return 'final';
         if (eventKind === 'approval_required') return 'awaiting_approval';
         if (eventKind === 'thinking')          return 'thinking'; // no-op transition
         if (eventKind === 'retry')             return 'thinking';
@@ -1960,13 +2814,13 @@ function reduceTurn(phase, eventKind) {
     }
     if (phase === 'tool_running') {
         if (eventKind === 'tool_executed')     return 'tool_done';
-        if (eventKind === 'response_chunk' || eventKind === 'done') return 'final';
+        if (isTerminalResponse)                return 'final';
         if (eventKind === 'approval_required') return 'awaiting_approval';
     }
     if (phase === 'tool_done') {
         if (eventKind === 'thinking')          return 'thinking';
         if (eventKind === 'tool_call_started') return 'tool_running';
-        if (eventKind === 'response_chunk' || eventKind === 'done') return 'final';
+        if (isTerminalResponse)                return 'final';
         if (eventKind === 'approval_required') return 'awaiting_approval';
     }
     if (phase === 'awaiting_approval') {
@@ -2008,7 +2862,6 @@ class Turn {
         this._lastSeq = 0;
         this._transports = [];
         this._timerInterval = null;
-        this._staleTimeout = null;
         this._scrollRAF = null;
         this._startTime = Date.now();
         this._finalized = false;
@@ -2022,7 +2875,6 @@ class Turn {
 
         this._buildDOM();
         this._startTimer();
-        this._armStaleTimeout();
     }
 
     // ── DOM ──────────────────────────────────────────────────────────────────
@@ -2040,12 +2892,12 @@ class Turn {
 
         const $inner = $('<div class="thinking-bubble flex items-center gap-2 rounded-lg px-3 py-2 text-xs border border-purple-200 bg-purple-50 dark:border-purple-800 dark:bg-purple-900/60 cursor-pointer">');
         $inner.append(
-            $('<span>').html('&#129504;'),
+            $('<span class="inline-flex">').html(uiIcon('brain', 16)),
             $('<span class="font-medium text-purple-700 dark:text-purple-200">').text('Thinking'),
             $('<span class="thinking-step-count text-purple-500 dark:text-purple-300 text-[10px] ml-0.5 hidden">'),
             $('<span class="thinking-spinner">').append($('<span class="tool-spinner">')),
             $('<span class="thinking-timer-inline text-purple-500 dark:text-purple-400 text-[10px]">').text('0.0 s'),
-            $('<span class="ml-1 text-purple-500 dark:text-purple-300 tool-trace-chevron text-sm">').html('&#9656;')
+            $('<span class="ml-1 text-purple-500 dark:text-purple-300 tool-trace-chevron">').html(uiIcon('chevron-right', 14))
         );
 
         if (avatarHtml) this.$bubble.append($(avatarHtml));
@@ -2084,16 +2936,8 @@ class Turn {
         }, 100);
     }
 
-    _armStaleTimeout() {
-        this._staleTimeout = setTimeout(() => {
-            this._log.warn('stale timeout reached, auto-finalizing', this.id);
-            this._finalizeBubble(null);
-        }, STALE_TIMEOUT_MS);
-    }
-
     _clearTimers() {
         if (this._timerInterval) { clearInterval(this._timerInterval); this._timerInterval = null; }
-        if (this._staleTimeout)  { clearTimeout(this._staleTimeout);   this._staleTimeout = null; }
         if (this._scrollRAF)     { cancelAnimationFrame(this._scrollRAF); this._scrollRAF = null; }
     }
 
@@ -2118,18 +2962,9 @@ class Turn {
         }
         if (seq) this._lastSeq = seq;
 
-        // Reset stale timeout on every live event — turn is clearly still active
-        if (this._staleTimeout) {
-            clearTimeout(this._staleTimeout);
-            this._staleTimeout = setTimeout(() => {
-                this._log.warn('stale timeout reached, auto-finalizing', this.id);
-                this._finalizeBubble(null);
-            }, STALE_TIMEOUT_MS);
-        }
-
         this._log.debug('ingest', evtName, seq, '→ phase was', this.phase, this.id);
 
-        const nextPhase = reduceTurn(this.phase, evtName);
+        const nextPhase = reduceTurn(this.phase, evtName, data.is_final);
         if (nextPhase !== null && nextPhase !== this.phase) {
             const prev = this.phase;
             this.phase = nextPhase;
@@ -2152,7 +2987,7 @@ class Turn {
             $approvalColor
                 .removeClass('border-purple-200 bg-purple-50 dark:border-purple-800 dark:bg-purple-900/60')
                 .addClass('border-orange-300 bg-orange-50 dark:border-orange-700 dark:bg-orange-900/60');
-            this.$bubble.find('span:first').html('&#128274;');
+            this.$bubble.find('span:first').html(uiIcon('lock', 16));
             this.$bubble.find('.font-medium')
                 .text('Menunggu Approval')
                 .removeClass('text-purple-700 dark:text-purple-200')
@@ -2161,7 +2996,7 @@ class Turn {
             $approvalColor
                 .addClass('border-purple-200 bg-purple-50 dark:border-purple-800 dark:bg-purple-900/60')
                 .removeClass('border-orange-300 bg-orange-50 dark:border-orange-700 dark:bg-orange-900/60');
-            this.$bubble.find('span:first').html('&#129504;');
+            this.$bubble.find('span:first').html(uiIcon('brain', 16));
             this.$bubble.find('.font-medium')
                 .text('Thinking')
                 .addClass('text-purple-700 dark:text-purple-200')
@@ -2178,7 +3013,20 @@ class Turn {
     _handleEventRendering(evtName, data) {
         if (evtName === 'turn_begin') {
             // Already in thinking phase — bubble is ready
-            if (data.ts) this._startTime = data.ts;
+            // Keep the EARLIEST start: the eager bubble began at submit, while turn_begin carries the
+            // (later) moment the server started the turn after queueing/buffering. Re-basing to it made
+            // the timer jump back to 0.
+            if (data.ts) this._startTime = Math.min(this._startTime, data.ts);
+            return;
+        }
+
+        if (evtName === 'thinking_delta') {
+            this._appendLiveThinking(data.content || '');
+            return;
+        }
+
+        if (evtName === 'thinking_reset') {
+            this._clearLiveThinking();
             return;
         }
 
@@ -2198,14 +3046,31 @@ class Turn {
             if (this._captureSavedArtifact(data)) this._renderSavedArtifacts();
             this._mergeToolResult(data);
             this._showThinkingRow();
+            // An agent that moved itself changed the workplace shown in the page header.
+            if (data && data.tool === 'switch_workplace' && !data.error) {
+                document.dispatchEvent(new CustomEvent('evonic:workplace-maybe-changed'));
+            }
             // Fire tool:executed for agent-state-bridge
             this._onTrigger('tool:executed', data);
             return;
         }
 
-        if (evtName === 'response_chunk' && data.is_final && data.content) {
+        if (evtName === 'state:changed') {
+            this._onTrigger('state:changed', data);
+            return;
+        }
+
+        if (evtName === 'tasks:auto_transition' || evtName === 'tasks:stale') {
+            this._onTrigger(evtName, data);
+            return;
+        }
+
+        if (evtName === 'response_chunk' && data.content) {
+            // Render every response chunk in the trace (intermediate + final), matching
+            // the history-render view. Only the FINAL chunk is stashed for the final
+            // response bubble; intermediates stay inline in the thinking timeline.
             this._addTimelineEntry({ type: 'response', content: data.content });
-            this._finalContent = data.content;  // stash for final-response bubble
+            if (data.is_final) this._finalContent = data.content;
             return;
         }
 
@@ -2228,24 +3093,37 @@ class Turn {
 
         if (evtName === 'done') {
             console.warn('[turn] done event turn=%s _finalized=%s _finalContent=%s', this.id, this._finalized, !!this._finalContent);
-            this._finalizeBubble(data.thinking_duration);
+            // The server's duration only covers the model loop (it excludes queueing, the message
+            // buffer and pre-passes such as CMP), so it can be SHORTER than what the timer already
+            // counted live — the label then visibly jumped backwards. Never show less than the
+            // wall time this turn was actually on screen. Replayed turns have ~0 elapsed, so they
+            // keep the stored value.
+            let shownDuration = data.thinking_duration;
+            if (shownDuration != null) {
+                const wall = Math.max(0, (Date.now() - this._startTime) / 1000);
+                shownDuration = Math.max(Number(shownDuration) || 0, wall);
+            }
+            this._finalizeBubble(shownDuration);
             // Fire final:response so page-level code can render the response bubble
-            // synchronously — no dependency on pollForResponse JSONL poll.
+            // synchronously from the durable stream.
             if (this._finalContent) {
                 console.warn('[turn] firing final:response turn=%s contentLen=%d', this.id, this._finalContent.length);
                 this._onTrigger('final:response', {
                     turnId: this.id,
                     content: this._finalContent,
-                    thinking_duration: data.thinking_duration,
+                    thinking_duration: shownDuration,
                 });
             }
             return;
         }
 
         if (evtName === 'turn_split') {
-            this._finalizeBubble(null);
+            const splitDuration = data.timestamp && this._startTime
+                ? Math.max(0, (data.timestamp - this._startTime) / 1000)
+                : null;
+            this._finalizeBubble(splitDuration);
             // ChatUI will create a new Turn for the continuation
-            this._onTrigger('turn:split', { turnId: this.id });
+            this._onTrigger('turn:split', { turnId: this.id, timestamp: data.timestamp });
             return;
         }
 
@@ -2263,8 +3141,9 @@ class Turn {
         if (total > 0 && total % 10 === 0) {
             console.warn('[turn] _addTimelineEntry count=%d type=%s turn=%s — possible duplicate replay?', total + 1, ev.type, this.id);
         }
-        // Remove "Thinking..." placeholder when a new event arrives
+        // Remove "Thinking..." placeholder (and the streamed preview) when a new event arrives
         this.$timeline.find('.tl-thinking-pending').remove();
+        this._clearLiveThinking();
 
         // Deactivate previous last entry
         const $prevLast = this.$timeline.find('.timeline-entry:last-child');
@@ -2307,9 +3186,13 @@ class Turn {
         const $status = $target.find('.tl-status');
         if ($status.length) {
             $status.html(data.error
-                ? '<span class="text-[14px] font-bold leading-none" style="color:#ef4444">&#10005;</span>'
-                : '<span class="text-[14px] font-bold leading-none" style="color:#22c55e">&#10003;</span>');
+                ? '<span class="inline-flex" style="color:#ef4444">' + uiIcon('x', 14) + '</span>'
+                : '<span class="inline-flex" style="color:#22c55e">' + uiIcon('check', 14) + '</span>');
         }
+
+        // Who decided this execution: DMSS, the rule engine, you, another agent,
+        // or a timeout.  Persisted with the tool output, so replay keeps it.
+        this._applySafetyBadge($target, data.safety, data.approval);
 
         const $detail = $target.find('.tl-detail');
         if ($detail.length) {
@@ -2356,6 +3239,41 @@ class Turn {
         this._smartScroll();
     }
 
+    // ── Live thinking preview (streamed reasoning) ────────────────────────────
+    // Shown while the model is still thinking; replaced by the real timeline entry
+    // when the full `thinking` event arrives (or cleared on retry / next event).
+
+    _appendLiveThinking(text) {
+        if (this._finalized || !text) return;
+        let $live = this.$timeline.find('.tl-thinking-live');
+        if (!$live.length) {
+            this.$timeline.find('.tl-thinking-pending').remove();
+            const $prevLast = this.$timeline.find('.timeline-entry:last-child');
+            if ($prevLast.length) this._deactivateEntry($prevLast);
+            $live = $('<div class="tl-thinking-live pl-3 py-1 relative">').append(
+                $('<div class="tl-live-head">').append(
+                    $('<span class="inline-flex">').html(uiIcon('brain', 14)),
+                    $('<span class="tl-live-label">').text('Thinking'),
+                    $('<span class="tl-live-dots" aria-hidden="true">').append($('<i>'), $('<i>'), $('<i>'))
+                ),
+                $('<div class="tl-live-body">').append($('<div class="tl-live-text">'))
+            );
+            this.$timeline.append($live);
+            this.$timeline.removeClass('hidden');
+        }
+        const body = $live.find('.tl-live-body')[0];
+        const pre = $live.find('.tl-live-text')[0];
+        // Follow the tail unless the reader scrolled up inside the box.
+        const atTail = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+        pre.appendChild(document.createTextNode(text));
+        if (atTail) body.scrollTop = body.scrollHeight;
+        this._smartScroll();
+    }
+
+    _clearLiveThinking() {
+        this.$timeline.find('.tl-thinking-live').remove();
+    }
+
     _showThinkingRow() {
         if (this._finalized) return; // don't add a pending row to a completed turn
         this.$timeline.find('.tl-thinking-pending').remove();
@@ -2397,6 +3315,7 @@ class Turn {
         }
 
         this.$timeline.find('.tl-thinking-pending').remove();
+        this._clearLiveThinking();
         this._deactivateEntry(this.$timeline.find('.timeline-entry:last-child'));
 
         // Auto-collapse the timeline when turn completes, keeping UI clean
@@ -2447,7 +3366,7 @@ class Turn {
         const $details = $('<div class="approval-details p-3">');
         $details.append(
             $('<div class="flex items-center gap-2 mb-2">').append(
-                $('<span class="text-sm font-semibold">').addClass(riskColorClass).html('&#9888; Approval Required'),
+                $('<span class="text-sm font-semibold inline-flex items-center gap-1.5">').addClass(riskColorClass).html(uiIcon('alert', 15) + ' Approval Required'),
                 $('<span class="text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border border-current">').addClass(riskColorClass).text(riskLevel)
             ),
             $('<div class="text-xs text-gray-700 dark:text-gray-200 mb-1">').append(
@@ -2456,6 +3375,23 @@ class Turn {
             ),
             $('<div class="text-xs text-gray-600 dark:text-gray-300 mb-2">').text(description)
         );
+
+        // What triggered the gate: engine verdict + flagged categories, so the
+        // decision can be evaluated after the fact.
+        if (data.safety && data.safety.source) {
+            const prov = describeBadge(data.safety, null);
+            const bits = [];
+            if (prov) bits.push('Verdict: ' + prov.label);
+            if (data.safety.mode) bits.push('mode ' + data.safety.mode);
+            if (data.safety.confidence != null) bits.push('confidence ' + data.safety.confidence);
+            if (data.safety.event_id) bits.push('event ' + String(data.safety.event_id).slice(0, 12));
+            $details.append($('<div class="text-[11px] text-gray-500 dark:text-gray-400 mb-1">')
+                .attr('title', prov ? prov.title : '').text(bits.join(' · ')));
+            if (data.safety.blocked_patterns && data.safety.blocked_patterns.length) {
+                $details.append($('<div class="text-[11px] text-gray-500 dark:text-gray-400 mb-2">')
+                    .text('Flagged: ' + data.safety.blocked_patterns.join(', ')));
+            }
+        }
 
         if (reasons.length) {
             const $ul = $('<ul class="text-xs text-gray-600 dark:text-gray-300 list-disc list-inside mb-2 space-y-0.5">');
@@ -2493,6 +3429,17 @@ class Turn {
         this._smartScroll();
     }
 
+    _applySafetyBadge($entry, safety, approval) {
+        if (!$entry || !$entry.length) return;
+        if (!safety && !(approval && approval.decision)) return;
+        try {
+            applyBadge($entry, safety, approval);
+        } catch (e) {
+            // A badge must never break the timeline.
+            log.warn('safety badge failed', e);
+        }
+    }
+
     async _submitApproval(approvalId, decision, $card) {
         $card.find('.approval-actions button').prop('disabled', true);
         try {
@@ -2502,7 +3449,7 @@ class Turn {
                 body: JSON.stringify({approval_id: approvalId, decision}),
             });
             if (res.ok) {
-                this._markApprovalResolved($card, decision, false);
+                this._markApprovalResolved($card, decision, false, 'user:web');
             } else {
                 const body = await res.json().catch(() => ({}));
                 $card.find('.approval-status').text(body.error || 'Failed.').removeClass('hidden').addClass('text-red-600');
@@ -2516,19 +3463,25 @@ class Turn {
 
     _resolveApprovalCard(data) {
         const $card = this.$timeline.find(`[data-approval-id="${CSS.escape(data.approval_id)}"]`);
-        if ($card.length) this._markApprovalResolved($card, data.decision, data.timed_out);
+        if ($card.length) {
+            this._markApprovalResolved($card, data.decision, data.timed_out, data.decided_by);
+        }
     }
 
-    _markApprovalResolved($card, decision, timedOut) {
+    _markApprovalResolved($card, decision, timedOut, decidedBy) {
         $card.find('.approval-actions').addClass('hidden');
+        const actor = decidedBy || (timedOut ? 'timeout' : 'user:web');
+        const badge = describeBadge(null, { decision: decision, decided_by: actor });
+        const label = (badge && badge.label) || (decision === 'approve' ? 'You approved' : 'You declined');
         let statusText, statusClass, iconHtml;
         if (timedOut) {
-            statusText = 'Timed out — auto-rejected.'; statusClass = 'text-gray-500'; iconHtml = '&#x23F1; Timed out';
+            statusText = label + ' — auto-rejected.'; statusClass = 'text-gray-500'; iconHtml = '&#x23F1; ' + label;
         } else if (decision === 'approve') {
-            statusText = 'Approved — executing...'; statusClass = 'text-green-600'; iconHtml = '&#10003; Approved';
+            statusText = label + ' — executing...'; statusClass = 'text-green-600'; iconHtml = uiIcon('check', 14) + ' ' + label;
         } else {
-            statusText = 'Rejected.'; statusClass = 'text-red-500'; iconHtml = '&#10007; Rejected';
+            statusText = label + '.'; statusClass = 'text-red-500'; iconHtml = uiIcon('x', 14) + ' ' + label;
         }
+        $card.attr('data-decided-by', actor);
         $card.find('.approval-status').text(statusText).removeClass('hidden').addClass(statusClass);
         $card.find('.approval-summary-icon').html(iconHtml);
         $card.find('.approval-summary').removeClass('hidden').addClass('flex');
@@ -2640,7 +3593,8 @@ class ChatUI {
 
     
     appendMessage(role, content, opts = {}) {
-        const hasMeta = opts.metadata && (opts.metadata.image_url || opts.metadata.attachment_info);
+        // workplace_switch has no text of its own: the divider is drawn from the metadata
+        const hasMeta = opts.metadata && (opts.metadata.image_url || opts.metadata.attachment_info || opts.metadata.workplace_switch);
         if (role !== 'error' && (!content || !content.trim()) && !hasMeta) {
             this._log.warn('appendMessage SKIPPED empty/whitespace content', role);
             return $();
@@ -2703,12 +3657,14 @@ class ChatUI {
             onTrigger:       (evtName, data) => {
                 this._log.debug('turn event', evtName, data);
                 this.$bus.trigger(evtName, [data]);
-                // agent-state bridge: fire document-level event for tool:executed
-                if (evtName === 'tool:executed') {
-                    const toolName = data && data.tool;
-                    if (['save_plan', 'set_mode', 'update_tasks', 'state', 'use_skill', 'unload_skill'].includes(toolName)) {
-                        document.dispatchEvent(new CustomEvent('evonic:agent-state-changed', { detail: data }));
-                    }
+                if (evtName === 'state:changed') {
+                    document.dispatchEvent(new CustomEvent('evonic:state-changed', { detail: data }));
+                    // Keep the established page-level event for consumers that have
+                    // not migrated to the more specific SSE event name yet.
+                    document.dispatchEvent(new CustomEvent('evonic:agent-state-changed', { detail: data }));
+                }
+                if (evtName === 'tasks:auto_transition' || evtName === 'tasks:stale') {
+                    document.dispatchEvent(new CustomEvent('evonic:' + evtName, { detail: data }));
                 }
                 if (evtName === 'approval:required') {
                     document.dispatchEvent(new CustomEvent('evonic:approval-required', { detail: data }));
@@ -2782,7 +3738,14 @@ class ChatUI {
                 _ensureTurn();
                 let result;
                 try { result = JSON.parse(entry.content); } catch(e) { result = { data: entry.content }; }
-                thinkingTurn.ingest({ event: 'tool_executed', data: { tool: entry.function, result, error: !!entry.error }, seq: 0 });
+                thinkingTurn.ingest({ event: 'tool_executed', data: { tool: entry.function, result, error: !!entry.error,
+                                                                       safety: entry.safety || null,
+                                                                       approval: entry.approval || null }, seq: 0 });
+                // switch_workplace: end the bubble here and draw the divider, later steps start a new one.
+                if (entry.function === 'switch_workplace' && !entry.error && result && result.workplace_switch) {
+                    if (thinkingTurn) { thinkingTurn.ingest({ event: 'done', data: {}, seq: 0 }); thinkingTurn = null; }
+                    this.appendMessage('system', '', { metadata: { workplace_switch: result.workplace_switch }, timestamp: entry.ts || null });
+                }
                 continue;
             }
             if (entry.type === 'intermediate') {
@@ -2800,7 +3763,10 @@ class ChatUI {
                 // If we built the timeline from streaming events, don't also render it
                 // from metadata — that would create a duplicate thinking bubble.
                 const msgMeta = hadStreamingTurn ? Object.assign({}, meta, { timeline: [] }) : meta;
-                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, { metadata: msgMeta });
+                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, {
+                    metadata: msgMeta,
+                    timestamp: entry.ts || entry.created_at || null,
+                });
                 continue;
             }
             if (entry.type === 'error') {
@@ -2810,6 +3776,10 @@ class ChatUI {
             }
             if (entry.type === 'system') {
                 const sysMeta = (entry.metadata && (entry.metadata.slash_command || entry.metadata.bash_exec)) ? { metadata: { slash_command: entry.metadata.slash_command || false, bash_exec: entry.metadata.bash_exec || false } } : {};
+                if (entry.metadata && entry.metadata.workplace_switch) {
+                    sysMeta.metadata = { workplace_switch: entry.metadata.workplace_switch };
+                    sysMeta.timestamp = entry.ts || null;
+                }
                 this.appendMessage('system', entry.content || '', sysMeta);
                 continue;
             }
@@ -2903,6 +3873,32 @@ class ChatUI {
         });
     }
 
+    // ── Public: upload progress indicators ──────────────────────────────────
+
+    markMessageUploading($msgEl) {
+        if (!$msgEl || !$msgEl.length) return;
+        if ($msgEl.find('.upload-indicator').length) return;
+        const isRight = $msgEl.hasClass('md:justify-end') || $msgEl.hasClass('justify-end');
+        const $indicator = $('<div class="upload-indicator flex items-center gap-1.5 mt-1 px-1">').addClass(isRight ? 'justify-end' : 'justify-start');
+        $indicator.html('<span class="tool-spinner" style="width:10px;height:10px;border-width:1.5px;border-color:rgba(255,255,255,0.3);border-top-color:rgba(255,255,255,0.9)"></span><span class="upload-indicator-text" style="font-size:10px;color:rgba(255,255,255,0.7)">Uploading…</span>');
+        $msgEl.find('div').first().append($indicator);
+    }
+
+    updateUploadProgress($msgEl, percent) {
+        if (!$msgEl || !$msgEl.length) return;
+        const $text = $msgEl.find('.upload-indicator-text');
+        if ($text.length) $text.text('Uploading… ' + percent + '%');
+    }
+
+    markMessageUploadDone($msgEl) {
+        if (!$msgEl || !$msgEl.length) return;
+        $msgEl.find('.upload-indicator').each(function() {
+            const $el = $(this);
+            $el.css('transition', 'opacity 0.5s').css('opacity', '0');
+            setTimeout(() => $el.remove(), 500);
+        });
+    }
+
     clearContainer() {
         this.clear();
     }
@@ -2989,6 +3985,7 @@ class ChatUI {
                     const $lastUser = this.$container.find('[data-msg-role="user"]').last();
                     const $anchor = $lastUser.length ? $lastUser : (opts.userMsgEl ? $(opts.userMsgEl) : turn.$anchor);
                     const newTurn = this.beginTurn($anchor);
+                    if (data.timestamp) newTurn._startTime = data.timestamp;
                     this._lastLiveTurnId = newTurn.id;
                     this.markQueuedAsDelivered();
                     // Re-route the SSE adapter to the new turn so subsequent events
@@ -3140,6 +4137,8 @@ window.SSEAdapter = SSEAdapter;
 window.PollingAdapter = PollingAdapter;
 window.ReplayAdapter = ReplayAdapter;
 window.Lightbox = Lightbox;
+window.renderKBDocPreview = renderKBDocPreview;
+window.showWikilinkPreview = showWikilinkPreview;
 
 log('ui').info('chat-ui v2 loaded');
 

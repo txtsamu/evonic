@@ -81,7 +81,8 @@ export class ChatUI {
      * @returns {jQuery}  the wrapper div (anchor for Turn)
      */
     appendMessage(role, content, opts = {}) {
-        const hasMeta = opts.metadata && (opts.metadata.image_url || opts.metadata.attachment_info);
+        // workplace_switch has no text of its own: the divider is drawn from the metadata
+        const hasMeta = opts.metadata && (opts.metadata.image_url || opts.metadata.attachment_info || opts.metadata.workplace_switch);
         if (role !== 'error' && (!content || !content.trim()) && !hasMeta) {
             this._log.warn('appendMessage SKIPPED empty/whitespace content', role);
             return $();
@@ -151,12 +152,14 @@ export class ChatUI {
             onTrigger:       (evtName, data) => {
                 this._log.debug('turn event', evtName, data);
                 this.$bus.trigger(evtName, [data]);
-                // agent-state bridge: fire document-level event for tool:executed
-                if (evtName === 'tool:executed') {
-                    const toolName = data && data.tool;
-                    if (['save_plan', 'set_mode', 'update_tasks', 'state', 'use_skill', 'unload_skill'].includes(toolName)) {
-                        document.dispatchEvent(new CustomEvent('evonic:agent-state-changed', { detail: data }));
-                    }
+                if (evtName === 'state:changed') {
+                    document.dispatchEvent(new CustomEvent('evonic:state-changed', { detail: data }));
+                    // Keep the established page-level event for consumers that have
+                    // not migrated to the more specific SSE event name yet.
+                    document.dispatchEvent(new CustomEvent('evonic:agent-state-changed', { detail: data }));
+                }
+                if (evtName === 'tasks:auto_transition' || evtName === 'tasks:stale') {
+                    document.dispatchEvent(new CustomEvent('evonic:' + evtName, { detail: data }));
                 }
                 if (evtName === 'approval:required') {
                     document.dispatchEvent(new CustomEvent('evonic:approval-required', { detail: data }));
@@ -242,7 +245,14 @@ export class ChatUI {
                 _ensureTurn();
                 let result;
                 try { result = JSON.parse(entry.content); } catch(e) { result = { data: entry.content }; }
-                thinkingTurn.ingest({ event: 'tool_executed', data: { tool: entry.function, result, error: !!entry.error }, seq: 0 });
+                thinkingTurn.ingest({ event: 'tool_executed', data: { tool: entry.function, result, error: !!entry.error,
+                                                                       safety: entry.safety || null,
+                                                                       approval: entry.approval || null }, seq: 0 });
+                // switch_workplace: end the bubble here and draw the divider, later steps start a new one.
+                if (entry.function === 'switch_workplace' && !entry.error && result && result.workplace_switch) {
+                    if (thinkingTurn) { thinkingTurn.ingest({ event: 'done', data: {}, seq: 0 }); thinkingTurn = null; }
+                    this.appendMessage('system', '', { metadata: { workplace_switch: result.workplace_switch }, timestamp: entry.ts || null });
+                }
                 continue;
             }
             if (entry.type === 'intermediate') {
@@ -260,7 +270,10 @@ export class ChatUI {
                 // If we built the timeline from streaming events, don't also render it
                 // from metadata — that would create a duplicate thinking bubble.
                 const msgMeta = hadStreamingTurn ? Object.assign({}, meta, { timeline: [] }) : meta;
-                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, { metadata: msgMeta });
+                this.appendMessage(meta.error ? 'error' : 'assistant', entry.content, {
+                    metadata: msgMeta,
+                    timestamp: entry.ts || entry.created_at || null,
+                });
                 continue;
             }
             if (entry.type === 'error') {
@@ -270,6 +283,10 @@ export class ChatUI {
             }
             if (entry.type === 'system') {
                 const sysMeta = (entry.metadata && (entry.metadata.slash_command || entry.metadata.bash_exec)) ? { metadata: { slash_command: entry.metadata.slash_command || false, bash_exec: entry.metadata.bash_exec || false } } : {};
+                if (entry.metadata && entry.metadata.workplace_switch) {
+                    sysMeta.metadata = { workplace_switch: entry.metadata.workplace_switch };
+                    sysMeta.timestamp = entry.ts || null;
+                }
                 this.appendMessage('system', entry.content || '', sysMeta);
                 continue;
             }
@@ -366,6 +383,32 @@ export class ChatUI {
         });
     }
 
+    // ── Public: upload progress indicators ──────────────────────────────────
+
+    markMessageUploading($msgEl) {
+        if (!$msgEl || !$msgEl.length) return;
+        if ($msgEl.find('.upload-indicator').length) return;
+        const isRight = $msgEl.hasClass('md:justify-end') || $msgEl.hasClass('justify-end');
+        const $indicator = $('<div class="upload-indicator flex items-center gap-1.5 mt-1 px-1">').addClass(isRight ? 'justify-end' : 'justify-start');
+        $indicator.html('<span class="tool-spinner" style="width:10px;height:10px;border-width:1.5px;border-color:rgba(255,255,255,0.3);border-top-color:rgba(255,255,255,0.9)"></span><span class="upload-indicator-text" style="font-size:10px;color:rgba(255,255,255,0.7)">Uploading…</span>');
+        $msgEl.find('div').first().append($indicator);
+    }
+
+    updateUploadProgress($msgEl, percent) {
+        if (!$msgEl || !$msgEl.length) return;
+        const $text = $msgEl.find('.upload-indicator-text');
+        if ($text.length) $text.text('Uploading… ' + percent + '%');
+    }
+
+    markMessageUploadDone($msgEl) {
+        if (!$msgEl || !$msgEl.length) return;
+        $msgEl.find('.upload-indicator').each(function() {
+            const $el = $(this);
+            $el.css('transition', 'opacity 0.5s').css('opacity', '0');
+            setTimeout(() => $el.remove(), 500);
+        });
+    }
+
     clearContainer() {
         this.clear();
     }
@@ -452,6 +495,7 @@ export class ChatUI {
                     const $lastUser = this.$container.find('[data-msg-role="user"]').last();
                     const $anchor = $lastUser.length ? $lastUser : (opts.userMsgEl ? $(opts.userMsgEl) : turn.$anchor);
                     const newTurn = this.beginTurn($anchor);
+                    if (data.timestamp) newTurn._startTime = data.timestamp;
                     this._lastLiveTurnId = newTurn.id;
                     this.markQueuedAsDelivered();
                     // Re-route the SSE adapter to the new turn so subsequent events
@@ -603,5 +647,7 @@ window.SSEAdapter = SSEAdapter;
 window.PollingAdapter = PollingAdapter;
 window.ReplayAdapter = ReplayAdapter;
 window.Lightbox = Lightbox;
+window.renderKBDocPreview = renderKBDocPreview;
+window.showWikilinkPreview = showWikilinkPreview;
 
 log('ui').info('chat-ui v2 loaded');

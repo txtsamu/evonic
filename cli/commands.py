@@ -1,6 +1,6 @@
 """Evonic CLI commands — start, stop, status, plugin, and skill management."""
 
-import fcntl
+import json
 import os
 import shutil
 import signal
@@ -20,15 +20,16 @@ for lib_dir in ("lib",):
     if os.path.isdir(lib_path) and lib_path not in sys.path:
         sys.path.insert(0, lib_path)
 
+# Cross-platform advisory file locking (POSIX flock / Windows msvcrt). Imported
+# after the sys.path setup above because it lives in the ``backend`` package.
+from backend.file_lock import AlreadyLockedError, open_and_lock, release
+
 
 # PID file location.
 #
-# After migration to the release-based layout the canonical run/ directory
-# lives at ``<app_root>/shared/run/`` (supervisor writes the daemon PID
-# there). Pre-migration installs still use ``<install_root>/run/``. Resolve
-# whichever is present so ``evonic status``/``evonic stop`` find a daemon
-# regardless of whether it was launched by the legacy in-process path or by
-# supervisor.
+# Resolve the run/ directory for PID file storage. Supports both legacy
+# shared/run/ path (from old release-based layout) and the current run/
+# directory at the project root.
 def _resolve_pid_dir():
     shared_run = os.path.join(ROOT, "shared", "run")
     if os.path.isdir(shared_run):
@@ -110,9 +111,20 @@ def _is_running(pid):
         return False
 
 
-def _write_pid(pid):
-    """Write PID to file."""
+def _write_pid(pid, fd=None):
+    """Write PID to the PID file.
+
+    When ``fd`` is given the PID is written through that already-open
+    descriptor instead of reopening the file. This keeps the write from
+    truncating (or conflicting with) a byte-range lock we hold on the same
+    file, which is a lock violation on Windows.
+    """
     os.makedirs(PID_DIR, exist_ok=True)
+    if fd is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(pid).encode())
+        return
     with open(PID_FILE, "w") as f:
         f.write(str(pid))
 
@@ -124,38 +136,32 @@ def _remove_pid():
 
 
 def _acquire_pid_lock():
-    """Acquire an exclusive file lock (flock) on the PID file.
+    """Acquire an exclusive lock on the PID file.
 
-    The lock is held for the lifetime of the file descriptor. If another
-    instance already holds the lock, exit immediately to prevent a second
-    server process from starting.
+    Uses the cross-platform :mod:`backend.file_lock` helper so the guard works
+    on Linux, macOS, and Windows. The lock is held for the lifetime of the
+    returned file descriptor; if another instance already holds it, exit
+    immediately to prevent a second server process from starting.
 
     Returns:
-        The open file descriptor, or ``None`` if daemon mode (caller should
-        not hold the lock — the child process will).
+        The open file descriptor holding the lock. Callers must keep it open
+        for as long as the lock should be held.
     """
     if not os.path.exists(PID_DIR):
         os.makedirs(PID_DIR, exist_ok=True)
 
     try:
-        fd = os.open(PID_FILE, os.O_CREAT | os.O_RDWR)
-    except OSError as e:
-        print(f"Error: Could not open PID file {PID_FILE}: {e}")
-        sys.exit(1)
-
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError as e:
-        # EAGAIN or EWOULDBLOCK means another process holds the lock
-        os.close(fd)
+        return open_and_lock(PID_FILE)
+    except AlreadyLockedError:
         existing_pid = _get_pid()
-        msg = f"Server is already running"
+        msg = "Server is already running"
         if existing_pid:
             msg += f" (PID: {existing_pid})"
         print(msg)
         sys.exit(1)
-
-    return fd
+    except OSError as e:
+        print(f"Error: Could not open PID file {PID_FILE}: {e}")
+        sys.exit(1)
 
 
 def start_server(port=None, host=None, debug=None, daemon=False):
@@ -170,20 +176,6 @@ def start_server(port=None, host=None, debug=None, daemon=False):
     # For foreground mode the lock is held for the entire server lifetime.
     # For daemon mode the child process (app.py) will acquire its own lock.
     pid_lock_fd = _acquire_pid_lock()
-
-    # Check if already running (legacy PID check — redundant with flock but kept
-    # for backward compat and a friendlier error message).
-    existing_pid = _get_pid()
-    if existing_pid and _is_running(existing_pid):
-        print(f"Server is already running (PID: {existing_pid})")
-        try:
-            import config
-
-            print(f"Port: {port or config.PORT}")
-        except Exception:
-            pass
-        os.close(pid_lock_fd)
-        return
 
     # Import config to get defaults
     try:
@@ -200,32 +192,6 @@ def start_server(port=None, host=None, debug=None, daemon=False):
 
     # Daemon (background) mode: spawn detached subprocess
     if daemon:
-        # Check if in release mode (self-update capable)
-        current_link = os.path.join(ROOT, "current")
-        sup_cfg_path = os.path.join(ROOT, "supervisor", "config.json")
-        release_mode = os.path.islink(current_link) and os.path.exists(sup_cfg_path)
-
-        if release_mode:
-            # Start supervisor daemon (handles release + self-update)
-            sup_script = os.path.join(ROOT, "supervisor", "supervisor.py")
-            proc = subprocess.Popen(
-                [sys.executable, sup_script],
-                start_new_session=True,
-            )
-            time.sleep(2)
-            if _is_running(proc.pid):
-                # Release the lock — supervisor/daemon will acquire their own
-                os.close(pid_lock_fd)
-                print(f"Supervisor started (PID: {proc.pid})")
-                print(
-                    f"Server will run from the current release with automatic self-update"
-                )
-            else:
-                print("Failed to start supervisor. Check the log for details.")
-                sys.exit(1)
-            return
-
-        # Flat mode (no releases): run app.py directly (legacy behavior)
         env = os.environ.copy()
         if port is not None:
             env["PORT"] = str(port)
@@ -240,6 +206,12 @@ def start_server(port=None, host=None, debug=None, daemon=False):
         app_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "app.py"
         )
+        # Release the lock BEFORE spawning — the child process (app.py) will
+        # acquire its own via its single-instance guard. Holding the lock here
+        # causes a race: the child's non-blocking lock attempt fails because
+        # this process still owns the lock, killing the child immediately.
+        release(pid_lock_fd)
+
         proc = subprocess.Popen(
             [sys.executable, app_path],
             env=env,
@@ -252,8 +224,6 @@ def start_server(port=None, host=None, debug=None, daemon=False):
 
         if _is_running(proc.pid):
             _write_pid(proc.pid)
-            # Release the lock — the child process (app.py) will acquire its own
-            os.close(pid_lock_fd)
             print(f"Server started in background (PID: {proc.pid})")
             print(f"Host: {host}")
             print(f"Port: {port}")
@@ -278,29 +248,6 @@ def start_server(port=None, host=None, debug=None, daemon=False):
     if debug:
         print("Debug mode: ON")
 
-    # Foreground release-mode parity: if the app was migrated to release-based
-    # layout, exec the release's python on its app.py (mirrors daemon path).
-    # Falls through to legacy in-process import when no release is staged.
-    current_link = os.path.join(ROOT, "current")
-    sup_cfg_path = os.path.join(ROOT, "supervisor", "config.json")
-    release_mode = os.path.islink(current_link) and os.path.exists(sup_cfg_path)
-    if release_mode:
-        release_path = os.path.realpath(current_link)
-        if sys.platform == "win32":
-            release_py = os.path.join(release_path, ".venv", "Scripts", "python.exe")
-        else:
-            release_py = os.path.join(release_path, ".venv", "bin", "python")
-        release_app = os.path.join(release_path, "app.py")
-        if os.path.exists(release_py) and os.path.exists(release_app):
-            print(EVONIC_BANNER)
-            print(f"Starting server (Ctrl+C to stop)")
-            print(f"Host: {host}")
-            print(f"Port: {port}")
-            print(f"URL: http://{host if host != '0.0.0.0' else 'localhost'}:{port}")
-            os.chdir(release_path)
-            os.execv(release_py, [release_py, release_app])
-            # execv replaces the process; lines below unreachable.
-
     # We already hold the single-instance flock (acquired above via
     # _acquire_pid_lock). app.py runs in THIS same process, so tell its
     # module-level guard to skip re-acquiring the lock — a second flock on the
@@ -316,9 +263,11 @@ def start_server(port=None, host=None, debug=None, daemon=False):
         print("  evonic setup")
         sys.exit(1)
 
-    # Write PID and keep the flock fd open — the lock is held for the entire
-    # server lifetime and released automatically by the OS on process exit.
-    _write_pid(os.getpid())
+    # Write our PID through the locked descriptor (instead of reopening the
+    # file) so the write cannot conflict with the byte-range lock we hold on
+    # Windows. The fd stays open for the entire server lifetime — the lock is
+    # released automatically by the OS on process exit.
+    _write_pid(os.getpid(), pid_lock_fd)
 
     print(EVONIC_BANNER)
 
@@ -330,8 +279,37 @@ def start_server(port=None, host=None, debug=None, daemon=False):
     app.run(host=host, port=port, debug=debug, use_reloader=False, threaded=True)
 
 
+def _configured_systemd_service():
+    """Return the configured systemd unit, or None when self-managed."""
+    import config
+
+    if config.SERVICE_SYSTEM != "systemd":
+        return None
+    if not config.SYSTEMD_SERVICE_NAME:
+        print("Error: SYSTEMD_SERVICE_NAME is required when SERVICE_SYSTEM=systemd")
+        return ""
+    return config.SYSTEMD_SERVICE_NAME
+
+
+def _run_systemctl(action, service_name):
+    command = ["systemctl", action, service_name]
+    try:
+        subprocess.run(command, check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"Failed to run {' '.join(command)}: {e}")
+        return False
+    print(f"Systemd service {service_name} {action} requested.")
+    return True
+
+
 def stop_server():
     """Stop the running server."""
+    systemd_service = _configured_systemd_service()
+    if systemd_service is not None:
+        if systemd_service:
+            _run_systemctl("stop", systemd_service)
+        return
+
     pid = _get_pid()
 
     if pid is None:
@@ -363,7 +341,7 @@ def stop_server():
             return
 
     # Force kill if still running. SIGKILL is POSIX-only, so on Windows we
-    # use `taskkill /F` (the same approach as supervisor/supervisor.py).
+    # use `taskkill /F`.
     print("Server didn't stop gracefully. Force-killing...")
     try:
         if sys.platform == "win32":
@@ -377,14 +355,7 @@ def stop_server():
 
     _remove_pid()
 
-    # Also stop supervisor if running
-    spid = _get_supervisor_pid()
-    if spid and _is_running(spid):
-        try:
-            os.kill(spid, signal.SIGTERM)
-            print(f"Sending SIGTERM to supervisor (PID: {spid})...")
-        except OSError as e:
-            print(f"Failed to send SIGTERM to supervisor: {e}")
+
 
 
 def status_server():
@@ -413,7 +384,13 @@ def status_server():
 
 
 def restart_server():
-    """Stop the running server, then start it again in daemon mode."""
+    """Restart through systemd or use Evonic's self-managed process path."""
+    systemd_service = _configured_systemd_service()
+    if systemd_service is not None:
+        if systemd_service:
+            _run_systemctl("restart", systemd_service)
+        return
+
     print("Stopping server...")
     stop_server()
 
@@ -427,16 +404,21 @@ def restart_server():
 # ─── Plugin Management ────────────────────────────────────────────────────────
 
 
-def _get_plugin_manager():
-    """Lazily create a PluginManager instance."""
+def _get_plugin_manager(load_plugins: bool = True):
+    """Lazily create a PluginManager instance.
+
+    Metadata-only commands pass load_plugins=False: it skips executing
+    plugin handler modules, whose module-level code can mutate state the
+    live server owns (e.g. the kanban scanner schedules).
+    """
     from backend.plugin_manager import PluginManager
 
-    return PluginManager()
+    return PluginManager(load_plugins=load_plugins)
 
 
 def plugin_list():
     """List all installed plugins in a table format."""
-    pm = _get_plugin_manager()
+    pm = _get_plugin_manager(load_plugins=False)
     plugins = pm.list_plugins()
 
     if not plugins:
@@ -770,8 +752,9 @@ the handler logic in `handler.py`.
 
 # ─── Skill Management ──────────────────────────────────────────────────────────
 
-# Built-in/core skills that cannot be removed via CLI
-_SKILL_CORE_IDS = {"hello_world"}
+# Built-in/core skills that cannot be removed via CLI. Mirrors the backend's
+# CORE_SKILL_IDS (which is the real enforcement point for CLI + API + UI).
+from backend.skills_manager import CORE_SKILL_IDS as _SKILL_CORE_IDS
 
 
 def _get_skills_manager():
@@ -973,14 +956,177 @@ def skill_rm(skill_id):
     print(f"Skill uninstalled: {skill_id}")
 
 
+def skill_export(skill_id, output=None, verbose=False):
+    """Export a skill identified by its ID into a structured zip archive.
+
+    Collects all files under the skill's directory (manifest, tools, source
+    code, assets, etc.), excluding build artifacts (``__pycache__``), and
+    packages them into a zip file with a ``<skill_id>/`` prefix so the
+    archive can be re-installed via ``evonic skill add``.
+
+    Args:
+        skill_id: The skill ID to export.
+        output: Optional output path for the zip file. Defaults to
+                ``./<skill_id>.zip`` in the current working directory.
+        verbose: If True, prints every file as it is added to the archive.
+    """
+    import zipfile
+
+    if not skill_id:
+        print("Error: skill_id is required.")
+        print("Usage: evonic skill export <skill_id> [-o <path>] [-v]")
+        sys.exit(1)
+
+    sm = _get_skills_manager()
+    skill = sm.get_skill(skill_id)
+
+    if skill is None:
+        print(f"Error: Skill not found: {skill_id}")
+        sys.exit(1)
+
+    skill_dir = skill.get("_dir")
+    if not skill_dir or not os.path.isdir(skill_dir):
+        print(f"Error: Skill directory not found for '{skill_id}'.")
+        sys.exit(1)
+
+    # Determine output path
+    if output is None:
+        output = os.path.join(os.getcwd(), f"{skill_id}.zip")
+    elif not os.path.isabs(output):
+        output = os.path.join(os.getcwd(), output)
+
+    # Ensure parent directory exists
+    output_dir = os.path.dirname(output)
+    if output_dir and not os.path.isdir(output_dir):
+        print(f"Error: Output directory does not exist: {output_dir}")
+        sys.exit(1)
+
+    # Collect all files under the skill directory, excluding __pycache__
+    file_paths = []
+    for root, dirs, files in os.walk(skill_dir):
+        # Skip __pycache__ directories
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for fname in files:
+            full_path = os.path.join(root, fname)
+            # Preserve relative path inside the archive under skill_id/
+            rel_path = os.path.relpath(full_path, skill_dir)
+            arcname = f"{skill_id}/{rel_path}"
+            file_paths.append((full_path, arcname))
+
+    if not file_paths:
+        print(f"Error: No files found in skill directory for '{skill_id}'.")
+        sys.exit(1)
+
+    # Create the zip archive
+    try:
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
+            for full_path, arcname in sorted(file_paths, key=lambda x: x[1]):
+                zf.write(full_path, arcname)
+                if verbose:
+                    print(f"  + {arcname}")
+    except PermissionError:
+        print(f"Error: Permission denied writing to '{output}'.")
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: Could not create zip file '{output}': {e}")
+        sys.exit(1)
+
+    skill_name = skill.get("name", skill_id)
+    version = skill.get("version", "?")
+    file_count = len(file_paths)
+    print(f"Skill exported: {skill_name} ({skill_id}) v{version}")
+    print(f"Output: {output}")
+    print(f"Files:  {file_count}")
+    print()
+    print("To re-install:")
+    print(f"  evonic skill add {output}")
+    print()
+    print("To extract manually:")
+    print(f"  unzip {output} -d <target-dir>")
+
+
 # ─── Skillset Management ───────────────────────────────────────────────────────────────
 
 
 def _get_skillsets():
-    """Lazily import skillsets module."""
-    from backend import skillsets
+    """Lazily build the skillset view over the canonical template engine.
 
-    return skillsets
+    Skillsets are plain agent templates (``agent_templates/``); this view
+    reproduces the historical ``backend.skillsets`` surface (list / get /
+    resolve / apply) on top of :mod:`backend.agent_templates` so the CLI
+    handlers keep their shape.
+    """
+    from backend import agent_templates
+
+    class _SkillsetView:
+        @staticmethod
+        def list_skillsets():
+            return [
+                {
+                    "id": s["id"],
+                    "name": s["name"],
+                    "description": s["description"],
+                    "tools_count": s["tool_count"],
+                    "skills_count": s["skill_count"],
+                }
+                for s in agent_templates.list_templates()
+                if s["valid"]
+            ]
+
+        @staticmethod
+        def get_skillset(skill_id):
+            try:
+                return agent_templates.get_template(skill_id)
+            except Exception:
+                return None
+
+        @staticmethod
+        def resolve_skillset(skill_id):
+            template = _SkillsetView.get_skillset(skill_id)
+            if template is None:
+                return None
+            try:
+                tools = agent_templates.resolve_template(skill_id)["tools"]
+                resolved = tools.get("resolved", list(template.get("tools") or []))
+                unresolved = tools.get("missing", [])
+            except Exception:
+                resolved = list(template.get("tools") or [])
+                unresolved = []
+            result = dict(template)
+            result["resolved_tools"] = resolved
+            result["unresolved_tools"] = unresolved
+            return result
+
+        @staticmethod
+        def apply_skillset(skill_id, agent_data):
+            template = _SkillsetView.get_skillset(skill_id)
+            if template is None:
+                return {"error": f"Skillset '{skill_id}' not found."}
+            defaults = template.get("defaults") or {}
+            result = {}
+            result["system_prompt"] = agent_data.get(
+                "system_prompt", template.get("system_prompt") or ""
+            )
+            model = (
+                agent_data.get("model_id")
+                or agent_data.get("model")
+                or defaults.get("model_id")
+                or ""
+            )
+            result["model"] = model or None
+            result["tools"] = agent_data.get("tools", template.get("tools") or [])
+            result["skills"] = agent_data.get("skills", template.get("skills") or [])
+            result["kb_files"] = agent_data.get(
+                "kb_files", template.get("kb_files") or {}
+            )
+            result["id"] = agent_data.get("id", "")
+            result["name"] = agent_data.get("name", template.get("name") or "")
+            result["description"] = agent_data.get(
+                "description", template.get("description") or ""
+            )
+            return result
+
+    return _SkillsetView
 
 
 def skillset_list():
@@ -1043,7 +1189,8 @@ def skillset_get(skillset_id):
     print(f"ID:          {skillset.get('id', '')}")
     print(f"Name:        {skillset.get('name', '')}")
     print(f"Description: {skillset.get('description', 'N/A')}")
-    print(f"Model:       {skillset.get('model', '(default)')}")
+    _defaults = skillset.get('defaults') or {}
+    print(f"Model:       {_defaults.get('model_id') or '(default)'}")
 
     # System prompt (truncated)
     sp = skillset.get("system_prompt", "")
@@ -1276,6 +1423,62 @@ def agent_get(agent_id):
             print(f"  - {cname}")
 
 
+def agent_export(agent_id, output=None):
+    """Export an agent as portable JSON."""
+    from backend.agent_portability import AgentPortabilityError, export_agent
+
+    try:
+        payload = export_agent(_get_db(), agent_id, ROOT)
+        content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+        if output:
+            output = os.path.abspath(os.path.expanduser(output))
+            parent = os.path.dirname(output)
+            if parent and not os.path.isdir(parent):
+                raise AgentPortabilityError(f"Output directory does not exist: {parent}.")
+            with open(output, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            print(f"Agent exported: {output}")
+        else:
+            sys.stdout.write(content)
+    except (AgentPortabilityError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def agent_import(source, agent_id=None, name=None, confirm=False):
+    """Import an agent from portable JSON in a file or stdin."""
+    from backend.agent_portability import AgentPortabilityError, import_agent, preflight_import
+
+    try:
+        if source == "-":
+            content = sys.stdin.read()
+        else:
+            with open(os.path.expanduser(source), "r", encoding="utf-8") as handle:
+                content = handle.read()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise AgentPortabilityError(
+                f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}."
+            ) from exc
+        db = _get_db()
+        preflight = preflight_import(db, payload)
+        warning = preflight["warning"]
+        if warning["skills"] or warning["tools"]:
+            print("Warning: unavailable dependencies will be skipped: " +
+                  ", ".join(warning["skills"] + warning["tools"]))
+            if not confirm and input("Continue with import? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("Import cancelled.")
+                return
+        imported_id = import_agent(
+            db, payload, ROOT, agent_id=agent_id, name=name, confirm_missing=True
+        )
+        print(f"Agent imported: {imported_id}")
+    except (AgentPortabilityError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def agent_add(agent_id, name, description=None, model=None, skillset=None):
     """Create a new agent, optionally from a skillset template."""
     if not agent_id:
@@ -1310,7 +1513,7 @@ def agent_add(agent_id, name, description=None, model=None, skillset=None):
     skills = []
 
     if skillset:
-        from backend import skillsets as ss_mod
+        ss_mod = _get_skillsets()
 
         skillset_data = ss_mod.get_skillset(skillset)
         if skillset_data is None:
@@ -1461,6 +1664,11 @@ def agent_remove(agent_id):
         )
         if os.path.isdir(agent_dir):
             shutil.rmtree(agent_dir)
+        try:
+            from models.chat import agent_chat_manager
+            agent_chat_manager.drop(agent_id)
+        except Exception:
+            pass
         print(f"Agent removed: {agent_id}")
     except Exception as e:
         print(f"Error: {e}")
@@ -2045,372 +2253,219 @@ def workplace_disconnect(workplace_id):
         sys.exit(1)
 
 
-# ─── Setup Wizard ─────────────────────────────────────────────────────────────
-
-
-def _install_dependencies():
-    """Install Python dependencies from requirements.txt."""
-    req_file = os.path.join(ROOT, "requirements.txt")
-    if not os.path.exists(req_file):
-        print("  Warning: requirements.txt not found, skipping dependency install.")
-        return True
-    print("  Installing dependencies...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", req_file],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print("  Error installing dependencies:")
-        print(result.stdout[-2000:] if result.stdout else "")
-        print(result.stderr[-2000:] if result.stderr else "")
-        return False
-    print("  Dependencies installed.")
-    return True
-
-
-def setup_wizard():
-    """Interactive first-time setup wizard for Evonic (CLI)."""
+def setup_command(non_interactive=False):
+    """First-time setup wizard: configure LLM provider and create super agent."""
     import getpass
 
-    # ── Pipe-safe input: when stdin is piped (e.g., curl | bash → evonic setup),
-    #    rebind sys.stdin to /dev/tty so input() and getpass.getpass()
-    #    read directly from the terminal instead of hitting EOF. ──
-    if not sys.stdin.isatty():
-        try:
-            sys.stdin = open("/dev/tty", "r")
-        except OSError:
-            pass  # No /dev/tty available; existing EOFError handlers will abort gracefully
+    from models.db import db
 
-    db = _get_db()
+    # If already set up, run doctor --fix to keep things healthy
     if db.has_super_agent():
-        print("Setup is already complete. Super agent already exists.")
-        sys.exit(0)
+        print("Super agent already exists — running doctor --fix to ensure everything is healthy.\n")
+        doctor_command(fix=True)
+        return
 
-    # ── Banner ──
     print()
-    print("  Welcome to Evonic Setup")
-    print("  " + "=" * 22)
+    print("  ╔══════════════════════════════════════════════════╗")
+    print("  ║        Welcome to Evonic Setup Wizard            ║")
+    print("  ╚══════════════════════════════════════════════════╝")
     print()
-
-    # ── Step 0: Install dependencies ──
-    if not _install_dependencies():
-        sys.exit(1)
+    print("  This wizard will help you configure your first")
+    print("  super agent and default LLM provider.")
     print()
 
-    from backend.setup import (
-        PROVIDER_DEFAULTS,
-        build_sandbox_image,
-        check_docker_available,
-        run_setup,
-        test_connection,
-    )
-
-    # ── Step 1: Provider ──
-    providers = list(PROVIDER_DEFAULTS.items())
-    print("  Select your LLM provider:")
-    print()
-    for i, (pid, p) in enumerate(providers, 1):
-        print(f"    [{i}] {p['label']:<12} {p['description']}")
-    print()
+    # Rebind stdin to /dev/tty for interactive input when called via wrapper
     try:
-        choice = input("  Choice [1]: ").strip() or "1"
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    try:
-        idx = int(choice) - 1
-        if idx < 0 or idx >= len(providers):
-            raise ValueError
-    except ValueError:
-        print("  Invalid choice.")
-        sys.exit(1)
+        sys.stdin = open("/dev/tty", "r")
+    except OSError:
+        pass
 
-    provider_id, provider_cfg = providers[idx]
-    print(f"\n  Selected: {provider_cfg['label']}")
-    # ── Step 2: Base URL ──
-    default_url = provider_cfg["base_url"]
-    print()
-    if provider_id == "custom":
-        try:
-            print("  eg: http://192.168.1.7:8080/v1")
-            base_url = input("  Base URL: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if not base_url:
-            print("  Base URL is required for custom provider.")
-            sys.exit(1)
+    # --- Provider selection ---
+    from backend.setup import PROVIDER_DEFAULTS
+
+    providers = list(PROVIDER_DEFAULTS.keys())
+    print("  Available LLM providers:")
+    for i, p in enumerate(providers, 1):
+        cfg = PROVIDER_DEFAULTS[p]
+        print(f"    {i}. {cfg['label']} — {cfg['description']}")
+
+    if non_interactive:
+        provider = "openrouter"
+        print(f"\n  [non-interactive] Using default provider: {provider}")
     else:
         try:
-            entered = input(f"  Base URL [{default_url}]: ").strip()
+            choice = input(f"\n  Choose provider [1-{len(providers)}] (default: 1): ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        base_url = entered or default_url
+            print("\n  Setup aborted.")
+            return
+        try:
+            idx = int(choice) - 1 if choice else 0
+            if idx < 0 or idx >= len(providers):
+                print(f"  Invalid choice, using default (1. {PROVIDER_DEFAULTS[providers[0]]['label']})")
+                idx = 0
+        except ValueError:
+            idx = 0
+        provider = providers[idx]
 
-    # ── Step 3: API Key ──
+    provider_cfg = PROVIDER_DEFAULTS[provider]
+    print(f"  Selected: {provider_cfg['label']}")
+
+    # --- API key ---
     api_key = ""
     if provider_cfg["api_key_required"]:
-        try:
-            api_key = getpass.getpass("  API Key: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if not api_key:
-            print("  API key is required for this provider.")
-            sys.exit(1)
-    else:
-        try:
-            api_key = getpass.getpass(
-                "  API Key (optional, press Enter to skip): "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-
-    # ── Step 4: Model name ──
-    placeholder = provider_cfg["placeholder_model"]
-    try:
-        model_name = input(f"  Model name [{placeholder}]: ").strip() or placeholder
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if not model_name:
-        print("  Model name is required.")
-        sys.exit(1)
-
-    # ── Step 5: Test connection ──
-    print()
-    print("  Testing connection...", end=" ", flush=True)
-    result = test_connection(base_url, api_key or None)
-    if result["success"]:
-        print(f"OK — {result['message']}")
-    else:
-        print(f"FAILED — {result['message']}")
-        try:
-            cont = input("  Continue anyway? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if cont not in ("y", "yes"):
-            print("  Aborted.")
-            sys.exit(1)
-
-    # ── Step 6: Super Agent name ──
-    print()
-    try:
-        agent_name = input("  Super Agent name [Admin]: ").strip() or "Admin"
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-
-    import re
-
-    default_id = re.sub(r"[^a-z0-9_]", "_", agent_name.lower())
-    default_id = re.sub(r"_+", "_", default_id).strip("_") or "admin"
-    try:
-        agent_id = input(f"  Agent ID [{default_id}]: ").strip().lower() or default_id
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if not re.match(r"^[a-z0-9_]+$", agent_id):
-        print(
-            "  Agent ID must be lowercase alphanumeric and underscores only (snake_case)."
-        )
-        sys.exit(1)
-
-    # ── Step 6: Docker Sandbox Detection ──
-    sandbox_enabled = False
-    print()
-    docker_status = check_docker_available()
-    if docker_status["available"]:
-        print(f"  Docker detected — {docker_status['message']}")
-        print()
-        print("  Fitur sandbox execution memerlukan Docker.")
-        try:
-            build_choice = (
-                input(
-                    "  Apakah Anda ingin menyiapkan Docker image terlebih dahulu? [Y/n]: "
-                )
-                .strip()
-                .lower()
-            )
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if build_choice in ("", "y", "yes"):
-            print()
-            print("  Building Docker sandbox image...", end=" ", flush=True)
-            build_result = build_sandbox_image()
-            if build_result["success"]:
-                print("Done!")
-                print(f"  {build_result['message']}")
-                sandbox_enabled = True
-            else:
-                print("FAILED")
-                print(f"  {build_result['message']}")
-                print("  Sandbox execution will be disabled.")
+        if non_interactive:
+            print("  [non-interactive] Skipping API key — you can set it later in .env")
         else:
-            print("  Skipping Docker setup. Sandbox execution will be disabled.")
+            try:
+                api_key = getpass.getpass(f"  {provider_cfg['label']} API key: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Setup aborted.")
+                return
+
+    # --- Model name ---
+    default_model = provider_cfg["placeholder_model"]
+    if non_interactive:
+        model_name = default_model
+        print(f"  [non-interactive] Using default model: {model_name}")
     else:
-        print(f"  Docker not available — {docker_status['message']}")
-        print("  Sandbox execution will be disabled.")
+        try:
+            inp = input(f"  Model name (default: {default_model}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Setup aborted.")
+            return
+        model_name = inp if inp else default_model
 
-    # ── Step 7: Confirm ──
-    print()
-    print("  Setup Summary")
-    print("  " + "─" * 30)
-    print(f"  Provider       : {provider_cfg['label']}")
-    print(f"  Base URL       : {base_url}")
-    print(f"  Model          : {model_name}")
-    print(f"  Agent          : {agent_name} ({agent_id})")
-    print(f"  Sandbox        : {'Enabled' if sandbox_enabled else 'Disabled'}")
-    print()
-    try:
-        confirm = input("  Proceed? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if confirm in ("n", "no"):
-        print("  Aborted.")
-        sys.exit(0)
+    # --- Agent name ---
+    from backend.setup import DEFAULT_SUPER_AGENT_NAME
 
-    # ── Execute setup ──
+    if non_interactive:
+        agent_name = DEFAULT_SUPER_AGENT_NAME
+        print(f"  [non-interactive] Using default agent name: {agent_name}")
+    else:
+        try:
+            agent_name = input(f"  Your super agent's name (default: {DEFAULT_SUPER_AGENT_NAME}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Setup aborted.")
+            return
+        agent_name = agent_name or DEFAULT_SUPER_AGENT_NAME
+
+    # --- Language ---
+    if non_interactive:
+        language = "english"
+    else:
+        try:
+            lang = input("  Language [english/indonesian/adaptive] (default: english): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Setup aborted.")
+            return
+        language = lang if lang in ("english", "indonesian", "adaptive") else "english"
+
+    # --- Timezone ---
+    from backend.setup import validate_timezone
+    timezone_name = "Asia/Jakarta"
+    if non_interactive:
+        print(f"  [non-interactive] Using default timezone: {timezone_name}")
+    else:
+        while True:
+            try:
+                tz = input(f"  Timezone (default: {timezone_name}): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Setup aborted.")
+                return
+            tz = tz if tz else timezone_name
+            try:
+                timezone_name = validate_timezone(tz)
+                break
+            except ValueError:
+                print(f"  Invalid timezone: {tz} \u2014 must be a valid IANA name (e.g. Asia/Jakarta, Europe/London)")
+
+    # --- Admin password ---
+    password = ""
+    if non_interactive:
+        print("  [non-interactive] Skipping admin password — you can set it later with 'evonic pass'")
+    else:
+        try:
+            set_pw = input("  Set admin dashboard password? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Setup aborted.")
+            return
+        if set_pw in ("y", "yes"):
+            pw1 = getpass.getpass("  New password: ")
+            if not pw1 or len(pw1) < 6:
+                print("  Password must be at least 6 characters — skipping password setup.")
+            else:
+                pw2 = getpass.getpass("  Confirm password: ")
+                if pw1 != pw2:
+                    print("  Passwords do not match — skipping password setup.")
+                else:
+                    password = pw1
+
+    # --- Confirm ---
     print()
-    print("  Creating platform...", end=" ", flush=True)
-    outcome = run_setup(
-        provider=provider_id,
+    print(f"  Summary:")
+    print(f"    Provider    : {provider_cfg['label']}")
+    print(f"    Model       : {model_name}")
+    print(f"    Agent Name  : {agent_name}")
+    print(f"    Language    : {language}")
+    print(f"    Timezone    : {timezone_name}")
+    if password:
+        print(f"    Admin Pass  : (set)")
+    print()
+
+    if not non_interactive:
+        try:
+            confirm = input("  Proceed with setup? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Setup aborted.")
+            return
+        if confirm in ("n", "no"):
+            print("  Setup cancelled.")
+            return
+
+    # --- Execute setup ---
+    from backend.setup import run_setup
+
+    result = run_setup(
+        provider=provider,
         model_name=model_name,
-        base_url=base_url,
+        base_url="",
         api_key=api_key,
         agent_name=agent_name,
-        agent_id=agent_id,
-        sandbox_enabled=sandbox_enabled,
+        agent_id="",
+        description="Evonic Super Agent",
+        language=language,
+        sandbox_enabled=False,
+        password=password,
+        timezone_name=timezone_name,
     )
-    if outcome.get("error"):
-        print(f"FAILED\n  Error: {outcome['error']}")
+
+    if "error" in result:
+        print(f"\n  Error: {result['error']}")
         sys.exit(1)
 
-    print("Done!")
-    print()
-    print(f"  Super agent '{agent_name}' created successfully.")
-
-    # ── Step 8: Telegram Binding ──
-    bot_token = ""
-    print()
-    print("  Telegram Integration")
-    print("  " + "─" * 30)
-    print("  Connect a Telegram bot so you can chat with your")
-    print("  super agent directly through Telegram.")
-    print()
-    try:
-        telegram_choice = input("  Connect Telegram bot? [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Skipped.")
-        telegram_choice = "n"
-    if telegram_choice in ("y", "yes"):
+    # --- Memory engine (evomem) ---
+    # Offered interactively only (default yes). Headless/scripted runs
+    # (--non-interactive) skip the prompt; install.sh provisions evomem directly
+    # via `python -m backend.evomem_provision`. ensure_evomem() is idempotent, so
+    # the prompt is safe even when the installer already fetched the binary.
+    if not non_interactive:
         try:
-            bot_token = getpass.getpass("  Telegram Bot Token: ").strip()
+            reply = input("\n  Install evomem memory engine? [Y/n]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if bot_token:
-            try:
-                db.create_channel(
-                    {
-                        "agent_id": agent_id,
-                        "type": "telegram",
-                        "name": "Telegram Bot",
-                        "config": {"bot_token": bot_token, "mode": "restricted"},
-                        "enabled": True,
-                    }
-                )
-                print("  Telegram bot connected successfully.")
-                print(f"  You can now chat with '{agent_name}' via Telegram.")
-            except Exception as e:
-                print(f"  Failed to connect Telegram bot: {e}")
-        else:
-            print("  No token provided. Skipping Telegram setup.")
-    else:
-        print("  Skipped. You can add Telegram later from the web dashboard.")
+            reply = ""
+        if reply not in ("n", "no"):
+            print("  Installing evomem memory engine...")
+            from backend.evomem_provision import ensure_evomem
+            ev = ensure_evomem()
+            if ev["ok"]:
+                _ok(ev["msg"]) if ev["installed"] else _info(ev["msg"])
+            else:
+                _warn(ev["msg"])
+                _info("Run 'evonic evomem install' to retry.")
 
-    # ── Step 10: Password Setup ──
-    from werkzeug.security import generate_password_hash
-
+    print(f"\n  Setup complete! Super agent '{result['agent_id']}' created.")
+    print(f"  Run 'evonic start -d' to start the platform.")
     print()
-    print("  Set Web Dashboard Password")
-    print("  " + "─" * 30)
-    print("  This password is used to log in to the web dashboard.")
-    print()
-    env_path = os.path.join(ROOT, ".env")
-    while True:
-        try:
-            pw1 = getpass.getpass("  Password: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if not pw1:
-            print(
-                "  Warning: No password set. Web dashboard will be accessible without login."
-            )
-            break
-        if len(pw1) < 6:
-            print("  Error: Password must be at least 6 characters. Try again.")
-            continue
-        try:
-            pw2 = getpass.getpass("  Confirm password: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if pw1 != pw2:
-            print("  Error: Passwords do not match. Try again.")
-            continue
-        new_hash = generate_password_hash(pw1, method="pbkdf2:sha256")
-        _update_env_var(env_path, "ADMIN_PASSWORD_HASH", new_hash)
-        print("  Password set successfully.")
-        break
-
-    # -- Generate supervisor/config.json for self-update support --
-    print()
-    print("  Setting up supervisor for self-update...", end=" ", flush=True)
-
-    # Resolve the server port from config (which loads .env) so the
-    # supervisor health check probes the correct port (not hardcoded 8080).
-    try:
-        import config
-        server_port = int(getattr(config, 'PORT', 8080))
-    except Exception:
-        server_port = 8080
-
-    sup_cfg = {
-        "app_root": ROOT,
-        "poll_interval": 300,
-        "health_port": server_port,
-        "health_temp_port": 18080,
-        "health_timeout": 10,
-        "monitor_duration": 60,
-        "keep_releases": 3,
-        "python_bin": "python3",
-        "uv_bin": None,
-        "telegram_bot_token": bot_token,
-        "telegram_chat_id": "",
-    }
-    sup_cfg_dir = os.path.join(ROOT, "supervisor")
-    os.makedirs(sup_cfg_dir, exist_ok=True)
-    sup_cfg_path = os.path.join(sup_cfg_dir, "config.json")
-    import json
-
-    with open(sup_cfg_path, "w") as f:
-        json.dump(sup_cfg, f, indent=4)
-    print("Done!")
-
-    print()
-    print(f"  Start the server with: evonic start")
-    print()
-
-
-# ─── Password Setup ──────────────────────────────────────────────────────────
 
 
 def pass_setup():
@@ -2482,511 +2537,6 @@ def pass_setup():
         _update_env_var(env_path, "ADMIN_PASSWORD_HASH", new_hash)
         print("Password changed successfully.")
 
-
-def _reconfigure_supervisor_wizard():
-    """Interactive wizard for reconfiguring the supervisor daemon.
-
-    Prompts user for poll interval, health check port, release retention,
-    and optional Telegram notification settings. Saves the result to
-    supervisor/config.json.
-    """
-    import json
-
-    sup = _load_supervisor_module()
-    cfg_path = os.path.join(ROOT, "supervisor", "config.json")
-
-    # Load existing config if available, otherwise start from defaults
-    cfg = sup.load_config(cfg_path)
-
-    # --- Banner ---
-    print()
-    print("  Evonic Supervisor Reconfigure")
-    print("  " + "=" * 30)
-    print()
-    print("  Configure the supervisor daemon that manages the server")
-    print("  process, self-updates, and health checks.")
-    print()
-
-    # --- Step 1: Poll interval ---
-    print("  Poll interval \u2014 how often (in seconds) the supervisor checks")
-    print("  for new releases on GitHub.")
-    print()
-    current_poll = cfg.get("poll_interval", 300)
-    try:
-        poll_input = input(f"  Poll interval [{current_poll}]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if poll_input:
-        try:
-            poll_interval = int(poll_input)
-            if poll_interval < 60:
-                print("  Minimum poll interval is 60 seconds.")
-                poll_interval = 60
-        except ValueError:
-            print("  Invalid value. Using default.")
-            poll_interval = current_poll
-    else:
-        poll_interval = current_poll
-
-    # --- Step 2: Health check port ---
-    print()
-    print("  Health check port \u2014 the supervisor probes this port to")
-    print("  determine whether the server is responsive after a swap.")
-    print()
-    # Resolve default from config.PORT if available, otherwise 8080
-    try:
-        import config
-        _default_health_port = int(getattr(config, 'PORT', 8080))
-    except Exception:
-        _default_health_port = 8080
-    current_health = cfg.get('health_port', _default_health_port)
-    try:
-        health_input = input(f"  Health check port [{current_health}]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if health_input:
-        try:
-            health_port = int(health_input)
-            if health_port < 1 or health_port > 65535:
-                print("  Port must be 1\u201365535. Using default.")
-                health_port = current_health
-        except ValueError:
-            print("  Invalid value. Using default.")
-            health_port = current_health
-    else:
-        health_port = current_health
-
-    # --- Step 3: Keep releases ---
-    print()
-    print("  Release retention \u2014 how many past releases to keep")
-    print("  (older ones are pruned after a successful update).")
-    print()
-    current_keep = cfg.get("keep_releases", 3)
-    try:
-        keep_input = input(f"  Keep releases [{current_keep}]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if keep_input:
-        try:
-            keep_releases = int(keep_input)
-            if keep_releases < 1:
-                print("  Must keep at least 1 release. Using default.")
-                keep_releases = current_keep
-        except ValueError:
-            print("  Invalid value. Using default.")
-            keep_releases = current_keep
-    else:
-        keep_releases = current_keep
-
-    # --- Step 4: Telegram notifications (optional) ---
-    print()
-    print("  Telegram notifications \u2014 optionally notify a chat when")
-    print("  the supervisor performs an update or encounters an error.")
-    print()
-    current_token = cfg.get("telegram_bot_token", "")
-    current_chat = cfg.get("telegram_chat_id", "")
-    masked_token = (
-        ("***" + current_token[-4:])
-        if len(current_token) > 4
-        else (current_token or "(not set)")
-    )
-    print(f"  Current bot token : {masked_token}")
-    print(f"  Current chat ID   : {current_chat or '(not set)'}")
-    print()
-    try:
-        use_telegram = (
-            input("  Configure Telegram notifications? [y/N]: ").strip().lower()
-        )
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-
-    telegram_bot_token = current_token
-    telegram_chat_id = current_chat
-
-    if use_telegram in ("y", "yes"):
-        try:
-            token_input = input(f"  Bot token [{masked_token}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if token_input:
-            telegram_bot_token = token_input
-        try:
-            chat_input = input(f"  Chat ID [{current_chat or ''}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if chat_input:
-            telegram_chat_id = chat_input
-
-    # --- Summary ---
-    print()
-    print("  Supervisor Config Summary")
-    print("  " + "\u2500" * 30)
-    print(f"  Poll interval    : {poll_interval} seconds")
-    print(f"  Health check port: {health_port}")
-    print(f"  Keep releases    : {keep_releases}")
-    masked_final = (
-        ("***" + telegram_bot_token[-4:])
-        if len(telegram_bot_token) > 4
-        else telegram_bot_token
-    )
-    print(f"  Telegram token   : {masked_final or '(not set)'}")
-    print(f"  Telegram chat ID : {telegram_chat_id or '(not set)'}")
-    print()
-    try:
-        confirm = input("  Proceed? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if confirm in ("n", "no"):
-        print("  Aborted.")
-        sys.exit(0)
-
-    # --- Save ---
-    cfg["poll_interval"] = poll_interval
-    cfg["health_port"] = health_port
-    cfg["keep_releases"] = keep_releases
-    cfg["telegram_bot_token"] = telegram_bot_token
-    cfg["telegram_chat_id"] = telegram_chat_id
-
-    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-    print()
-    print(f"  Supervisor config saved to {cfg_path}")
-    print()
-
-
-def reconfigure_wizard(supervisor=False):
-    """Interactive reconfigure wizard for Evonic (CLI).
-
-    Args:
-        supervisor: If True, run the supervisor-specific reconfigure wizard
-                    instead of the full platform reconfigure wizard.
-    """
-    if supervisor:
-        return _reconfigure_supervisor_wizard()
-
-    import getpass
-
-    db = _get_db()
-    if not db.has_super_agent():
-        print("Setup has not been completed yet. No super agent exists.")
-        print("Please run 'evonic setup' first to configure your platform.")
-        sys.exit(1)
-
-    from backend.setup import (
-        LANGUAGE_PRESETS,
-        PROVIDER_DEFAULTS,
-        build_sandbox_image,
-        check_docker_available,
-        run_reconfigure,
-        test_connection,
-    )
-
-    # ── Load current configuration from DB ──
-    super_agent = db.get_super_agent()
-    agent_id = super_agent["id"]
-
-    current_language = db.get_setting("agent_language", "english")
-    current_sandbox = db.get_setting("sandbox_default_enabled", "0") == "1"
-
-    # Determine current provider/model by checking which setup_* model exists
-    current_provider = "ollama"
-    current_model_name = ""
-    current_base_url = ""
-    for pid in PROVIDER_DEFAULTS:
-        model = db.get_model_by_id(f"setup_{pid}")
-        if model:
-            current_provider = pid
-            current_model_name = model.get("model_name", "")
-            current_base_url = model.get("base_url", "")
-            break
-
-    # ── Banner ──
-    print()
-    print("  Evonic Reconfigure")
-    print("  " + "=" * 20)
-    print()
-
-    # ── Step 1: Provider ──
-    providers = list(PROVIDER_DEFAULTS.items())
-    print("  Select your LLM provider:")
-    print()
-    for i, (pid, p) in enumerate(providers, 1):
-        mark = " (current)" if pid == current_provider else ""
-        print(f"    [{i}] {p['label']:<12} {p['description']}{mark}")
-    print()
-    current_idx = 1
-    for i, (pid, _) in enumerate(providers, 1):
-        if pid == current_provider:
-            current_idx = i
-            break
-    try:
-        choice = input(f"  Choice [{current_idx}]: ").strip() or str(current_idx)
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    try:
-        idx = int(choice) - 1
-        if idx < 0 or idx >= len(providers):
-            raise ValueError
-    except ValueError:
-        print("  Invalid choice.")
-        sys.exit(1)
-
-    provider_id, provider_cfg = providers[idx]
-    print(f"\n  Selected: {provider_cfg['label']}")
-    # ── Step 2: Base URL ──
-    # If provider changed, use the new provider's default; otherwise use current
-    if provider_id == current_provider and current_base_url:
-        default_url = current_base_url
-    else:
-        default_url = provider_cfg["base_url"]
-    print()
-    if provider_id == "custom":
-        try:
-            print("  eg: http://192.168.1.7:8080/v1")
-            prompt = f"  Base URL [{default_url}]: " if default_url else "  Base URL: "
-            base_url = input(prompt).strip() or default_url
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if not base_url:
-            print("  Base URL is required for custom provider.")
-            sys.exit(1)
-    else:
-        try:
-            entered = input(f"  Base URL [{default_url}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        base_url = entered or default_url
-
-    # ── Step 3: API Key ──
-    api_key = ""
-    if provider_cfg["api_key_required"]:
-        try:
-            api_key = getpass.getpass("  API Key: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if not api_key:
-            print("  API key is required for this provider.")
-            sys.exit(1)
-    else:
-        try:
-            api_key = getpass.getpass(
-                "  API Key (optional, press Enter to skip): "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-
-    # ── Step 4: Model name ──
-    if provider_id == current_provider and current_model_name:
-        placeholder = current_model_name
-    else:
-        placeholder = provider_cfg["placeholder_model"]
-    try:
-        model_name = input(f"  Model name [{placeholder}]: ").strip() or placeholder
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if not model_name:
-        print("  Model name is required.")
-        sys.exit(1)
-
-    # ── Step 5: Test connection ──
-    print()
-    print("  Testing connection...", end=" ", flush=True)
-    result = test_connection(base_url, api_key or None)
-    if result["success"]:
-        print(f"OK — {result['message']}")
-    else:
-        print(f"FAILED — {result['message']}")
-        try:
-            cont = input("  Continue anyway? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if cont not in ("y", "yes"):
-            print("  Aborted.")
-            sys.exit(1)
-
-    # ── Step 6: Language ──
-    languages = list(LANGUAGE_PRESETS.items())
-    print()
-    print("  Response language:")
-    print()
-    current_lang_idx = 1
-    for i, (lid, l) in enumerate(languages, 1):
-        mark = " (current)" if lid == current_language else ""
-        print(f"    [{i}] {l['label']:<14} {l['description']}{mark}")
-        if lid == current_language:
-            current_lang_idx = i
-    print()
-    try:
-        lang_choice = input(f"  Choice [{current_lang_idx}]: ").strip() or str(
-            current_lang_idx
-        )
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    try:
-        lidx = int(lang_choice) - 1
-        if lidx < 0 or lidx >= len(languages):
-            raise ValueError
-    except ValueError:
-        print("  Invalid choice.")
-        sys.exit(1)
-
-    language_id, _ = languages[lidx]
-
-    # ── Step 6: Docker Sandbox ──
-    sandbox_enabled = current_sandbox
-    print()
-    docker_status = check_docker_available()
-    if docker_status["available"]:
-        print(f"  Docker detected — {docker_status['message']}")
-        print()
-        sandbox_label = "enabled" if current_sandbox else "disabled"
-        print(f"  Sandbox execution is currently {sandbox_label}.")
-        try:
-            build_choice = input("  Toggle sandbox execution? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            sys.exit(1)
-        if build_choice in ("y", "yes"):
-            sandbox_enabled = not current_sandbox
-            if sandbox_enabled:
-                print()
-                print("  Building Docker sandbox image...", end=" ", flush=True)
-                build_result = build_sandbox_image()
-                if build_result["success"]:
-                    print("Done!")
-                    print(f"  {build_result['message']}")
-                else:
-                    print("FAILED")
-                    print(f"  {build_result['message']}")
-                    print("  Sandbox execution will remain disabled.")
-                    sandbox_enabled = False
-            else:
-                print("  Sandbox execution disabled.")
-    else:
-        print(f"  Docker not available — {docker_status['message']}")
-        print("  Sandbox execution will be disabled.")
-        sandbox_enabled = False
-
-    # ── Step 7: Confirm ──
-    print()
-    print("  Reconfigure Summary")
-    print("  " + "─" * 30)
-    print(f"  Provider       : {provider_cfg['label']}")
-    print(f"  Base URL       : {base_url}")
-    print(f"  Model          : {model_name}")
-    print(f"  Language       : {LANGUAGE_PRESETS[language_id]['label']}")
-    print(f"  Sandbox        : {'Enabled' if sandbox_enabled else 'Disabled'}")
-    print()
-    try:
-        confirm = input("  Proceed? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
-        sys.exit(1)
-    if confirm in ("n", "no"):
-        print("  Aborted.")
-        sys.exit(0)
-
-    # ── Execute reconfigure ──
-    print()
-    print("  Reconfiguring platform...", end=" ", flush=True)
-    outcome = run_reconfigure(
-        provider=provider_id,
-        model_name=model_name,
-        base_url=base_url,
-        api_key=api_key,
-        language=language_id,
-        sandbox_enabled=sandbox_enabled,
-    )
-    if outcome.get("error"):
-        print(f"FAILED\n  Error: {outcome['error']}")
-        sys.exit(1)
-
-    print("Done!")
-    print()
-    print("  Platform reconfigured successfully.")
-    print()
-
-    # ── Step 8: Optional password change ──
-    try:
-        import config
-
-        current_hash = config.ADMIN_PASSWORD_HASH
-    except Exception:
-        current_hash = ""
-    if current_hash:
-        try:
-            pw_choice = input("  Change admin password? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Done.")
-            return
-        if pw_choice not in ("y", "yes"):
-            print("  Password unchanged.")
-            print()
-            return
-    else:
-        print("  No admin password set. Create one for the web dashboard.")
-        try:
-            pw_choice = input("  Set password? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Done.")
-            return
-        if pw_choice in ("n", "no"):
-            print("  Password skipped.")
-            print()
-            return
-
-    import getpass as gp
-
-    from werkzeug.security import generate_password_hash
-
-    env_path = os.path.join(ROOT, ".env")
-    while True:
-        try:
-            pw1 = gp.getpass("  Password: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            return
-        if not pw1:
-            print(
-                "  Warning: Password not set. Web dashboard can be accessed without login."
-            )
-            break
-        if len(pw1) < 6:
-            print("  Error: Password must be at least 6 characters. Try again.")
-            continue
-        try:
-            pw2 = gp.getpass("  Confirm password: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            return
-        if pw1 != pw2:
-            print("  Error: Passwords do not match. Try again.")
-            continue
-        new_hash = generate_password_hash(pw1, method="pbkdf2:sha256")
-
-        _update_env_var(env_path, "ADMIN_PASSWORD_HASH", new_hash)
-        print("  Password set successfully.")
-        break
-    print()
-
-
 def _update_env_var(env_path, key, value):
     """Update or add an environment variable in a .env file.
 
@@ -3000,128 +2550,149 @@ def _update_env_var(env_path, key, value):
 # ─── Update / Self-Update ──────────────────────────────────────────────────────
 
 
-def _load_supervisor_module():
-    """Import supervisor.py from the supervisor/ directory."""
-    sup_path = os.path.join(ROOT, "supervisor")
-    if sup_path not in sys.path:
-        sys.path.insert(0, sup_path)
-    import importlib
-
-    return importlib.import_module("supervisor")
-
-
-def _get_supervisor_pid():
-    """Read the running supervisor's PID, or None."""
-    sup_pid_file = os.path.join(ROOT, "supervisor", "run", "supervisor.pid")
-    if not os.path.exists(sup_pid_file):
-        return None
-    try:
-        with open(sup_pid_file) as f:
-            return int(f.read().strip())
-    except (ValueError, IOError):
-        return None
-
-
 def update_server(
     check_only=False, force=False, tag=None, rollback_flag=False, nightly=False
 ):
     """
-    Trigger or run a self-update.
+    Update evonic to the latest release tag via the shared apply pipeline
+    (reset → reinstall deps → doctor --fix → smoke test → auto-rollback on
+    failure), so the CLI and the web updater behave identically.
+
+    In the flat-repo architecture, the project root IS the live directory.
 
     Modes:
-    - check_only: fetch tags, report what is available, no update applied
-    - rollback_flag: swap back to the previous release
-    - default: signal running supervisor (SIGUSR1) or run update inline
-    - tag: target a specific tag instead of latest
-    - nightly: fetch origin/main and run full update lifecycle (no tags)
+    - check_only: fetch and report current version vs latest tag
+    - default: update to the latest vX.Y.Z tag GREATER than the current version
+    - tag=X: update to a specific tag
+    - nightly: track origin/main instead of release tags
+    - rollback_flag: restore the previously recorded commit
     """
-    sup = _load_supervisor_module()
-    cfg_path = os.path.join(ROOT, "supervisor", "config.json")
-    cfg = sup.load_config(cfg_path)
-    app_root = cfg["app_root"]
+    import re
 
-    # Update root project first to keep CLI/supervisor code up-to-date.
-    # Use fetch + reset instead of pull --ff-only so diverged branches
-    # don't block the update (the root project should always track remote).
-    print("Updating root project from origin/main...")
-    rc, _, err = sup._git(app_root, ['fetch', 'origin', 'main'])
+    def _git(args):
+        """Run a git command in the project root."""
+        proc = subprocess.run(
+            ["git"] + args,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+    def _parse_semver(s):
+        m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (s or "").strip())
+        return tuple(int(x) for x in m.groups()) if m else None
+
+    def _vstr(ver):
+        return "v%d.%d.%d" % ver if ver else "unknown"
+
+    def _current_version():
+        """Current version from the VERSION file, falling back to git describe."""
+        try:
+            with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as f:
+                ver = _parse_semver(f.read())
+                if ver:
+                    return ver
+        except Exception:
+            pass
+        rc, out, _ = _git(["describe", "--tags", "--abbrev=0"])
+        return _parse_semver(out) if rc == 0 else None
+
+    def _latest_tag():
+        """Highest vX.Y.Z tag known to git, as (name, version_tuple)."""
+        rc, out, _ = _git(["tag", "-l", "--sort=-v:refname"])
+        if rc != 0:
+            return None, None
+        for line in out.splitlines():
+            ver = _parse_semver(line)
+            if ver:
+                return line.strip(), ver
+        return None, None
+
+    # Rollback to the previous version. Reuses the shared rollback core so the
+    # CLI and the web UI restore the same recorded commit and repair identically.
+    if rollback_flag:
+        print("Rolling back to the previous version...")
+        from backend import update_manager
+        result = update_manager.apply_rollback()
+        if "error" in result:
+            print(result["error"])
+            sys.exit(1)
+        print(f"Rollback complete — now at {result['target'][:8]}.")
+        return
+
+    # Nightly channel: track origin/main instead of release tags.
+    if nightly:
+        print("Fetching origin/main (nightly)...")
+        rc, _, err = _git(["fetch", "origin", "main", "--tags"])
+        if rc != 0:
+            print(f"Git fetch failed: {err}")
+            sys.exit(1)
+        if check_only:
+            rc, cur, _ = _git(["rev-parse", "--short", "HEAD"])
+            rc2, rem, _ = _git(["rev-parse", "--short", "origin/main"])
+            print(f"Current     : {cur if rc == 0 else 'unknown'}")
+            print(f"origin/main : {rem if rc2 == 0 else 'unknown'}")
+            return
+        print("Applying update (origin/main)...")
+        from backend import update_manager
+        result = update_manager.apply_update("origin/main")
+        if "error" in result:
+            print(result["error"])
+            sys.exit(1)
+        print("Update complete.")
+        return
+
+    # Release channel: update to a release tag (vX.Y.Z).
+    # --force so a locally-diverged release tag ("would clobber existing tag")
+    # is re-synced to the remote rather than aborting the update.
+    print("Fetching tags from origin...")
+    rc, _, err = _git(["fetch", "--tags", "--force", "origin"])
     if rc != 0:
         print(f"Git fetch failed: {err}")
         sys.exit(1)
-    rc, _, err = sup._git(app_root, ['reset', '--hard', 'FETCH_HEAD'])
-    if rc != 0:
-        print(f"Git reset failed: {err}")
-        sys.exit(1)
-    print("Root project updated.")
 
-    if rollback_flag:
-        print("Rolling back to previous release...")
-        ok = sup.rollback(app_root, cfg, None)
-        sys.exit(0 if ok else 1)
+    current = _current_version()
+
+    if tag:
+        target_name = tag if tag.startswith("v") else "v" + tag
+        target_ver = _parse_semver(target_name)
+        if not target_ver:
+            print(f"Invalid tag '{tag}'. Expected format vX.Y.Z (e.g. v0.8.0).")
+            sys.exit(1)
+    else:
+        target_name, target_ver = _latest_tag()
+        if not target_name:
+            print("No release tags (vX.Y.Z) found on origin.")
+            sys.exit(1)
+
+    print(f"Current    : {_vstr(current)}")
+    print(f"Latest tag : {target_name}")
+
+    is_newer = bool(target_ver and current and target_ver > current)
 
     if check_only:
-        if nightly:
-            print("Fetching origin/main...")
-            ok, err = sup.git_fetch_branch(app_root, "main")
-            if not ok:
-                print(f"Fetch failed: {err}")
-                sys.exit(1)
-            rc, sha, _ = sup._git(app_root, ["rev-parse", "--short", "origin/main"])
-            current = sup.get_current_release(app_root)
-            print(f"Current      : {current or '(none — flat repo mode)'}")
-            print(f"origin/main  : {sha if rc == 0 else 'unknown'}")
-            return
-        print("Fetching tags...")
-        sup.git_fetch_tags(app_root)
-        current = sup.get_current_release(app_root)
-        latest = sup.get_latest_tag(app_root)
-        print(f"Current : {current or '(none — flat repo mode)'}")
-        print(f"Latest  : {latest or '(no tags found)'}")
-        if latest and latest != current:
-            print(f"Update available: {current} -> {latest}")
-        elif latest:
+        if is_newer:
+            print(f"Update available: {_vstr(current)} -> {target_name}")
+        else:
             print("Already up to date.")
         return
 
-    if nightly:
-        # Nightly: always run inline (no supervisor signal)
-        print("Fetching origin/main (nightly)...")
-        ok, err = sup.git_fetch_branch(app_root, "main")
-        if not ok:
-            print(f"Fetch failed: {err}")
-            sys.exit(1)
-        rc, sha, _ = sup._git(app_root, ["rev-parse", "--short", "origin/main"])
-        print(f"Updating to nightly (origin/main @ {sha if rc == 0 else 'unknown'})...")
-        ok = sup.run_update("main", cfg, None, skip_verify=True, nightly=True)
-        sys.exit(0 if ok else 1)
-
-    # Signal running supervisor for immediate check
-    if not sup.is_windows():
-        spid = _get_supervisor_pid()
-        if spid and _is_running(spid):
-            try:
-                os.kill(spid, signal.SIGUSR1)
-                print(f"Sent update trigger to supervisor (PID {spid})")
-                return
-            except OSError:
-                pass
-
-    # Supervisor not running — run update inline
-    print("Supervisor not running. Running update inline...")
-    sup.git_fetch_tags(app_root)
-    target = tag or sup.get_latest_tag(app_root)
-    if not target:
-        print("No tags found — nothing to update.")
-        sys.exit(1)
-
-    current = sup.get_current_release(app_root)
-    if target == current and not force:
-        print(f"Already at {target}.")
+    # The default (latest) path only proceeds when the tag is strictly newer
+    # than the current version. An explicit --tag bypasses this (allows pinning).
+    if not tag and not is_newer:
+        print(f"Already up to date (current {_vstr(current)}, latest {target_name}).")
         return
 
-    print(f"Updating to {target}...")
-    ok = sup.run_update(target, cfg, None, skip_verify=force)
-    sys.exit(0 if ok else 1)
+    print(f"Updating to {target_name}...")
+    from backend import update_manager
+    result = update_manager.apply_update(target_name)
+    if "error" in result:
+        print(result["error"])
+        print("Resolve local changes/conflicts, then re-run `evonic update`.")
+        sys.exit(1)
+
+    print(f"Update complete — now at {target_name}.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3143,15 +2714,18 @@ _PASS = f"{_G}✓{_RESET}"
 _FAIL = f"{_R}✗{_RESET}"
 _WARN = f"{_Y}⚠{_RESET}"
 _INFO = f"{_B}ℹ{_RESET}"
+_DOCTOR_COMPACT = False
 
 
 def _section(title):
-    print(f"\n{_BOLD}{_C}══ {title} ══{_RESET}")
+    if not _DOCTOR_COMPACT:
+        print(f"\n{_BOLD}{_C}══ {title} ══{_RESET}")
 
 
 def _ok(msg=""):
     line = f"  {_PASS}  {msg}" if msg else f"  {_PASS}"
-    print(line)
+    if not _DOCTOR_COMPACT:
+        print(line)
     return "pass"
 
 
@@ -3168,14 +2742,29 @@ def _warn(msg=""):
 
 
 def _info(msg):
-    print(f"  {_INFO}  {msg}")
+    if not _DOCTOR_COMPACT:
+        print(f"  {_INFO}  {msg}")
 
 
-def doctor_command(quick=False, fix=False, with_llm_provider=False):
+def evomem_install(force=False):
+    """Download and install the evomem memory-engine binary (latest release)."""
+    from backend.evomem_provision import ensure_evomem
+    result = ensure_evomem(force=force)
+    if result["ok"]:
+        _ok(result["msg"]) if result["installed"] else _info(result["msg"])
+    else:
+        _warn(result["msg"])
+    return 0 if result["ok"] else 1
+
+
+def doctor_command(quick=False, fix=False, with_llm_provider=False, verbose=False):
     """Run comprehensive system health diagnostics."""
     import importlib
     import json
     import platform
+
+    global _DOCTOR_COMPACT
+    _DOCTOR_COMPACT = fix and not verbose
 
     if fix:
         print(f"\n{_BOLD}{_C}🩺  Evonic Doctor (fix mode){_RESET}")
@@ -3208,9 +2797,6 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
         "SECRET_KEY",
         "DEBUG",
         "ADMIN_PASSWORD_HASH",
-        "SANDBOX_NETWORK",
-        "LOG_FULL_THINKING",
-        "LOG_FULL_RESPONSE",
     ]
     for var in important_vars:
         val = os.getenv(var)
@@ -3524,6 +3110,49 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
     except Exception as e:
         results.append(_fail(f"Skill check failed: {e}"))
 
+
+    # ── 6b. Sandbox Availability Check ─────────────────────────────────
+    _section("6b. Sandbox Availability Check")
+
+    try:
+        from models.db import db
+        agents = db.get_agents()
+        sandbox_agents = [
+            a for a in agents
+            if a.get("sandbox_enabled") and a.get("enabled")
+        ]
+
+        if not sandbox_agents:
+            results.append(_ok("No agents have sandbox enabled — skipping Docker check"))
+        else:
+            docker_available = False
+            try:
+                result = subprocess.run(
+                    ["docker", "info"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0:
+                    docker_available = True
+                    results.append(_ok("Docker is available and responsive"))
+                else:
+                    results.append(_warn(
+                        f"Docker CLI found but daemon returned exit code {result.returncode}"
+                    ))
+            except FileNotFoundError:
+                results.append(_warn("Docker is not installed or not in PATH"))
+            except subprocess.TimeoutExpired:
+                results.append(_warn("Docker daemon timed out — may be unresponsive"))
+            except Exception as e:
+                results.append(_warn(f"Docker check failed: {e}"))
+
+            if not docker_available:
+                names = [f"{a.get('name', a.get('id'))} ({a['id']})" for a in sandbox_agents]
+                results.append(_warn(
+                    f"Docker unavailable but {len(sandbox_agents)} agent(s) have "
+                    f"sandbox enabled: {', '.join(names)}"
+                ))
+    except Exception as e:
+        results.append(_fail(f"Sandbox agent check failed: {e}"))
     # ── 7. LLM Provider Check ────────────────────────────────
     _section("7. LLM Provider Check")
 
@@ -3588,84 +3217,8 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
                     results.append(_info("  No models with base_url to test"))
         except Exception as e:
             results.append(_fail(f"LLM check failed: {e}"))
-
-    # ── 8. Supervisor Config Check ──────────────────────────────────────────────
-    _section("8. Supervisor Config Check")
-
-    sup_cfg_path = os.path.join(ROOT, "supervisor", "config.json")
-    if os.path.isfile(sup_cfg_path):
-        _info("  supervisor/config.json found")
-        try:
-            with open(sup_cfg_path) as f:
-                sup_cfg = json.load(f)
-
-            # Validate app_root
-            app_root = sup_cfg.get("app_root", "")
-            if app_root and os.path.isdir(app_root):
-                results.append(_ok(f"  app_root: {app_root}"))
-            elif app_root:
-                results.append(
-                    _fail(
-                        f"  app_root '{app_root}' does not exist or is not a directory"
-                    )
-                )
-            else:
-                results.append(_fail("  app_root is not set in supervisor/config.json"))
-
-            # Validate numeric fields
-            for key, label, min_val in [
-                ("poll_interval", "poll_interval", 1),
-                ("health_port", "health_port", 1),
-                ("health_temp_port", "health_temp_port", 1),
-                ("health_timeout", "health_timeout", 1),
-                ("monitor_duration", "monitor_duration", 1),
-                ("keep_releases", "keep_releases", 1),
-            ]:
-                val = sup_cfg.get(key)
-                if isinstance(val, int) and val >= min_val:
-                    _info(f"  {label}: {val}")
-                else:
-                    results.append(
-                        _warn(f"  {label} is invalid or missing (got {val!r})")
-                    )
-
-            # Validate telegram_bot_token
-            token = sup_cfg.get("telegram_bot_token", "")
-            if token:
-                results.append(_ok("  telegram_bot_token is configured"))
-            else:
-                results.append(
-                    _warn(
-                        "  telegram_bot_token is empty — configure it for supervisor notifications. "
-                        "Set via super agent channel or edit supervisor/config.json manually."
-                    )
-                )
-
-            # Validate telegram_chat_id
-            chat_id = sup_cfg.get("telegram_chat_id", "")
-            if chat_id:
-                results.append(_ok("  telegram_chat_id is configured"))
-            else:
-                results.append(
-                    _warn(
-                        "  telegram_chat_id is empty — configure it for supervisor notifications. "
-                        "Set via super agent channel or edit supervisor/config.json manually."
-                    )
-                )
-
-        except json.JSONDecodeError as e:
-            results.append(_fail(f"  supervisor/config.json parse error: {e}"))
-        except Exception as e:
-            results.append(_fail(f"  supervisor/config.json validation error: {e}"))
-    else:
-        results.append(
-            _warn(
-                "  supervisor/config.json not found — self-update supervisor is not configured"
-            )
-        )
-
-    # ── 9. Artifact Tool Consistency Check ───────────────────────────────────
-    _section("9. Artifact Tool Consistency Check")
+    # ── 8. Artifact Tool Consistency Check ───────────────────────────────────
+    _section("8. Artifact Tool Consistency Check")
 
     try:
         from models.db import db
@@ -3697,8 +3250,11 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
             elif not artifacts_on and has_list:
                 spurious_list.append((aid, aname))
 
-            if artifacts_on and not has_fetch:
+            needs_fetch = a.get('workplace_id') is not None or a.get('sandbox_enabled', 0) == 1
+            if artifacts_on and needs_fetch and not has_fetch:
                 missing_fetch.append((aid, aname))
+            elif artifacts_on and not needs_fetch and has_fetch:
+                spurious_fetch.append((aid, aname))
             elif not artifacts_on and has_fetch:
                 spurious_fetch.append((aid, aname))
 
@@ -3823,8 +3379,8 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
     except Exception as e:
         results.append(_fail(f"Artifact tool check failed: {e}"))
 
-    # ── 10. Non-Lazy Skill Tool Consistency Check ─────────────────────────────
-    _section("10. Non-Lazy Skill Tool Consistency Check")
+    # ── 9. Non-Lazy Skill Tool Consistency Check ─────────────────────────────
+    _section("9. Non-Lazy Skill Tool Consistency Check")
 
     try:
         from models.db import db
@@ -3911,53 +3467,387 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
     except Exception as e:
         results.append(_fail(f"Non-lazy skill tool check failed: {e}"))
 
-    # ── 11. Evobrain Memory Engine Check ──
-    _section("11. Evobrain Memory Engine Check")
+    # ── 10. Orphaned Tool Assignment Check ───────────────────────────────────
+    _section("10. Orphaned Tool Assignment Check")
 
     try:
-        engine = os.environ.get("EVONIC_MEMORY_ENGINE", "evobrain").strip().lower()
+        from models.db import db
+        from backend.tools.registry import ToolRegistry, BUILTIN_TOOL_IDS
+        from backend.skills_manager import SkillsManager
+
+        agents = db.get_agents()
+        _tr = ToolRegistry()
+        _sm = SkillsManager()
+
+        # Build the set of all valid tool IDs
+        valid_tool_ids = set(BUILTIN_TOOL_IDS)
+
+        # Built-in factory tools (auto-injected, but may also appear in agent_tools)
+        for builtin_id in _tr._builtins:
+            # builtin_id is e.g. 'builtin:remember' → function name is 'remember'
+            fn_name = builtin_id.split(":", 1)[-1] if ":" in builtin_id else builtin_id
+            valid_tool_ids.add(fn_name)
+
+        # Regular tools from tools/*.json
+        for td in _tr.get_tool_defs_from_json():
+            tid = td.get("id") or td.get("function", {}).get("name")
+            if tid:
+                valid_tool_ids.add(tid)
+
+        # Skill tools: skill:<skill_id>:<fn_name>
+        for skill in _sm.list_skills():
+            skill_id = skill.get("id", "")
+            if not skill_id:
+                continue
+            skill_dir = os.path.join(ROOT, "skills", skill_id)
+            if not os.path.isdir(skill_dir):
+                continue
+            for td in _sm.get_skill_tool_defs(skill_id):
+                fn_name = td.get("function", {}).get("name", "")
+                if fn_name:
+                    valid_tool_ids.add(f"skill:{skill_id}:{fn_name}")
+
+        orphan_count = 0
+        for a in agents:
+            aid = a.get("id", "?")
+            aname = a.get("name", aid)
+            agent_tools = db.get_agent_tools(aid)
+
+            orphans = [t for t in agent_tools if t not in valid_tool_ids]
+            if orphans:
+                orphan_count += len(orphans)
+                orphan_list = ", ".join(sorted(orphans))
+                results.append(_warn(
+                    f"Agent '{aname}' ({aid}) has {len(orphans)} orphaned tool(s): "
+                    f"{orphan_list}"
+                ))
+
+                if fix:
+                    for tool_id in orphans:
+                        try:
+                            db.remove_agent_tool(aid, tool_id)
+                            fixes_applied.append(
+                                f"Removed orphaned tool '{tool_id}' from agent "
+                                f"'{aname}' ({aid})"
+                            )
+                        except Exception as e:
+                            results.append(_fail(
+                                f"Failed to remove tool '{tool_id}' from '{aid}': {e}"
+                            ))
+
+        if orphan_count == 0:
+            results.append(_ok("No orphaned tool assignments found"))
+
+    except Exception as e:
+        results.append(_fail(f"Orphaned tool check failed: {e}"))
+
+    # ── 10b. Super Agent Core Skills Migration ──
+    _section("10b. Super Agent Core Skills Migration")
+
+    try:
+        from models.db import db
+
+        agents = db.get_agents()
+        super_agents = [a for a in agents if a.get("is_super")]
+        core_skills = ["explorer"]
+
+        if not super_agents:
+            results.append(_ok("No super agents found — nothing to migrate"))
+        else:
+            migrated = 0
+            needs_fix = 0
+
+            for a in super_agents:
+                aid = a.get("id", "?")
+                aname = a.get("name", aid)
+                current_skills = db.get_agent_skills(aid)
+                missing = [s for s in core_skills if s not in current_skills]
+
+                if not missing:
+                    continue
+
+                needs_fix += 1
+                if fix:
+                    merged = current_skills + missing
+                    db.set_agent_skills(aid, merged)
+                    results.append(_ok(
+                        f"Super agent '{aname}' ({aid}): added missing "
+                        f"core skills: {', '.join(missing)}"
+                    ))
+                    fixes_applied.append(
+                        f"Added core skills {', '.join(missing)} to "
+                        f"super agent '{aname}' ({aid})"
+                    )
+                    migrated += 1
+                else:
+                    results.append(_warn(
+                        f"Super agent '{aname}' ({aid}) is missing core "
+                        f"skills: {', '.join(missing)}. Run "
+                        f"`evonic doctor --fix` to auto-add them."
+                    ))
+
+            if migrated > 0:
+                results.append(_ok(
+                    f"Migrated {migrated} super agent(s) with missing core skills"
+                ))
+            elif needs_fix == 0:
+                results.append(_ok("All super agents have required core skills"))
+
+    except Exception as e:
+        results.append(_fail(f"Super agent core skills migration check failed: {e}"))
+
+    # ── 11. Evomem Memory Engine Check ──────────────────────────────────────
+    _section("11. Evomem Memory Engine Check")
+
+    try:
+        from cli import evomem_update as _evup
+
+        engine = os.environ.get("EVONIC_MEMORY_ENGINE", "evomem").strip().lower()
         engine_explicit = "EVONIC_MEMORY_ENGINE" in os.environ
-        binary_path = os.environ.get("EVOBRAIN_BINARY", "shared/bin/evobrain")
+        binary_path = os.environ.get("EVOMEM_BINARY", "shared/bin/evomem")
         binary_full = os.path.join(ROOT, binary_path) if not os.path.isabs(binary_path) else binary_path
         binary_ok = os.path.isfile(binary_full) and os.access(binary_full, os.X_OK)
 
-        # Check custom EVOBRAIN_BINARY path
-        if "EVOBRAIN_BINARY" in os.environ and not binary_ok:
+        # Check custom EVOMEM_BINARY path
+        custom_binary = "EVOMEM_BINARY" in os.environ
+        if custom_binary and not binary_ok:
             results.append(_warn(
-                f"EVOBRAIN_BINARY is set to '{binary_path}' but binary not found "
+                f"EVOMEM_BINARY is set to '{binary_path}' but binary not found "
                 f"or not executable at {binary_full}"
             ))
 
-        if engine == "fts5":
-            _info("  Memory engine is FTS5 (evobrain not used)")
-        elif binary_ok:
-            results.append(_ok("Evobrain memory engine available"))
-        elif engine_explicit:
-            results.append(_fail(
-                f"EVONIC_MEMORY_ENGINE=evobrain is set but binary not found at "
-                f"{binary_full}. Set EVONIC_MEMORY_ENGINE=fts5 to use fallback, "
-                f"or install the evobrain binary."
-            ))
-        else:
-            results.append(_warn(
-                f"Evobrain is the default memory engine but binary not found at "
-                f"{binary_full}. Evobrain features (think, graph_query) will "
-                f"silently fall back to FTS5."
-            ))
+        # Consult GitHub for the latest release (best-effort, networked). Skipped
+        # in quick mode or when EVONIC_SKIP_EVOMEM_UPDATE_CHECK is set.
+        update_check = (
+            engine != "fts5"
+            and not quick
+            and os.environ.get("EVONIC_SKIP_EVOMEM_UPDATE_CHECK", "").strip().lower()
+            not in ("1", "true", "yes")
+        )
+        release = _evup.latest_release() if update_check else None
 
-        # Fix: provide actionable message + create directory if needed
-        if not binary_ok and engine != "fts5" and fix:
-            _info(
-                "  To install evobrain: place the static binary at "
-                "shared/bin/evobrain and make it executable (chmod +x)."
-            )
-            bin_dir = os.path.dirname(binary_full)
-            if not os.path.isdir(bin_dir):
-                os.makedirs(bin_dir, exist_ok=True)
-                fixes_applied.append(f"Created directory {bin_dir} for evobrain binary")
+        def _install_latest(action):
+            """Download + install the latest asset for this host. Returns True on
+            success. `action` is 'Updated'/'Installed' for the status line."""
+            target = _evup.host_target()
+            url = (release.get("assets") or {}).get(target) if release else None
+            if not url:
+                results.append(_warn(
+                    f"No evomem release asset for this platform "
+                    f"({target or 'unsupported'}); update/install manually."
+                ))
+                return False
+            try:
+                _evup.download_and_install(url, binary_full)
+                results.append(_ok(f"{action} evomem to {release['version']}"))
+                fixes_applied.append(f"{action} evomem to {release['version']}")
+                return True
+            except Exception as e:  # noqa: BLE001 — keep existing binary on failure
+                results.append(_warn(f"evomem {action.lower()} failed: {e}; "
+                                     f"existing binary kept."))
+                return False
+
+        if engine == "fts5":
+            _info("  Memory engine is FTS5 (evomem not used)")
+        elif binary_ok:
+            cur = _evup.current_version(binary_full)
+            if release and cur and _evup.is_outdated(cur, release["version"]):
+                latest = release["version"]
+                if fix:
+                    _install_latest("Updated")
+                else:
+                    results.append(_warn(
+                        f"evomem {cur} installed; {latest} available — run "
+                        f"`evonic doctor --fix` to update."
+                    ))
+            elif release and cur:
+                results.append(_ok(f"Evomem memory engine available (latest: {cur})"))
+            else:
+                results.append(_ok("Evomem memory engine available"))
+                if update_check and release is None:
+                    _info("  (could not check latest evomem version)")
+        else:
+            # Binary missing. Under --fix, try to install the latest first.
+            installed = fix and _install_latest("Installed")
+            if not installed:
+                if engine_explicit:
+                    results.append(_fail(
+                        f"EVONIC_MEMORY_ENGINE=evomem is set but binary not found at "
+                        f"{binary_full}. Set EVONIC_MEMORY_ENGINE=fts5 to use fallback, "
+                        f"or install the evomem binary."
+                    ))
+                else:
+                    results.append(_warn(
+                        f"Evomem is the default memory engine but binary not found at "
+                        f"{binary_full}. Evomem features (think, graph_query) will "
+                        f"silently fall back to FTS5."
+                    ))
+                if fix:
+                    _info(
+                        "  To install evomem: place the static binary at "
+                        "shared/bin/evomem and make it executable (chmod +x)."
+                    )
+                    bin_dir = os.path.dirname(binary_full)
+                    if not os.path.isdir(bin_dir):
+                        os.makedirs(bin_dir, exist_ok=True)
+                        fixes_applied.append(f"Created directory {bin_dir} for evomem binary")
 
     except Exception as e:
-        results.append(_fail(f"Evobrain check failed: {e}"))
+        results.append(_fail(f"Evomem check failed: {e}"))
+
+    # ── 11b. KB Organizer Config Check ────────────────────────
+    _section("11b. KB Organizer Config Check")
+    try:
+        env_path = os.path.join(ROOT, ".env")
+        key = "EVOMEM_KB_ORGANIZER_MIN_INTERVAL_SECONDS"
+        default_val = "1800"  # 30 minutes
+
+        in_file = False
+        if os.path.isfile(env_path):
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith(key + "=") or s.startswith("export " + key + "="):
+                        in_file = True
+                        break
+
+        if in_file:
+            results.append(_ok(f"{key} set in .env"))
+        elif fix:
+            _update_env_var(env_path, key, default_val)
+            results.append(_ok(
+                f"Added {key}={default_val} to .env "
+                f"(KB organizer min interval between filing runs — 30 min)"))
+            fixes_applied.append(f"Added {key}={default_val} to .env")
+        else:
+            results.append(_warn(
+                f"{key} not in .env (KB organizer min interval between filing runs; "
+                f"defaults to {default_val}s). Run `evonic doctor --fix` to add it."))
+    except Exception as e:
+        results.append(_fail(f"KB organizer config check failed: {e}"))
+
+    # ── 11c. Memory Engine + KB Organizer Compatibility ───
+    _section("11c. Memory Engine / KB Organizer Compatibility")
+    try:
+        from models.db import db as _db
+
+        global_engine = os.environ.get("EVONIC_MEMORY_ENGINE", "evomem").strip().lower()
+        global_kb_mode = os.environ.get("EVOMEM_KB_ORGANIZER", "sefton").strip().lower()
+
+        _evomem_required_modes = {"agentic", "sefton"}
+
+        _kb_mode_aliases = {
+            "on": "agentic", "1": "agentic", "yes": "agentic", "true": "agentic",
+            "nonagentic": "non-agentic", "legacy": "non-agentic",
+            "off": "off", "no": "off", "0": "off", "false": "off", "none": "off",
+        }
+        norm_global_kb = _kb_mode_aliases.get(global_kb_mode, global_kb_mode)
+
+        if global_engine == "fts5" and norm_global_kb in _evomem_required_modes:
+            results.append(_warn(
+                f"EVONIC_MEMORY_ENGINE=fts5 but EVOMEM_KB_ORGANIZER={global_kb_mode} "
+                f"— '{norm_global_kb}' mode requires evomem. Agents without a per-agent "
+                f"override will skip KB filing."
+            ))
+        else:
+            results.append(_ok(
+                f"Global defaults compatible "
+                f"(engine={global_engine}, kb_organizer={norm_global_kb})"
+            ))
+
+        agents = _db.get_agents() or []
+        bad_agents = []
+        for ag in agents:
+            ag_engine = (ag.get("memory_engine") or "").strip().lower() or global_engine
+            ag_kb = (ag.get("kb_organizer_mode") or "").strip().lower()
+            ag_kb_norm = _kb_mode_aliases.get(ag_kb, ag_kb) if ag_kb else norm_global_kb
+            if ag_engine == "fts5" and ag_kb_norm in _evomem_required_modes:
+                bad_agents.append((ag.get("name") or ag.get("id", "?"), ag_kb_norm))
+
+        if bad_agents:
+            for name, mode in bad_agents:
+                results.append(_warn(
+                    f"Agent '{name}': memory_engine=fts5 but "
+                    f"kb_organizer_mode={mode} (requires evomem)"
+                ))
+        elif agents:
+            results.append(_ok(
+                f"All {len(agents)} agent(s) have compatible engine/organizer settings"
+            ))
+    except Exception as e:
+        results.append(_fail(f"Engine/organizer compatibility check failed: {e}"))
+
+    # ── 11d. System Settings Consistency Check ──
+    _section("11d. System Settings Consistency Check")
+
+    import config as _cfg
+
+    _EXPECTED_SETTINGS = {
+        "theme": "system",
+        "vision_model_id": "",
+        "kb_organizer_model_id": "",
+        "task_classifier_enabled": "0",
+        "agent_timeout_retries": str(getattr(_cfg, "AGENT_TIMEOUT_RETRIES", 2)),
+        "llm_max_retries": "5",
+        "max_concurrent_llm_per_agent": "1",
+        "max_concurrent_llm_per_model": "0",
+        "max_concurrent_llm_global": "1",
+        "agent_queue_workers": str(getattr(_cfg, "AGENT_QUEUE_WORKERS", 5)),
+        "max_tool_iterations": str(getattr(_cfg, "AGENT_MAX_TOOL_ITERATIONS", 100)),
+        "agent_sidebar_limit": str(getattr(_cfg, "AGENT_SIDEBAR_LIMIT", 10)),
+        "public_history": "0",
+        "long_running_guard_enabled": (
+            "1" if getattr(_cfg, "LONG_RUNNING_GUARD_ENABLED", True) else "0"
+        ),
+        "root_fs_scan_guard_enabled": (
+            "1" if getattr(_cfg, "ROOT_FS_SCAN_GUARD_ENABLED", True) else "0"
+        ),
+        "message_wrapper_enabled": "1",
+        "events_dispatch_enabled": "1",
+    }
+
+    try:
+        from models.db import db as _ctl_db
+        missing = []
+        present = 0
+        for key, default_val in _EXPECTED_SETTINGS.items():
+            val = _ctl_db.get_setting(key)
+            if val is None:
+                missing.append((key, default_val))
+            else:
+                present += 1
+
+        if missing:
+            keys_str = ", ".join(k for k, _ in missing)
+            results.append(_warn(
+                f"{len(missing)} system setting(s) not initialized: {keys_str}"
+            ))
+            if fix:
+                fixed_count = 0
+                for key, default_val in missing:
+                    try:
+                        _ctl_db.set_setting(key, default_val)
+                        fixed_count += 1
+                    except Exception:
+                        pass
+                if fixed_count:
+                    fixes_applied.append(
+                        f"Seeded {fixed_count} missing system setting(s) with defaults"
+                    )
+                    results.append(_ok(
+                        f"Seeded {fixed_count} missing system setting(s)"
+                    ))
+            else:
+                _info(
+                    "  Run `evonic doctor --fix` to seed missing settings with "
+                    "defaults."
+                )
+        else:
+            results.append(_ok(
+                f"All {present} system settings present and accounted for"
+            ))
+    except Exception as e:
+        results.append(_fail(f"System settings check failed: {e}"))
 
     # ── 12. PromptPurify ML Safety Check ──
     _section("12. PromptPurify ML Safety Check")
@@ -4167,6 +4057,271 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
         results.append(_fail(f"Asset build check failed: {e}"))
 
 
+    # ── 14. Database Schema / Query Health Check ──────────────
+    _section("14. Database Schema / Query Health Check")
+    try:
+        import sqlite3 as _sqlite3
+        from models.db import db as _schema_db
+
+        dashboard_queries = [
+            ("dashboard stats", _schema_db.get_dashboard_stats),
+            ("model usage", _schema_db.get_model_usage),
+            ("model leaderboard", _schema_db.get_model_leaderboard),
+            ("recent agents", _schema_db.get_recent_agents),
+            ("recent runs", _schema_db.get_recent_runs),
+        ]
+        schema_ok = True
+        for q_name, q_fn in dashboard_queries:
+            try:
+                q_fn()
+            except _sqlite3.OperationalError as qe:
+                schema_ok = False
+                results.append(_fail(f"{q_name} query failed — schema mismatch: {qe}"))
+            except Exception as qe:
+                results.append(_warn(f"{q_name} query raised {type(qe).__name__}: {qe}"))
+        if schema_ok:
+            results.append(_ok("Dashboard queries match the current database schema"))
+        else:
+            _info("  A column referenced by a query is missing from the schema "
+                  "(commonly a rename/drop that left a query un-updated).")
+    except Exception as e:
+        results.append(_fail(f"Database schema check failed: {e}"))
+
+
+    # ── 15. Core Explore Skills Check ─────────────────────────
+    _section("15. Core Explore Skills Check")
+    try:
+        from backend.skills_manager import SkillsManager, CORE_SKILL_IDS
+
+        sm = SkillsManager()
+        for sid in sorted(CORE_SKILL_IDS):
+            manifest_path = os.path.join(ROOT, "skills", sid, "skill.json")
+            if not os.path.isfile(manifest_path):
+                results.append(_fail(
+                    f"Core skill '{sid}' is missing — the Explore agent requires it. "
+                    f"Reinstall it under skills/{sid}/."
+                ))
+            elif not sm.is_skill_enabled(sid):
+                results.append(_fail(
+                    f"Core skill '{sid}' is installed but disabled — the Explore agent "
+                    f"requires it. Re-enable it (it cannot normally be disabled)."
+                ))
+            else:
+                results.append(_ok(f"Core skill '{sid}' present and enabled"))
+    except Exception as e:
+        results.append(_fail(f"Core skill check failed: {e}"))
+
+
+    # ── 16. Skill/Plugin Requirements Check ───────────────────
+    _section("16. Skill/Plugin Requirements Check")
+    try:
+        import logging as _logging
+        from cli import requirements_check as _rc
+
+        # gather_requirements() imports the plugin manager, which emits noisy
+        # apscheduler INFO logs on first import — quiet them for a clean report.
+        _aps = _logging.getLogger("apscheduler")
+        _aps_level = _aps.level
+        _aps.setLevel(_logging.WARNING)
+        try:
+            records = _rc.gather_requirements()
+        finally:
+            _aps.setLevel(_aps_level)
+
+        if not records:
+            _info("  No additional skill/plugin requirements declared")
+        for rec in records:
+            binary = rec["binary"]
+            name = binary["name"]
+            src = f"{rec['source_type']} '{rec['source_id']}'"
+            res = _rc.check_binary(binary)
+
+            if res["status"] == "ok":
+                ver = f" {res['current']}" if res["current"] else ""
+                results.append(_ok(f"{name}{ver} — required by {src}"))
+                continue
+
+            if res["status"] == "outdated":
+                problem = (f"{name} {res['current']} installed; {res['required']}+ "
+                           f"required by {src}")
+            elif res["status"] == "unknown":
+                problem = (f"{name} found but its version could not be determined "
+                           f"({res['required']}+ required by {src})")
+            else:  # missing
+                problem = f"{name} not found on PATH — required by {src}"
+
+            has_script = bool(binary.get("fix_script"))
+            if fix and has_script:
+                # Stream the fix_script's real-time stdout/stderr in a left-rail
+                # gutter — a clean header, a dim "│" margin per line, and a
+                # closing tick. A gutter (vs. a closed box) stays aligned even
+                # when long lines wrap.
+                print(f"  {_DIM}╭─{_RESET} {_BOLD}{name}{_RESET} {_DIM}install · {rec['source_id']}/{binary['fix_script']}{_RESET}")
+                # Truncate each streamed line to the terminal width so long lines
+                # (URLs, paths) stay on one row instead of wrapping and breaking
+                # the rail. Prefix "  │ " is 4 visible columns.
+                _rail_w = max(20, shutil.get_terminal_size((100, 24)).columns - 4)
+
+                def _rail(ln):
+                    if len(ln) > _rail_w:
+                        ln = ln[:_rail_w - 1] + "…"
+                    print(f"  {_DIM}│{_RESET} {ln}")
+
+                outcome = _rc.run_fix_script(binary, rec["dir"], on_output=_rail)
+                recheck = _rc.check_binary(binary)
+                # Close the rail with the outcome — the rail terminator doubles
+                # as the result line, so there's no duplicate status line.
+                if outcome.get("ran") and recheck["status"] == "ok":
+                    ver = f" {recheck['current']}" if recheck["current"] else ""
+                    print(f"  {_DIM}╰─{_RESET} {_G}✓{_RESET} Installed {name}{ver} "
+                          f"(required by {src})")
+                    results.append("pass")
+                    fixes_applied.append(f"Installed {name} for {src}")
+                else:
+                    detail = outcome.get("error") or "see output above"
+                    print(f"  {_DIM}╰─{_RESET} {_Y}⚠{_RESET} {problem}; "
+                          f"fix_script did not resolve it ({detail})")
+                    results.append("warn")
+            else:
+                results.append(_warn(problem))
+                if has_script:
+                    _info(f"  Run `evonic doctor --fix` to install {name} automatically.")
+                else:
+                    _info(f"  Install {name} manually (no fix_script declared by {src}).")
+    except Exception as e:
+        results.append(_fail(f"Requirements check failed: {e}"))
+
+
+    # ── 17. Channel Integrations Check ────────────────────────
+    _section("17. Channel Integrations Check")
+    try:
+        from models.db import db as _chan_db
+
+        # Map channel type -> (import module, pip package) for dependency checks.
+        _channel_deps = {
+            'telegram': ('telegram', 'python-telegram-bot'),
+            'discord': ('discord', 'discord.py'),
+        }
+        configured_types = set()
+        for agent in _chan_db.get_agents():
+            for ch in _chan_db.get_channels(agent['id']):
+                if ch.get('enabled'):
+                    configured_types.add(ch.get('type'))
+
+        if not configured_types:
+            _info("  No channels configured — skipping")
+        else:
+            for ctype in sorted(configured_types):
+                dep = _channel_deps.get(ctype)
+                if not dep:
+                    _info(f"  {ctype}: no dependency check available")
+                    continue
+                module_name, pkg_name = dep
+                try:
+                    mod = importlib.import_module(module_name)
+                    ver = getattr(mod, "__version__", "?")
+                    results.append(_ok(f"{ctype} library available ({pkg_name}=={ver})"))
+                except ImportError:
+                    results.append(_fail(
+                        f"{ctype} channel enabled but {pkg_name} not installed "
+                        f"— run: pip install {pkg_name}"
+                    ))
+            if 'discord' in configured_types:
+                _info("  Discord requires the Message Content Intent "
+                      "(Bot → Privileged Gateway Intents in the Developer Portal).")
+    except Exception as e:
+        results.append(_warn(f"Channel integrations check failed: {e}"))
+
+    # ── 17b. WhatsApp Bridge Check ────────────────────────────
+    _section("17b. WhatsApp Bridge Check")
+    try:
+        from models.db import db as _wa_db
+
+        _wa_channels = []
+        for agent in _wa_db.get_agents():
+            for ch in _wa_db.get_channels(agent['id']):
+                if ch.get('type') in ('whatsapp', 'whatsapp_shared') and ch.get('enabled'):
+                    _wa_channels.append((agent, ch))
+
+        if not _wa_channels:
+            _info("  No enabled WhatsApp channels — skipping")
+        else:
+            # node runtime
+            node_path = shutil.which('node')
+            if node_path:
+                try:
+                    node_ver = subprocess.check_output(
+                        ['node', '--version'], text=True, timeout=10).strip()
+                    results.append(_ok(f"node available ({node_ver})"))
+                except Exception:
+                    results.append(_ok("node available"))
+            else:
+                results.append(_fail("node not found in PATH — WhatsApp bridge cannot start"))
+
+            # bridge npm dependencies
+            _bridge_dir = os.path.join(ROOT, 'backend', 'channels', 'whatsapp-bridge')
+            if os.path.isdir(os.path.join(_bridge_dir, 'node_modules')):
+                results.append(_ok("whatsapp-bridge npm dependencies installed"))
+            else:
+                results.append(_warn(
+                    "whatsapp-bridge node_modules missing — will npm install on first start"))
+
+            import requests as _wa_requests
+            for agent, ch in _wa_channels:
+                label = f"{agent.get('name') or agent['id']} ({str(ch['id'])[:8]})"
+                cfg = ch.get('config') if isinstance(ch.get('config'), dict) else {}
+                port = int(cfg.get('bridge_port', 3001))
+
+                # Session / pairing state
+                creds_file = os.path.join(
+                    ROOT, 'data', 'whatsapp-sessions', ch['id'], 'creds.json')
+                if os.path.isfile(creds_file):
+                    try:
+                        with open(creds_file) as f:
+                            _creds = json.load(f)
+                        if (_creds.get('me') or {}).get('lid'):
+                            results.append(_ok(f"{label}: session paired (LID present)"))
+                        else:
+                            results.append(_warn(
+                                f"{label}: session paired but creds lack LID — group "
+                                f"@mentions may not be detected; re-scan QR to refresh"))
+                    except Exception:
+                        results.append(_warn(f"{label}: creds.json unreadable"))
+                else:
+                    results.append(_warn(f"{label}: no session — QR scan required"))
+
+                # Live bridge probe (works cross-process — bridge listens on 127.0.0.1)
+                try:
+                    _st = _wa_requests.get(
+                        f"http://127.0.0.1:{port}/status", timeout=3).json().get('status')
+                    if _st == 'connected':
+                        results.append(_ok(f"{label}: bridge connected (port {port})"))
+                    elif _st == 'qr_pending':
+                        results.append(_warn(
+                            f"{label}: bridge waiting for QR scan (port {port}) — "
+                            f"open the agent page and scan"))
+                    else:
+                        results.append(_warn(
+                            f"{label}: bridge running but disconnected (port {port})"))
+                except Exception:
+                    results.append(_warn(
+                        f"{label}: bridge not reachable on port {port} "
+                        f"(server not running, or channel failed to start)"))
+
+                # Group reachability in restricted mode
+                if cfg.get('mode') == 'restricted':
+                    _allowed = cfg.get('allowed_users') or []
+                    _has_group = any(
+                        '-' in str(u) or str(u).startswith('120')
+                        for u in _allowed)
+                    if not _has_group:
+                        results.append(_warn(
+                            f"{label}: restricted mode with no group ID in allowed_users "
+                            f"— group messages will be dropped silently"))
+    except Exception as e:
+        results.append(_warn(f"WhatsApp bridge check failed: {e}"))
+
+
     _section("Summary")
 
     # Filter out "skip" entries
@@ -4195,7 +4350,11 @@ def doctor_command(quick=False, fix=False, with_llm_provider=False):
     else:
         print(f"\n{_G}{_BOLD}  All checks passed. System is healthy!{_RESET}")
 
+    if not fix and (failed > 0 or warnings > 0):
+        print(f"\n  {_DIM}Tip: run{_RESET} {_BOLD}evonic doctor --fix{_RESET} {_DIM}to auto-fix fixable issues.{_RESET}")
+
     print()
+    _DOCTOR_COMPACT = False
     return 0 if failed == 0 else 1
 
 
@@ -4279,7 +4438,6 @@ import sqlite3
 import tarfile
 import glob
 import shutil
-import getpass
 from datetime import datetime as _datetime
 
 try:
@@ -4287,13 +4445,6 @@ try:
 except ImportError:
     def _get_evonic_version():
         return _datetime.now().strftime("%Y%m%d")
-
-# Encryption support (pure Python AES-256-GCM)
-try:
-    from cli.backup_crypto import encrypt_file_aes256gcm, decrypt_file_aes256gcm
-    _ENCRYPTION_AVAILABLE = True
-except ImportError:
-    _ENCRYPTION_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Backup source definitions
@@ -4304,7 +4455,7 @@ except ImportError:
 
 def _build_backup_sources():
     """Return the list of backup sources as (rel_path, label, is_db, is_glob)."""
-    sources = [
+    backup_sources = [
         # 1. Agent runtime data
         ("agents/", "Agent runtime data", False, True),
         # 2. Shared agent KB files
@@ -4337,12 +4488,12 @@ def _build_backup_sources():
         # 14. Plan files
         ("plan/", "Agent plan files", False, True),
     ]
-    return sources
+    return backup_sources
 
 
 # Excluded paths (relative to ROOT)
 _EXCLUDED_PATTERNS = [
-    "backend/", "cli/", "app.py", "config.py", "routes/", "releases/", "current/",
+    "backend/", "cli/", "app.py", "config.py", "routes/",
     "plugins/",  # source code excluded; data + config.json included via specific patterns
     "skills/",   # source code excluded; config.json included via specific pattern
     "skills/*/.git/", "shared/data/icd10_*",
@@ -4473,8 +4624,12 @@ def _collect_files_for_source(rel_pattern, is_glob, staging_dir, quiet=False):
             if os.path.isfile(match):
                 dst = os.path.join(staging_dir, rel)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(match, dst)
-                collected.append((rel, match, dst))
+                try:
+                    shutil.copy2(match, dst)
+                    collected.append((rel, match, dst))
+                except (OSError, FileNotFoundError) as e:
+                    if not quiet:
+                        print(f"  Warning: Skipping {rel}: {e}")
     elif is_glob and os.path.isdir(abs_pattern):
         # Directory: walk recursively
         for dirpath, dirnames, filenames in os.walk(abs_pattern):
@@ -4489,8 +4644,12 @@ def _collect_files_for_source(rel_pattern, is_glob, staging_dir, quiet=False):
                     continue
                 dst = os.path.join(staging_dir, rel)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                collected.append((rel, src, dst))
+                try:
+                    shutil.copy2(src, dst)
+                    collected.append((rel, src, dst))
+                except (OSError, FileNotFoundError) as e:
+                    if not quiet:
+                        print(f"  Warning: Skipping {rel}: {e}")
     elif os.path.isfile(abs_pattern):
         # Single file
         rel = rel_pattern
@@ -4499,8 +4658,12 @@ def _collect_files_for_source(rel_pattern, is_glob, staging_dir, quiet=False):
         dst = os.path.join(staging_dir, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         # DB files get special treatment via _snapshot_db
-        shutil.copy2(abs_pattern, dst)
-        collected.append((rel, abs_pattern, dst))
+        try:
+            shutil.copy2(abs_pattern, dst)
+            collected.append((rel, abs_pattern, dst))
+        except (OSError, FileNotFoundError) as e:
+            if not quiet:
+                print(f"  Warning: Skipping {rel}: {e}")
 
     return collected
 
@@ -4833,7 +4996,7 @@ def _validate_restored_db():
 # Backup command
 # ---------------------------------------------------------------------------
 
-def backup_command(output=None, fmt="gz", quiet=False, exclude=None, encrypt=False):
+def backup_command(output=None, fmt="gz", quiet=False, exclude=None):
     """Create a full Evonic backup archive."""
     
     # Parse options
@@ -4860,24 +5023,7 @@ def backup_command(output=None, fmt="gz", quiet=False, exclude=None, encrypt=Fal
         print(f"Evonic Backup v{version}")
         print(f"Output: {output}")
         print(f"Format: {fmt}")
-        if encrypt:
-            print("Encryption: AES-256-GCM (passphrase will be prompted)")
         print()
-    
-    # Handle encryption passphrase
-    passphrase = None
-    if encrypt:
-        if not _ENCRYPTION_AVAILABLE:
-            print("Error: Encryption not available (backup_crypto module not found)")
-            sys.exit(1)
-        passphrase = getpass.getpass("Enter encryption passphrase: ")
-        confirm = getpass.getpass("Confirm encryption passphrase: ")
-        if passphrase != confirm:
-            print("Error: Passphrases do not match")
-            sys.exit(1)
-        if len(passphrase) < 8:
-            print("Error: Passphrase must be at least 8 characters")
-            sys.exit(1)
     
     # Step 1: WAL checkpoint on main DB
     if not quiet:
@@ -4897,11 +5043,11 @@ def backup_command(output=None, fmt="gz", quiet=False, exclude=None, encrypt=Fal
     
     try:
         # Step 3: Collect all sources
-        sources = _build_backup_sources()
+        backup_sources = _build_backup_sources()
         all_files = []  # (rel_path, staging_path, size_bytes)
         db_files_collected = []  # DB files needing snapshot
         
-        for rel_pattern, label, is_db, is_glob in sources:
+        for rel_pattern, label, is_db, is_glob in backup_sources:
             if is_db:
                 # DB files get atomic snapshot
                 abs_src = os.path.join(ROOT, rel_pattern)
@@ -4959,29 +5105,12 @@ def backup_command(output=None, fmt="gz", quiet=False, exclude=None, encrypt=Fal
         if not quiet:
             print(f"Creating archive ({fmt})...")
         
-        if encrypt:
-            # Create unencrypted archive first, then encrypt
-            tmp_archive = output + ".plain"
-            archive_path = _create_archive(staging_dir, tmp_archive, fmt)
-            archive_sha = _archive_sha256(archive_path)
-            
-            # Update manifest with archive SHA
-            _update_manifest_sha256(archive_path, archive_sha)
-            
-            # Encrypt
-            if not quiet:
-                print("Encrypting archive...")
-            encrypt_file_aes256gcm(archive_path, output, passphrase)
-            os.remove(archive_path)
-            # Recompute SHA of encrypted file
-            archive_sha = _archive_sha256(output)
-        else:
-            archive_path = _create_archive(staging_dir, output, fmt)
-            archive_sha = _archive_sha256(archive_path)
-            # Update manifest with archive SHA, then recompute
-            _update_manifest_sha256(archive_path, archive_sha)
-            archive_sha = _archive_sha256(output)
-        
+        archive_path = _create_archive(staging_dir, output, fmt)
+        archive_sha = _archive_sha256(archive_path)
+        # Update manifest with archive SHA, then recompute
+        _update_manifest_sha256(archive_path, archive_sha)
+        archive_sha = _archive_sha256(output)
+    
         archive_size = os.path.getsize(output)
         
         print(f"\n  Backup complete!")
@@ -5014,6 +5143,17 @@ def restore_command(backup_file, dry_run=False, force=False, no_restart=False):
     print(f"Backup file: {backup_file}")
     print()
     
+    # Reject anything that is not a plain gzip/bzip2/zip archive. Encrypted
+    # backup archives are no longer supported (see CHANGELOG.md).
+    with open(backup_file, "rb") as _f:
+        _header = _f.read(4)
+    if not (_header[:2] == b"\x1f\x8b" or _header[:3] == b"BZh" or _header[:2] == b"PK"):
+        print("Error: Unsupported backup archive format.")
+        print("Only plain gzip (.tar.gz), bzip2 (.tar.bz2) and zip (.zip) archives are supported.")
+        print("Encrypted backups are no longer supported: the --encrypt option was removed.")
+        print("Use gpg or age to encrypt backup archives at the file level instead.")
+        sys.exit(1)
+
     # Step 1: Verify archive
     print("Verifying backup...")
     manifest, err = _read_manifest_from_archive(backup_file)
@@ -5028,39 +5168,6 @@ def restore_command(backup_file, dry_run=False, force=False, no_restart=False):
         sys.exit(1)
     print(f"Verification: OK ({manifest.get('file_count', 0)} files verified)")
     
-    # Check if encrypted (look for encryption header)
-    is_encrypted = False
-    try:
-        with open(backup_file, "rb") as f:
-            header = f.read(4)
-            # tar.gz starts with 0x1f 0x8b (gzip magic)
-            if header[:2] != b"\x1f\x8b":
-                is_encrypted = True
-    except Exception:
-        pass
-    
-    # If encrypted, prompt for passphrase
-    if is_encrypted:
-        if not _ENCRYPTION_AVAILABLE:
-            print("Error: File appears encrypted but encryption module is not available")
-            sys.exit(1)
-        passphrase = getpass.getpass("Enter decryption passphrase: ")
-        decrypted_path = backup_file + ".decrypted"
-        try:
-            print("Decrypting...")
-            decrypt_file_aes256gcm(backup_file, decrypted_path, passphrase)
-            backup_file = decrypted_path
-            # Re-verify decrypted archive
-            manifest, err = _read_manifest_from_archive(backup_file)
-            if err:
-                print(f"Error reading decrypted archive: {err}")
-                sys.exit(1)
-        except ValueError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-    else:
-        decrypted_path = None
-    
     # Step 2: Show contents
     print()
     _list_archive_contents(backup_file, manifest)
@@ -5068,8 +5175,6 @@ def restore_command(backup_file, dry_run=False, force=False, no_restart=False):
     # Step 3: Dry run handling
     if dry_run:
         print("\nDry run complete. No changes were made.")
-        if decrypted_path:
-            os.remove(decrypted_path)
         return
     
     # Step 4: Confirmation
@@ -5078,8 +5183,6 @@ def restore_command(backup_file, dry_run=False, force=False, no_restart=False):
         response = input("Continue? [y/N] ").strip().lower()
         if response not in ("y", "yes"):
             print("Restore cancelled.")
-            if decrypted_path:
-                os.remove(decrypted_path)
             return
     
     # Step 5: Extract to staging
@@ -5182,8 +5285,6 @@ def restore_command(backup_file, dry_run=False, force=False, no_restart=False):
         
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
-        if decrypted_path and os.path.exists(decrypted_path):
-            os.remove(decrypted_path)
 
 
 # ---------------------------------------------------------------------------

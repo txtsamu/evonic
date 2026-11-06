@@ -80,12 +80,27 @@ def test_path_within_agent_allowed(tmp_path, monkeypatch):
     assert '1: hello' in result['result']
 
 
-def test_missing_attachment_id_returns_error(tmp_path, monkeypatch):
+def test_missing_attachment_id_returns_actionable_not_found_error(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _make_agent('agent_m')
-    result = ra.execute({'id': 'agent_m'}, {'attachment_id': 999999})
+    result = ra.execute({'id': 'agent_m'}, {'attachment_id': 75433064})
     assert 'error' in result
-    assert 'not found' in result['error'].lower()
+    assert 'Attachment ID 75433064 was not found' in result['error']
+    assert "numeric 'Attachment ID' shown in the attachment metadata" in result['error']
+    assert 'session ID' in result['error']
+    assert 'expired' not in result['error'].lower()
+
+
+def test_existing_record_with_missing_file_reports_distinct_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _make_agent('agent_missing_file')
+    aid, path = _store('agent_missing_file', b'gone', tmp_path=tmp_path)
+    os.remove(path)
+
+    result = ra.execute({'id': 'agent_missing_file'}, {'attachment_id': aid})
+
+    assert 'missing on disk' in result['error']
+    assert 'retention cleanup' in result['error']
 
 
 def test_invalid_attachment_id_type(tmp_path, monkeypatch):
@@ -120,18 +135,30 @@ def test_binary_attachment_returns_metadata(tmp_path, monkeypatch):
     assert parsed['filename'] == 'photo.jpg'
 
 
-def test_pdf_no_pypdf_returns_unavailable(tmp_path, monkeypatch):
+def test_pdf_no_anydoc_returns_unavailable(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _make_agent('agent_pdf')
     aid, _ = _store('agent_pdf', b'%PDF-1.4 fake', name='doc.pdf',
                     mime='application/pdf', tmp_path=tmp_path)
-    # Force ImportError for pypdf
+    # Force ImportError for anydoc
     import sys
-    monkeypatch.setitem(sys.modules, 'pypdf', None)
+    monkeypatch.setitem(sys.modules, 'anydoc', None)
     result = ra.execute({'id': 'agent_pdf'}, {'attachment_id': aid})
     assert 'result' in result
     out = result['result']
-    assert 'PDF text extraction unavailable' in out or 'install' in out
+    assert 'Document text extraction unavailable' in out or 'install' in out
+
+
+def test_pdf_anydoc_conversion_failure_returns_metadata(tmp_path, monkeypatch):
+    """A malformed PDF should fall back to metadata, not crash."""
+    monkeypatch.chdir(tmp_path)
+    _make_agent('agent_pdf_bad')
+    aid, _ = _store('agent_pdf_bad', b'%PDF-1.4 fake', name='doc.pdf',
+                    mime='application/pdf', tmp_path=tmp_path)
+    result = ra.execute({'id': 'agent_pdf_bad'}, {'attachment_id': aid})
+    assert 'result' in result
+    out = result['result']
+    assert 'Document conversion failed' in out or 'metadata' in out.lower()
 
 
 def test_mock_shape_matches_execute(tmp_path, monkeypatch):

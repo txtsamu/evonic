@@ -2,10 +2,12 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -47,6 +49,12 @@ type Executor struct {
 
 	mu    sync.Mutex
 	cache map[string]*inflight // req.ID → in-flight/completed result
+
+	// Cached login-shell environment captured once at startup.
+	// On macOS this recovers PATH, custom env vars, and toolchain
+	// directories that GUI-launched processes don't normally inherit.
+	loginEnv     []string
+	loginEnvOnce sync.Once
 }
 
 func New(workDir string, verbose bool) *Executor {
@@ -59,6 +67,76 @@ func New(workDir string, verbose bool) *Executor {
 		clean += string(os.PathSeparator)
 	}
 	return &Executor{workDir: clean, verbose: verbose, cache: make(map[string]*inflight)}
+}
+
+// getEnviron returns the cached login-shell environment if available,
+// falling back to the process environment. RPC-supplied env vars are
+// merged on top by the callers (handleExecBash / handleExecPython).
+func (e *Executor) getEnviron() []string {
+	e.loginEnvOnce.Do(func() {
+		e.loginEnv = captureLoginEnv()
+	})
+	if e.loginEnv != nil {
+		return e.loginEnv
+	}
+	return os.Environ()
+}
+
+// envCaptureMarker delimits the start of `env` output. The user's login
+// shell may emit shell-integration escape codes or other preamble on stdout
+// while sourcing rc files; everything up to and including this marker line is
+// discarded so only real KEY=VALUE pairs remain.
+const envCaptureMarker = "__EVONET_ENV_START__"
+
+// captureLoginEnv recovers the full interactive login-shell environment
+// (PATH, toolchain dirs, custom vars). It uses the user's actual login shell
+// ($SHELL, e.g. zsh on macOS) — not a hardcoded bash — in login+interactive
+// mode so that both profile files (~/.zprofile, ~/.profile) and rc files
+// (~/.zshrc) are sourced. This matters on macOS, where GUI/launchd-launched
+// processes inherit a bare environment and where env lives in zsh config that
+// `bash -l` never reads. Returns nil on failure so callers gracefully fall
+// back to the process environment.
+func captureLoginEnv() []string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+
+	// login + interactive so both profile and rc files are sourced.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shell, "-l", "-i", "-c", "echo "+envCaptureMarker+"; env")
+	// Detach from the controlling terminal: an interactive shell would otherwise
+	// grab the TTY's foreground process group and leave evonet unable to receive
+	// CTRL+C after the first command (Linux bash ≥4.4 / zsh).
+	detachTTY(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("[evonet] login env capture failed (shell=%s, env will be process env): %v", shell, err)
+		return nil
+	}
+
+	lines := strings.Split(string(out), "\n")
+	// Discard everything up to and including the marker line (shell-integration
+	// escape codes, prompt preamble, etc. emitted while rc files were sourced).
+	start := 0
+	for i, line := range lines {
+		if strings.Contains(line, envCaptureMarker) {
+			start = i + 1
+			break
+		}
+	}
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines[start:] {
+		if strings.Contains(line, "=") {
+			filtered = append(filtered, line)
+		}
+	}
+	if len(filtered) == 0 {
+		log.Printf("[evonet] login env capture produced no vars (shell=%s); using process env", shell)
+		return nil
+	}
+	return filtered
 }
 
 // Handle processes a Request and returns a Response.

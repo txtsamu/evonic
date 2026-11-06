@@ -1,7 +1,7 @@
 """
 Builtin tool: use_skill
 
-Lazy-load a skill's SYSTEM.md knowledge into the agent context.
+Lazy-load a skill's optional SYSTEM.md knowledge into the agent context.
 For skills with lazy_tools=true, also returns their tool definitions so the
 runtime can inject them into the LLM tool list mid-turn.
 
@@ -39,6 +39,17 @@ def execute(agent: dict, args: dict) -> dict:
             "message": "id is required. Example: use_skill({id: 'hello_world'})"
         }
 
+    # Check if the skill exists
+    skill = skills_manager.get_skill(skill_id)
+    if not skill:
+        available = _enabled_skill_ids()
+        return {
+            "status": "error",
+            "id": skill_id,
+            "message": f"Skill '{skill_id}' not found.",
+            "available_skills": available
+        }
+
     # Check if the skill is enabled (DB-authoritative whitelist)
     if not skills_manager.is_skill_enabled(skill_id):
         available = _enabled_skill_ids()
@@ -64,17 +75,6 @@ def execute(agent: dict, args: dict) -> dict:
                 "message": f"Skill '{skill_id}' is not in your allowed skills list.",
                 "available_skills": allowed_available
             }
-
-    # Check if the skill exists
-    skill = skills_manager.get_skill(skill_id)
-    if not skill:
-        available = _enabled_skill_ids()
-        return {
-            "status": "error",
-            "id": skill_id,
-            "message": f"Skill '{skill_id}' not found or not enabled.",
-            "available_skills": available
-        }
 
     # Enforce super_only restriction
     skill_dir = skill.get('_dir', os.path.join(
@@ -107,33 +107,30 @@ def execute(agent: dict, args: dict) -> dict:
             )
         }
 
-    # Build path to SYSTEM.md
+    # SYSTEM.md is optional for tool-only lazy skills. When it is present, keep
+    # injecting its instructions; otherwise, load the declared tool definitions.
     skill_dir_norm = os.path.normpath(skill_dir)
     system_md_path = os.path.join(skill_dir_norm, "SYSTEM.md")
-
-    if not os.path.isfile(system_md_path):
-        return {
-            "status": "error",
-            "id": skill_id,
-            "message": f"No SYSTEM.md found in skill '{skill_id}' at {system_md_path}"
-        }
-
-    try:
-        with open(system_md_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception as e:
-        return {
-            "status": "error",
-            "id": skill_id,
-            "message": f"Failed to read SYSTEM.md: {str(e)}"
-        }
+    content = ""
+    if os.path.isfile(system_md_path):
+        try:
+            with open(system_md_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            return {
+                "status": "error",
+                "id": skill_id,
+                "message": f"Failed to read SYSTEM.md: {str(e)}"
+            }
 
     result = {
         "status": "success",
         "id": skill_id,
-        "system_md": content,
-        "message": f"Loaded skill knowledge for '{skill_id}'. This content is now in your context — use it to guide your actions."
+        "message": f"Loaded lazy skill '{skill_id}'."
     }
+    if content:
+        result["system_md"] = content
+        result["message"] += " Its instructions are now in your context — use them to guide your actions."
 
     # For lazy_tools skills, include tool definitions for runtime injection
     if manifest.get('lazy_tools', False):

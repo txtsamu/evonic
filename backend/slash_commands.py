@@ -4,10 +4,10 @@ Commands are parsed and executed in the backend so they work on all channels
 (Telegram, web, etc.) without any frontend-specific logic.
 """
 
+import json
 import logging
 import re
 import os
-import sys
 import threading
 from typing import Optional, Dict, Any, Callable, Tuple
 
@@ -20,10 +20,21 @@ CommandHandler = Callable[[str, str, str, Optional[str], str], str]
 class SlashCommand:
     """Represents a single slash command."""
 
-    def __init__(self, name: str, handler: CommandHandler, description: str = ""):
+    def __init__(self, name: str, handler: CommandHandler, description: str = "", parameters: list = None):
         self.name = name
         self.handler = handler
         self.description = description
+        self.parameters = parameters or []
+        self.accepts_args = bool(self.parameters)
+
+    def to_dict(self) -> dict:
+        """Return a dict suitable for JSON serialization to the frontend."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+            "accepts_args": self.accepts_args,
+        }
 
 
 class SlashCommandRegistry:
@@ -31,22 +42,165 @@ class SlashCommandRegistry:
 
     def __init__(self):
         self._commands: Dict[str, SlashCommand] = {}
+        self._providers: Dict[str, Callable[[str], list]] = {}
 
-    def register(self, name: str, handler: CommandHandler, description: str = ""):
+    def register(self, name: str, handler: CommandHandler, description: str = "", parameters: list = None):
         """Register a command handler."""
-        self._commands[name] = SlashCommand(name, handler, description)
+        self._commands[name] = SlashCommand(name, handler, description, parameters)
+
+    def register_provider(self, key: str, provider: Callable[[str], list]):
+        """Register a per-agent command provider.
+
+        `provider(agent_id)` returns a list of SlashCommand objects that exist only
+        for that agent (e.g. panel actions with an assigned slash command).
+        Statically registered commands always win on a name clash.
+        """
+        self._providers[key] = provider
 
     def get(self, name: str) -> Optional[SlashCommand]:
-        """Get a command by name."""
+        """Get a statically registered command by name."""
         return self._commands.get(name)
 
     def list_commands(self) -> list:
-        """Return list of (name, description) tuples."""
-        return [(cmd.name, cmd.description) for cmd in self._commands.values()]
+        """Return list of statically registered SlashCommand objects."""
+        return list(self._commands.values())
+
+    def provided_commands(self, agent_id: str) -> list:
+        """Return provider commands for an agent, minus any static name clash."""
+        out = []
+        for key, provider in list(self._providers.items()):
+            try:
+                for cmd in provider(agent_id) or []:
+                    if cmd.name not in self._commands:
+                        out.append(cmd)
+            except Exception:
+                _logger.warning("Slash command provider %r failed for agent %s", key, agent_id, exc_info=True)
+        return out
+
+    def resolve(self, name: str, agent_id: str) -> Optional[SlashCommand]:
+        """Get a command by name for an agent — static first, then providers."""
+        cmd = self._commands.get(name)
+        if cmd:
+            return cmd
+        return next((c for c in self.provided_commands(agent_id) if c.name == name), None)
+
+
+def _expand_slash_list(raw_value: str, all_names: set) -> set:
+    """Expand comma-separated list with wildcard '*' and inverse mode '!' support."""
+    if not raw_value or not raw_value.strip():
+        return set()
+    raw = raw_value.strip()
+    if raw == '*':
+        return set(all_names)
+    if raw.startswith('!'):
+        allowed = {c.strip() for c in raw[1:].split(',') if c.strip()}
+        return set(all_names) - allowed
+    return {c.strip() for c in raw.split(',') if c.strip()}
+
+
+class _CommandSuppressed:
+    """Sentinel: a slash command was recognized but suppressed by a per-agent setting.
+
+    This is distinct from `None` (unknown command), which tells callers to fall
+    through to normal LLM chat processing. When a command is suppressed, callers
+    must not reply and must not forward the message to the LLM.
+    """
+    __slots__ = ()
+
+    def __repr__(self):  # pragma: no cover
+        return "<COMMAND_SUPPRESSED>"
+
+
+# Returned by execute_command() when a command is deliberately ignored
+# (currently: `/help` when the agent's `help_enabled` setting is off).
+COMMAND_SUPPRESSED = _CommandSuppressed()
+
+
+def _help_command_enabled(agent_id: str) -> bool:
+    """Return whether the agent should respond to the `/help` command (default True)."""
+    try:
+        from models.db import db
+        agent = db.get_agent(agent_id)
+        if agent is None:
+            return True
+        return bool(agent.get('help_enabled', True))
+    except Exception:
+        return True
+
+
+def _persist_session_agent_state(chat_db, session_id: str, ms) -> None:
+    """Merge-write session-scoped AgentState fields for slash commands."""
+    import json
+
+    raw = chat_db.get_session_state(session_id)
+    try:
+        session_data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        session_data = {}
+    if not isinstance(session_data, dict):
+        session_data = {}
+    data = json.loads(ms.serialize())
+    session_data.update({
+        'mode': data.get('mode', 'plan'),
+        'tasks': data.get('tasks', []),
+        'next_task_id': data.get('next_task_id', 1),
+        'plan_file': data.get('plan_file'),
+        'states': data.get('states', {}),
+        'auto_trivial': data.get('auto_trivial', False),
+        'cmp': data.get('cmp'),
+    })
+    chat_db.upsert_session_state(session_id, json.dumps(session_data))
+
+
+def list_available_commands(agent_id: str, channel_id: Optional[str] = None) -> list:
+    """Return registered commands available to an agent on the given channel."""
+    commands = command_registry.list_commands() + command_registry.provided_commands(agent_id)
+    try:
+        from models.db import db
+        super_agent = db.get_super_agent()
+        is_super = bool(super_agent and super_agent.get('id') == agent_id)
+        agent = db.get_agent(agent_id)
+        workplace_id = agent.get('workplace_id') if agent else None
+        workplace = db.get_workplace(workplace_id) if workplace_id else None
+        can_cd = is_super or bool(workplace and workplace.get('type') in ('remote', 'tunnel'))
+        has_subagent = is_super or 'subagent' in db.get_agent_skills(agent_id)
+        disabled_raw = (agent.get('disabled_slash_commands') or '') if agent else ''
+        help_enabled = bool(agent.get('help_enabled', True)) if agent else True
+    except Exception:
+        is_super = can_cd = has_subagent = False
+        disabled_raw = ''
+        help_enabled = True
+
+    disabled_set = _expand_slash_list(disabled_raw, {cmd.name for cmd in commands})
+
+    available = []
+    for cmd in commands:
+        if cmd.name in {'cd', 'cwd'} and not can_cd:
+            continue
+        if cmd.name in {'restart', 'shutdown'} and not is_super:
+            continue
+        if cmd.name == 'sub' and not has_subagent:
+            continue
+        if not is_super and cmd.name in disabled_set:
+            continue
+        if cmd.name == 'help' and not help_enabled:
+            continue
+        available.append(cmd)
+    return sorted(available, key=lambda c: c.name)
 
 
 # Global registry instance
 command_registry = SlashCommandRegistry()
+
+SUBAGENT_USER_DIRECT_PREFIX = (
+    "You were spawned directly by the user via the `/sub` command"
+    " \u2014 not delegated by your parent agent."
+    " Execute the task below directly and report your result."
+    " Since your response will appear in the parent agent\u2019s chat,"
+    " begin your response with a brief line about the user request,"
+    " so the parent agent has context.\n\n"
+    "--- USER TASK ---\n"
+)
 
 
 def parse_command(message: str) -> Optional[Tuple[str, str]]:
@@ -57,13 +211,18 @@ def parse_command(message: str) -> Optional[Tuple[str, str]]:
     if not message or not message.startswith("/"):
         return None
 
-    # Match /command or /command args (hyphens allowed in command name)
-    match = re.match(r"^/([\w-]+)(?:\s+(.*))?$", message.strip(), re.DOTALL)
+    # Match /command, /command args, or /command:sub args (hyphens allowed
+    # in names; the :sub part becomes the first args token, e.g.
+    # "/panel:build foo" -> ("panel", "build foo"))
+    match = re.match(r"^/([\w-]+)(?::([\w-]+))?(?:\s+(.*))?$", message.strip(), re.DOTALL)
     if not match:
         return None
 
     cmd_name = match.group(1).lower()
-    args = match.group(2) or ""
+    sub = match.group(2)
+    args = match.group(3) or ""
+    if sub:
+        args = f"{sub} {args}".strip()
     return (cmd_name, args)
 
 
@@ -78,9 +237,15 @@ def execute_command(
     """Execute a slash command and return the response text.
 
     Returns the command response string, or None if the command is not found
-    (caller should then treat the message as normal chat).
+    (caller should then treat the message as normal chat). Returns
+    COMMAND_SUPPRESSED when the command is recognized but disabled for this
+    agent (e.g. `/help` with `help_enabled` off) — callers must then ignore
+    the message entirely: no reply, no LLM fallthrough.
     """
-    cmd = command_registry.get(cmd_name)
+    if cmd_name == 'help' and not _help_command_enabled(agent_id):
+        return COMMAND_SUPPRESSED
+
+    cmd = command_registry.resolve(cmd_name, agent_id)
     if not cmd:
         return None  # Unknown command — fall through to normal LLM processing
 
@@ -93,7 +258,7 @@ def execute_command(
 def _register_builtins():
     """Register all built-in slash commands."""
 
-    # /clear — Clear chat history and agent llm log
+    # /clear [ar] — Clear chat history and agent LLM log; `ar` also archives it.
     def clear_handler(
         session_id: str,
         agent_id: str,
@@ -103,9 +268,13 @@ def _register_builtins():
     ) -> str:
         from models.db import db
         import os
+        import config
 
-        db.clear_session(session_id, agent_id)
+        # Archive only when explicitly requested with the `ar` argument.
+        archive_requested = "ar" in set(args.strip().lower().split())
+        no_archive = not archive_requested
 
+        db.clear_session(session_id, agent_id, no_archive=no_archive)
         # Clear in-memory loaded skill state so skill badges disappear from session state UI
         from backend.agent_runtime import agent_runtime
         agent_runtime._session_skill_mds.pop(session_id, None)
@@ -123,6 +292,7 @@ def _register_builtins():
             'plan_file': fresh.plan_file,
             'states': fresh.states,
             'auto_trivial': fresh.auto_trivial,
+            'cmp': None,   # full-replace already wipes this; explicit for clarity
         }
         db.upsert_session_state(session_id, json.dumps(session_data), agent_id=agent_id)
         # Global: reset focus only
@@ -145,16 +315,21 @@ def _register_builtins():
         # Emit session_clear event
         try:
             from backend.event_stream import event_stream
-            event_stream.emit('session_clear', {'session_id': session_id, 'agent_id': agent_id})
+            event_stream.emit('session_clear', {
+                'session_id': session_id, 'agent_id': agent_id, 'turn_id': None,
+            })
         except Exception:
             pass
 
+        if no_archive and config.SESSION_ARCHIVE:
+            return "History cleared without archive"
         return "History cleared."
 
     command_registry.register(
         "clear",
         clear_handler,
-        "Clear chat history for this session",
+        "Clear chat history (`/clear ar` archives it)",
+        parameters=[{"name": "archive", "options": ["ar"]}],
     )
 
     # /help — Show available commands
@@ -165,23 +340,9 @@ def _register_builtins():
         channel_id: Optional[str],
         args: str,
     ) -> str:
-        commands = command_registry.list_commands()
-        # Filter out /restart for non-super agents
-        try:
-            from models.db import db
-            super_agent = db.get_super_agent()
-            is_super = super_agent and super_agent.get('id') == agent_id
-        except Exception:
-            is_super = False
         lines = ["**Available commands:**"]
-        super_only = {"restart", "cd", "cwd", "shutdown"}
-        web_only = {"investigate"}  # only shown/available on web, not channels
-        for name, desc in commands:
-            if name in super_only and not is_super:
-                continue
-            if name in web_only and channel_id is not None:
-                continue
-            lines.append(f"- `/{name}` — {desc}")
+        for cmd in list_available_commands(agent_id, channel_id):
+            lines.append(f"- `/{cmd.name}` — {cmd.description}")
         return "\n".join(lines)
 
     command_registry.register(
@@ -226,10 +387,6 @@ def _register_builtins():
         channel_id: Optional[str],
         args: str,
     ) -> str:
-        # Web-only: reject on channels
-        if channel_id is not None:
-            return "This command is only available on the web interface."
-
         from models.db import db
 
         # Parse target agent-id and context
@@ -237,6 +394,8 @@ def _register_builtins():
         if not parts or not parts[0]:
             return "Usage: /investigate <agent-id> <context>"
         target_agent_id = parts[0].strip().lower()
+        if target_agent_id == agent_id.lower():
+            return "Cannot investigate the current agent. Choose a different agent."
         context = parts[1].strip() if len(parts) > 1 else ""
 
         # Validate context
@@ -257,24 +416,64 @@ def _register_builtins():
         session_log_path = f"agents/{agent_id}/sessions/{jsonl_id}.jsonl"
 
         # Build investigation message
+        # The platform owner is asking the target agent to investigate the
+        # current agent's session — phrase it from the owner's perspective.
         target_name = target.get("name", target_agent_id)
         message = (
-            f"[INVESTIGATION REQUEST from {current_name}]\n\n"
+            f"[INVESTIGATION REQUEST from the platform owner]\n\n"
+            f"The platform owner has asked you to investigate another agent's session.\n\n"
+            f"Agent under investigation: {current_name} ({agent_id})\n"
             f"Session: {session_id}\n"
             f"Session log: {session_log_path}\n"
-            f"Context: {context}\n\n"
-            f"Please investigate the session log above. Focus on: {context}"
+            f"Owner's request: {context}\n\n"
+            f"Please investigate the session log above and report back to the owner."
         )
+
+        # Clear the target agent's investigation session before delivering the
+        # request, so stale/unrelated history from a previous investigation does
+        # not pollute the LLM context. Resolve the exact session notify_agent
+        # will deliver into (target agent + this sender's agent-message user id).
+        _AGENT_MSG_PREFIX = "__agent__"
+        target_external_user_id = f"{_AGENT_MSG_PREFIX}{agent_id}"
+        try:
+            target_session_id = db.get_or_create_session(
+                target_agent_id, target_external_user_id, None)
+            db.clear_session(target_session_id, target_agent_id)
+
+            # Reset per-session agent state so the investigation starts fresh
+            # (plan mode, no stale tasks). Do NOT touch the target's global
+            # agent_state or logs — those are not specific to this session.
+            from backend.agent_runtime import agent_runtime
+            agent_runtime._session_skill_mds.pop(target_session_id, None)
+            agent_runtime._session_skill_tools.pop(target_session_id, None)
+
+            from backend.agent_state import AgentState
+            import json
+            fresh = AgentState()
+            db.upsert_session_state(target_session_id, json.dumps({
+                'mode': fresh.mode,
+                'tasks': fresh.tasks,
+                'next_task_id': fresh._next_task_id,
+                'plan_file': fresh.plan_file,
+                'states': fresh.states,
+                'auto_trivial': fresh.auto_trivial,
+            }), agent_id=target_agent_id)
+
+            from backend.event_stream import event_stream
+            event_stream.emit('session_clear', {
+                'session_id': target_session_id, 'agent_id': target_agent_id})
+        except Exception:
+            # Clearing is best-effort; still deliver the investigation request.
+            pass
 
         # Deliver via notify_agent (same mechanism as send_agent_message)
         from backend.agent_runtime.notifier import notify_agent
 
-        _AGENT_MSG_PREFIX = "__agent__"
         result = notify_agent(
             agent_id=target_agent_id,
-            tag=f"AGENT/{current_name}",
+            tag="SYSTEM/Owner",
             message=message,
-            external_user_id=f"{_AGENT_MSG_PREFIX}{agent_id}",
+            external_user_id=target_external_user_id,
             channel_id=None,
             dedup=False,
             metadata={
@@ -297,6 +496,7 @@ def _register_builtins():
         "investigate",
         investigate_handler,
         "Send investigation request to another agent with session context",
+        parameters=[{"name": "agent_id"}, {"name": "context"}],
     )
 
 
@@ -326,29 +526,53 @@ def _register_builtins():
         channel_id: Optional[str],
         args: str,
     ) -> str:
-        from models.db import db
+        import json as _json
 
-        super_agent = db.get_super_agent()
-        if not super_agent or super_agent.get('id') != agent_id:
-            return "Permission denied: /cwd is only available to the super agent."
+        from models.db import db
 
         agent = db.get_agent(agent_id)
         if not agent:
             return "Error: Agent not found."
 
-        workspace = agent.get('workspace')
-        if not workspace:
-            return "No workspace directory configured."
+        # Determine which workspace to show
+        is_super = False
+        try:
+            super_agent = db.get_super_agent()
+            is_super = super_agent and super_agent.get('id') == agent_id
+        except Exception:
+            pass
 
-        return f"Current workspace: {workspace}"
+        if is_super:
+            workspace = agent.get('workspace')
+            if not workspace:
+                return "No workspace directory configured."
+            return f"Current workspace: {workspace}"
+
+        # Check for remote/tunnel workplace
+        workplace_id = agent.get('workplace_id')
+        if workplace_id:
+            workplace = db.get_workplace(workplace_id)
+            if workplace and workplace.get('type') in ('remote', 'tunnel'):
+                cfg_raw = workplace.get('config', '{}')
+                if isinstance(cfg_raw, str):
+                    cfg = _json.loads(cfg_raw)
+                else:
+                    cfg = cfg_raw or {}
+                workspace = cfg.get('workspace_path')
+                if not workspace:
+                    return "No workspace directory configured."
+                return f"Current workspace: {workspace}"
+
+        return "Permission denied: /cwd is only available to the super agent or agents with remote/tunnel workplaces."
 
     command_registry.register(
         "cwd",
         cwd_handler,
         "Show current workspace directory",
+        parameters=[],
     )
 
-    # /cd — Change workspace directory (super agent only)
+    # /cd — Change workspace directory (super agent or remote/tunnel workplace)
     def cd_handler(
         session_id: str,
         agent_id: str,
@@ -356,39 +580,89 @@ def _register_builtins():
         channel_id: Optional[str],
         args: str,
     ) -> str:
-        from models.db import db
+        import json as _json
 
-        super_agent = db.get_super_agent()
-        if not super_agent or super_agent.get('id') != agent_id:
-            return "Permission denied: /cd is only available to the super agent."
+        from models.db import db
+        from backend.workplaces.manager import workplace_manager
+
+        # Determine if this agent is allowed to use /cd:
+        #   - super agent (local/Docker-based)
+        #   - agent with a remote or tunnel workplace
+        is_super = False
+        try:
+            super_agent = db.get_super_agent()
+            is_super = super_agent and super_agent.get('id') == agent_id
+        except Exception:
+            pass
+
+        agent = db.get_agent(agent_id)
+        if not agent:
+            return "Error: Agent not found."
+
+        workplace_id = agent.get('workplace_id')
+        is_remote_or_tunnel = False
+        if workplace_id:
+            try:
+                workplace = db.get_workplace(workplace_id)
+                if workplace and workplace.get('type') in ('remote', 'tunnel'):
+                    is_remote_or_tunnel = True
+            except Exception:
+                pass
+
+        if not is_super and not is_remote_or_tunnel:
+            return (
+                "Permission denied: /cd is only available to the super agent "
+                "or agents with remote/tunnel workplaces."
+            )
 
         if not args or not args.strip():
             return "Usage: /cd [path] — change workspace directory"
 
-        new_path = os.path.expanduser(args.strip())
+        raw_path = args.strip()
 
-        # Reject paths containing '..' to prevent directory traversal
-        if '..' in new_path.split(os.sep):
-            return f"Error: path contains '..' which is not allowed: {new_path}"
+        # Path sanitization (.. rejection) applies to all
+        sanitized = raw_path.replace('\\', '/')
+        if '..' in sanitized.split('/'):
+            return f"Error: path contains '..' which is not allowed: {raw_path}"
 
-        # Resolve to absolute path and verify it exists
-        new_path = os.path.abspath(new_path)
-        if not os.path.isdir(new_path):
-            return f"Error: directory does not exist: {new_path}"
+        if is_super:
+            # Super agent: local filesystem — expand, verify, update agent.workspace,
+            # and recreate Docker container so the new workspace is mounted.
+            new_path = os.path.expanduser(raw_path)
+            if '..' in new_path.split(os.sep):
+                return f"Error: path contains '..' which is not allowed: {new_path}"
+            new_path = os.path.abspath(new_path)
+            if not os.path.isdir(new_path):
+                return f"Error: directory does not exist: {new_path}"
 
-        # Update agent workspace in DB
-        db.update_agent(agent_id, {'workspace': new_path})
+            db.update_agent(agent_id, {'workspace': new_path})
 
-        # Destroy the old Docker container so the new workspace gets mounted on next tool use
-        from backend.tools.runpy import _destroy_container
-        _destroy_container(session_id)
+            from backend.tools.runpy import _destroy_container
+            _destroy_container(session_id)
 
-        return f"Workspace changed to: {new_path}"
+            return f"Workspace changed to: {new_path}"
+
+        # Remote / tunnel agent: update the workplace config (skip
+        # os.path.expanduser / os.path.abspath / os.path.isdir — meaningless
+        # for remote filesystems). Also update the in-memory backend so the
+        # change takes effect immediately.
+        workplace = db.get_workplace(workplace_id)
+        cfg_raw = workplace.get('config', '{}') if workplace else '{}'
+        if isinstance(cfg_raw, str):
+            cfg = _json.loads(cfg_raw)
+        else:
+            cfg = cfg_raw or {}
+        cfg['workspace_path'] = raw_path
+        db.update_workplace(workplace_id, {'config': cfg})
+        workplace_manager.set_backend_workspace(workplace_id, raw_path)
+
+        return f"Workspace changed to: {raw_path}"
 
     command_registry.register(
         "cd",
         cd_handler,
         "Change workspace directory",
+        parameters=[{"name": "path"}],
     )
 
 
@@ -427,59 +701,8 @@ def _register_builtins():
         except Exception:
             pass
 
-        def _do_restart():
-            import time
-            import resource
-
-            time.sleep(1.5)  # Brief delay so response is sent first
-
-            # Stop all channels cleanly so Telegram releases its long-poll
-            # before the new process starts and re-opens them
-            from backend.channels.registry import channel_manager
-            channel_manager.stop_all()
-            time.sleep(1.0)  # Give Telegram server-side time to release
-
-            # Close all inherited file descriptors (including Flask's bound
-            # socket) so the new process can bind the same port cleanly.
-            # Use os.close_range with inheritable=False (Python 3.13+) so
-            # the child inherits the same FDs but the parent's semaphores
-            # don't trigger leak warnings on macOS. Fallback to
-            # os.closerange for older Python versions.
-            try:
-                maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-                if maxfd == resource.RLIM_INFINITY or maxfd > 65535:
-                    maxfd = 4096
-                try:
-                    os.close_range(3, maxfd, inheritable=False)
-                except AttributeError:
-                    os.closerange(3, maxfd)
-            except Exception:
-                pass
-
-            # Resolve the correct restart target:
-            # - Release mode (BASE_DIR inside releases/): follow current symlink
-            # - Dev mode: restart from project root (BASE_DIR)
-            import config as _config
-            _base = os.path.realpath(_config.BASE_DIR)
-            _rel_marker = os.sep + 'releases' + os.sep
-            if _rel_marker in _base:
-                _project_root = _base.split(_rel_marker)[0]
-                _current = os.path.join(_project_root, 'current')
-                _target = os.path.realpath(_current) if os.path.islink(_current) else _base
-            else:
-                _target = _base
-            _app_py = os.path.join(_target, 'app.py')
-            _venv_python = os.path.join(_target, '.venv', 'bin', 'python')
-            _python = _venv_python if os.path.exists(_venv_python) else sys.executable
-
-            # Replace the current process in-place so we preserve the
-            # original execution mode (foreground stays foreground,
-            # daemon stays daemon).
-            os.chdir(_target)
-            os.execv(_python, [_python, _app_py])
-
-        t = threading.Thread(target=_do_restart, daemon=True)
-        t.start()
+        from backend.restart import restart_service
+        restart_service()
         return "Restarting..."
 
     command_registry.register(
@@ -513,8 +736,8 @@ def _register_builtins():
 
             os._exit(0)
 
-        t = threading.Thread(target=_do_shutdown, daemon=True)
-        t.start()
+        from backend.restart import stop_service
+        stop_service(fallback=_do_shutdown)
         return "Shutting down..."
 
     command_registry.register(
@@ -534,24 +757,24 @@ def _register_builtins():
         from backend.agent_state import AgentState
         from models.chat import agent_chat_manager
 
-        # Create a fresh AgentState in plan mode
-        ms = AgentState()
-
-        # Save per-session state (mode/tasks/plan_file) to session_state
         _db = agent_chat_manager.get(agent_id)
-        session_data = {
-            'mode': ms.mode,
-            'tasks': ms.tasks,
-            'next_task_id': ms._next_task_id,
-            'plan_file': ms.plan_file,
-            'states': ms.states,
-            'auto_trivial': ms.auto_trivial,
-        }
-        import json
-        _db.upsert_session_state(session_id, json.dumps(session_data))
+        session_content = _db.get_session_state(session_id)
+        # Preserve CMP, plan, tasks, and extension-owned session fields.
+        # Only the operating mode changes for this command.
+        ms = AgentState.deserialize(session_content) if session_content else AgentState()
+        ms.set_mode("plan", reason="slash command /plan")
+        _persist_session_agent_state(_db, session_id, ms)
 
-        # Reset focus in global agent_state (focus is cross-session)
-        global_data = {'focus': ms.focus, 'focus_reason': ms.focus_reason}
+        # Focus is global, but do not replace unrelated global state such as
+        # an active fallback-model marker.
+        raw_global = _db.get_agent_state()
+        try:
+            global_data = json.loads(raw_global) if raw_global else {}
+        except (TypeError, ValueError):
+            global_data = {}
+        if not isinstance(global_data, dict):
+            global_data = {}
+        global_data.update({'focus': False, 'focus_reason': None})
         _db.upsert_agent_state(json.dumps(global_data))
 
         return "Switched to plan mode."
@@ -592,21 +815,15 @@ def _register_builtins():
             ms = AgentState()  # fresh plan-mode state
 
         # Transition to execute mode
-        result = ms.set_mode("execute", reason="slash command /exec")
+        result = ms.set_mode(
+            "execute",
+            reason="slash command /exec",
+            bypass_plan_requirement=True,
+        )
         if "error" in result:
             return f"Error: {result['error']}"
 
-        # Save per-session state (mode changed to execute)
-        import json
-        session_data = {
-            "mode": ms.mode,
-            "tasks": ms.tasks,
-            "next_task_id": ms._next_task_id,
-            "plan_file": ms.plan_file,
-            "states": ms.states,
-            "auto_trivial": ms.auto_trivial,
-        }
-        _db.upsert_session_state(session_id, json.dumps(session_data))
+        _persist_session_agent_state(_db, session_id, ms)
 
         return "Switched to execute mode."
 
@@ -614,6 +831,75 @@ def _register_builtins():
         "exec",
         exec_handler,
         "Switch to execute mode",
+    )
+
+    # /goal <query> — persist a durable goal and start an agent-visible system turn.
+    # The runtime records a translated system event rather than forwarding the
+    # slash-command literal into the model's conversation history.
+    def goal_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> Optional[str]:
+        from models.db import db
+        from backend.agent_state import AgentState
+        from models.chat import agent_chat_manager
+
+        goal = args.strip()
+        if not goal:
+            return "Usage: /goal <what the agent should complete>"
+
+        agent = db.get_agent(agent_id)
+        if not agent:
+            return "Error: Agent not found."
+        if not agent.get("enable_agent_state"):
+            return "Agent state is not enabled for this agent."
+
+        chat_db = agent_chat_manager.get(agent_id)
+        session_content = chat_db.get_session_state(session_id)
+        ms = AgentState.deserialize(session_content) if session_content else AgentState()
+        result = ms.set_mode(
+            "execute",
+            reason="slash command /goal",
+            bypass_plan_requirement=True,
+        )
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        raw = chat_db.get_session_state(session_id)
+        try:
+            session_data = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            session_data = {}
+        if not isinstance(session_data, dict):
+            session_data = {}
+        from backend.active_goal import create_active_goal, render_active_goal_event
+
+        state_data = json.loads(ms.serialize())
+        active_goal = create_active_goal(goal)
+        session_data.update({
+            'mode': state_data.get('mode', 'plan'),
+            'tasks': state_data.get('tasks', []),
+            'next_task_id': state_data.get('next_task_id', 1),
+            'plan_file': state_data.get('plan_file'),
+            'states': state_data.get('states', {}),
+            'auto_trivial': state_data.get('auto_trivial', False),
+            'cmp': state_data.get('cmp'),
+            'active_goal': active_goal,
+        })
+        chat_db.upsert_session_state(session_id, json.dumps(session_data))
+        # The runtime turns this into an agent-visible [SYSTEM] goal event and
+        # drives the turn with it, keeping the slash-command literal out of the
+        # LLM transcript.
+        return render_active_goal_event(active_goal)
+
+    command_registry.register(
+        "goal",
+        goal_handler,
+        "Execute a goal until it is complete, blocked, or reaches its nudge limit",
+        parameters=[{"name": "query", "placeholder": "Describe the goal to complete"}],
     )
 
     def unfocus_handler(
@@ -653,6 +939,8 @@ def _register_builtins():
         channel_id: Optional[str],
         args: str,
     ) -> str:
+        import json
+
         from models.db import db
         from backend.agent_state import AgentState
         from models.chat import agent_chat_manager
@@ -667,7 +955,7 @@ def _register_builtins():
             channel = db.get_channel(channel_id)
             if channel:
                 ch_type = channel.get("type", "")
-                is_compact = ch_type in ("telegram", "whatsapp")
+                is_compact = ch_type in ("telegram", "whatsapp", "whatsapp_shared")
 
         lines = []
         if is_compact:
@@ -692,9 +980,46 @@ def _register_builtins():
         # Agent state: per-session (mode/plan_file) from session_state, global (focus) from agent_state
         _db = agent_chat_manager.get(agent_id)
         session_content = _db.get_session_state(session_id)
+        try:
+            session_data = json.loads(session_content) if session_content else {}
+        except (TypeError, ValueError):
+            session_data = {}
+        if not isinstance(session_data, dict):
+            session_data = {}
+        try:
+            resolved_model = db.resolve_model_config(model) if model else {}
+        except Exception:
+            resolved_model = model or {}
+        from backend.provider.codex_client import model_supports_fast_mode
+        fast_available = (
+            resolved_model.get("api_format") == "codex"
+            and model_supports_fast_mode(resolved_model.get("model_name"))
+        )
+        lines.append(
+            f"Fast: {'on' if session_data.get('service_tier') == 'priority' else 'off'}"
+            if fast_available else "Fast: unavailable"
+        )
         if session_content:
             sess_ms = AgentState.deserialize(session_content)
             lines.append(f"Mode: {sess_ms.mode}")
+            task_counts = {
+                status: sum(1 for task in sess_ms.tasks if task.get("status") == status)
+                for status in ("pending", "in_progress", "done")
+            }
+            lines.append(
+                f"Tasks: {task_counts['pending']} pending, "
+                f"{task_counts['in_progress']} in progress, {task_counts['done']} done"
+            )
+            if sess_ms.cmp and sess_ms.cmp.get('paths'):
+                _paths = sess_ms.cmp['paths']
+                _active = _paths.get(sess_ms.cmp.get('active_id')) or {}
+                _preserved = sum(1 for p in _paths.values()
+                                 if p.get('status') in ('preserved', 'dormant'))
+                _archived = sum(1 for p in _paths.values() if p.get('status') == 'archived')
+                lines.append(
+                    f"Paths: {len(_paths)} (active: {_active.get('id')} "
+                    f"\"{_active.get('title', '')[:40]}\"; "
+                    f"{_preserved} preserved, {_archived} archived)")
             if sess_ms.plan_file:
                 # Try per-agent path first, then fallback to legacy centralized path
                 project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
@@ -817,27 +1142,6 @@ def _register_builtins():
         "Show agent status information",
     )
 
-    # /clear-memory — Delete all memories for current agent
-    def clear_memory_handler(
-        session_id: str,
-        agent_id: str,
-        external_user_id: str,
-        channel_id: Optional[str],
-        args: str,
-    ) -> str:
-        from models.db import db
-
-        count = db.clear_all_memories(agent_id)
-        if count == 0:
-            return "No memories to clear."
-        return f"{count} memories deleted."
-
-    command_registry.register(
-        "clear-memory",
-        clear_memory_handler,
-        "Delete all long-term memories for current agent",
-    )
-
     # /model — Show or set the agent's LLM model
     def model_handler(
         session_id: str,
@@ -848,59 +1152,466 @@ def _register_builtins():
     ) -> str:
         from models.db import db
 
+        import json as _json
+
         if not args or not args.strip():
-            # No args — show current model
-            model = db.get_agent_model(agent_id)
-            if model:
-                model_name = model.get("name", "unknown")
-                model_id = model.get("model_name", "")
-                if model_id:
-                    return f"Current model: {model_name} ({model_id})"
-                else:
-                    return f"Current model: {model_name}"
+            # No args — show current model only (with fallback awareness)
+            current = db.get_agent_model(agent_id)
+            if not current:
+                return "No model configured. Type /model list to see available models, or /model <number> to set one."
+
+            # Check for active fallback model in agent_state
+            try:
+                state_content = db.get_agent_state(agent_id)
+                if state_content:
+                    state_data = _json.loads(state_content) if isinstance(state_content, str) else state_content
+                    fb_active_id = state_data.get("active_fallback_model_id")
+                    if fb_active_id:
+                        fb_model = db.get_model_by_id(fb_active_id)
+                        if fb_model:
+                            fb_name = fb_model.get("name", fb_active_id)
+                            fb_mn = fb_model.get("model_name", "")
+                            fb_sc = fb_model.get("shortcode", "?")
+                            if fb_mn:
+                                return (
+                                    f"**Current model:** {fb_name} ({fb_mn}) [#{fb_sc}] (fallback)\n\n"
+                                    "Type /model list to see all available models. /model <number> to switch."
+                                )
+                            else:
+                                return (
+                                    f"**Current model:** {fb_name} [#{fb_sc}] (fallback)\n\n"
+                                    "Type /model list to see all available models. /model <number> to switch."
+                                )
+            except Exception:
+                pass
+
+            # No fallback — show primary
+            sc = current.get("shortcode", "?")
+            name = current.get("name", "unknown")
+            mn = current.get("model_name", "")
+            if mn:
+                return (
+                    f"**Current model:** {name} ({mn}) [#{sc}]\n\n"
+                    "Type /model list to see all available models. /model <number> to switch."
+                )
             else:
-                return "No model configured. Use `/model <id>` to set one."
+                return (
+                    f"**Current model:** {name} [#{sc}]\n\n"
+                    "Type /model list to see all available models. /model <number> to switch."
+                )
+
+        if args.strip().lower() in ("list", "ls"):
+            # Full listing grouped by provider
+            current = db.get_agent_model(agent_id)
+            current_id = current.get("id") if current else None
+            providers = db.get_providers()
+            all_models = db.get_enabled_llm_models()
+
+            if not all_models:
+                return "No models configured. Add models in Settings > Models."
+
+            models_by_prov = {}
+            for m in all_models:
+                prov = m.get("provider", "unknown")
+                models_by_prov.setdefault(prov, []).append(m)
+
+            prov_names = {p["id"]: p.get("name", p["id"]) for p in providers}
+
+            is_compact = False
+            if channel_id:
+                channel = db.get_channel(channel_id)
+                if channel:
+                    ch_type = channel.get("type", "")
+                    is_compact = ch_type in ("telegram", "whatsapp", "whatsapp_shared")
+            dot = "." if is_compact else "\\."
+
+            def _sort_key(m):
+                sc = m.get("shortcode")
+                return sc if isinstance(sc, int) else 1_000_000
+
+            lines = ["**Available Models**", ""]
+            for prov_id in sorted(models_by_prov.keys()):
+                prov_label = prov_names.get(prov_id, prov_id)
+                lines.append(f"**{prov_label}**")
+                lines.append("")
+                for m in sorted(models_by_prov[prov_id], key=_sort_key):
+                    sc = m.get("shortcode", "?")
+                    name = m.get("name", "unknown")
+                    model_name = m.get("model_name", "")
+                    is_current = " ✓" if m.get("id") == current_id else ""
+                    if model_name:
+                        lines.append(f"{sc}{dot} {name} ({model_name}){is_current}")
+                    else:
+                        lines.append(f"{sc}{dot} {name}{is_current}")
+                lines.append("")
+
+            if current:
+                sc = current.get("shortcode", "?")
+                lines.append(f"**Current:** {current.get('name', 'unknown')} (#{sc})")
+            else:
+                lines.append("**Current:** none")
+            lines.append("")
+            lines.append("Type /model <number> or /model <provider/model> to switch.")
+            if is_compact:
+                return "\n".join(lines)
+            return "\n\n".join(l for l in lines if l)
 
         # Set model
         new_model_id = args.strip()
-        model = db.get_model_by_id(new_model_id)
-        if not model:
-            # Try matching by model_name field too
-            model = db.get_model_by_model_name(new_model_id)
-        if not model:
-            # List available models so user knows what's valid
-            all_models = db.get_llm_models()
-            if all_models:
-                lines = [f"Model '{new_model_id}' not found. Available models:"]
-                for m in all_models:
-                    m_name = m.get("name", "unknown")
-                    m_model = m.get("model_name", "")
-                    if m_model:
-                        lines.append(f"- {m_name} ({m_model})")
-                    else:
-                        lines.append(f"- {m_name}")
-                return "\n".join(lines)
-            else:
-                return f"Model '{new_model_id}' not found and no models are configured."
 
-        # Set the agent's model
+        # Try shortcode first (numeric input)
+        model = None
+        if new_model_id.isdigit():
+            model = db.get_model_by_shortcode(int(new_model_id))
+
+        if not model:
+            model = db.get_model_by_id(new_model_id)
+        if not model:
+            model = db.get_model_by_model_name(new_model_id)
+
+        if not model:
+            return f"Model '{new_model_id}' not found. Type /model to see available models."
+
         success = db.set_agent_model(agent_id, model["id"])
         if not success:
             return f"Failed to set model to '{new_model_id}'."
 
+        sc = model.get("shortcode", "?")
         model_name = model.get("name", "unknown")
         model_model = model.get("model_name", "")
         if model_model:
-            return f"Model set to: {model_name} ({model_model})"
+            return f"Model set to: {model_name} ({model_model}) [#{sc}]"
         else:
-            return f"Model set to: {model_name}"
+            return f"Model set to: {model_name} [#{sc}]"
 
     command_registry.register(
         "model",
         model_handler,
-        "Show or set agent's LLM model — /model [id]",
+        "Show or switch LLM model — /model, /model list|ls, /model [number|provider/model]",
+        parameters=[{"name": "action", "options": ["current", "list", "set"]}, {"name": "model"}],
     )
 
+    # /fast — Session-scoped Codex Priority Processing toggle
+    def fast_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> str:
+        import json
+
+        from backend.provider.codex_client import model_supports_fast_mode
+        from models.chat import agent_chat_manager
+        from models.db import db
+
+        model = db.get_agent_model(agent_id)
+        model = db.resolve_model_config(model) if model else {}
+        if (model.get("api_format") != "codex"
+                or not model_supports_fast_mode(model.get("model_name"))):
+            return "Fast mode is not supported by the current model."
+
+        chat_db = agent_chat_manager.get(agent_id)
+        raw = chat_db.get_session_state(session_id)
+        try:
+            session_data = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            session_data = {}
+        if not isinstance(session_data, dict):
+            session_data = {}
+
+        action = args.strip().lower()
+        if action in ("", "status"):
+            mode = "on" if session_data.get("service_tier") == "priority" else "off"
+            return f"Fast mode: {mode}."
+        if action in ("on", "fast"):
+            session_data["service_tier"] = "priority"
+            reply = "Fast mode enabled for this session (higher credit usage)."
+        elif action in ("off", "normal"):
+            session_data.pop("service_tier", None)
+            reply = "Fast mode disabled for this session."
+        else:
+            return "Usage: /fast [on|off|status]"
+
+        chat_db.upsert_session_state(session_id, json.dumps(session_data))
+        return reply
+
+    command_registry.register(
+        "fast",
+        fast_handler,
+        "Show or set Codex Fast mode for this session — /fast [on|off|status]",
+        parameters=[{"name": "mode", "options": ["on", "off", "status", "fast", "normal"]}],
+    )
+
+
+
+    # /sub — Spawn a sub-agent with a direct task (requires subagent skill)
+    def sub_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> str:
+        if not args or not args.strip():
+            return "Usage: /sub <task description>"
+
+        from models.db import db
+
+        # Super agents have implicit access to all skills
+        super_agent = db.get_super_agent()
+        is_super = super_agent and super_agent.get('id') == agent_id
+        if not is_super:
+            skills = db.get_agent_skills(agent_id)
+            if "subagent" not in skills:
+                return "This command requires the `subagent` skill to be assigned to this agent."
+
+        # Fetch parent agent
+        parent_agent = db.get_agent(agent_id)
+        if not parent_agent:
+            return "Error: Agent not found."
+
+        # Spawn sub-agent
+        from backend.subagent_manager import subagent_manager
+        try:
+            sub_id = subagent_manager.spawn(parent_agent)
+        except ValueError as e:
+            return f"Failed to spawn sub-agent: {e}"
+
+        # Resolve report_to destination
+        from backend.agent_report_to import resolve_report_to_for_subagent_spawn
+        report_to_id, report_to_channel_id, _ = resolve_report_to_for_subagent_spawn(
+            agent_id, external_user_id, channel_id
+        )
+
+        # Build task message with direct-spawn prefix
+        task_text = args.strip()
+        message = SUBAGENT_USER_DIRECT_PREFIX + task_text
+
+        # Send task message to the sub-agent
+        from backend.agent_runtime.notifier import notify_agent
+        result = notify_agent(
+            agent_id=sub_id,
+            tag="SUBSPAWN",
+            message=message,
+            external_user_id=f"__agent__{agent_id}",
+            channel_id=channel_id,
+            dedup=False,
+            trigger_llm=True,
+            metadata={
+                "agent_message": True,
+                "from_agent_id": agent_id,
+                "subagent_user_direct": True,
+                "report_to_id": report_to_id,
+                "report_to_channel_id": report_to_channel_id,
+            },
+        )
+
+        if not result.get("success"):
+            reason = result.get("reason", "unknown")
+            return f"Sub-agent spawned ({sub_id}) but failed to deliver task: {reason}."
+
+        return f"Sub-agent spawned: **{sub_id}** — task sent."
+
+    command_registry.register(
+        "sub",
+        sub_handler,
+        "Spawn a sub-agent with a direct task",
+    )
+
+    # /detach — Hand off the running long-running process to a background watcher
+    def detach_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> str:
+        from backend.agent_runtime import agent_runtime
+        from backend.agent_runtime import monitors
+        from backend.agent_runtime.background_jobs import background_jobs
+
+        jobs = background_jobs.running_for_session(session_id)
+        if not jobs:
+            return (
+                "No running background process found for this session. "
+                "Check with /jobs."
+            )
+
+        already = monitors.monitored_job_ids(agent_id, session_id)
+        pending = [j for j in jobs if j.job_id not in already]
+        if not pending:
+            names = ", ".join(f"`{j.command}`" for j in jobs)
+            return (f"Already monitored: {names}.\n"
+                    "I'll report back when they finish. See /jobs.")
+
+        # End the current polling turn so the agent stops waiting and can chat.
+        agent_runtime.request_stop(session_id)
+
+        agent = {
+            'agent_id': agent_id, 'session_id': session_id,
+            'user_id': external_user_id, 'channel_id': channel_id,
+        }
+        attached, failed = [], []
+        for job in pending:
+            res = monitors.attach(agent, target={'job_id': job.job_id},
+                                  when={'on_exit': True},
+                                  note='attached via /detach')
+            (failed if res.get('error') else attached).append(job)
+
+        if not attached:
+            return "Failed to detach: could not attach the monitor."
+
+        names = ", ".join(f"`{j.command}`" for j in attached)
+        msg = (f"Monitoring {len(attached)} background job(s): {names}.\n"
+               "They keep running — I'll report back when they finish (even if "
+               "the server restarts). Check anytime with /jobs.")
+        if failed:
+            msg += f"\nCould not monitor {len(failed)} job(s)."
+        return msg
+
+    command_registry.register(
+        "detach",
+        detach_handler,
+        "Stop waiting on the running long-running process and monitor it instead",
+    )
+
+    # /jobs — List background jobs tracked for this session
+    def jobs_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> str:
+        import time as _time
+        from backend.agent_runtime import monitors
+        from backend.agent_runtime.background_jobs import (
+            background_jobs, refresh_statuses)
+        from models.db import db
+
+        # Nothing polls these in the background, so refresh on demand — one
+        # round-trip for the whole session.
+        try:
+            agent = db.get_agent(agent_id) or {}
+            refresh_statuses(session_id, {**agent, 'agent_id': agent_id})
+        except Exception:
+            pass
+
+        by_job = {}
+        loose = []
+        for m in monitors.list_for_session(agent_id, session_id):
+            (by_job.setdefault(m['job_id'], []) if m.get('job_id')
+             else loose).append(m)
+
+        lines = []
+        for j in background_jobs.list_for_session(session_id):
+            if j.status == 'running':
+                state = f"⏳ running, {int(_time.time() - j.started_at)}s"
+            else:
+                code = '' if j.exit_code is None else f" (exit {j.exit_code})"
+                state = f"✅ {j.status}{code}"
+            watchers = by_job.get(j.job_id) or []
+            watch = (" · 👁 " + "; ".join(m['condition'] for m in watchers)
+                     if watchers else " · unmonitored")
+            log = f" · log: {j.log_file}" if j.log_file else ""
+            lines.append(f"- `{j.job_id}` `{j.command}` — {state}{watch}{log}")
+
+        for m in loose:
+            lines.append(f"- `{m['monitor_id']}` watching `{m['watching']}` "
+                         f"— 👁 {m['condition']}")
+
+        if not lines:
+            return ("No background jobs or monitors for this session. "
+                    "Background processes run unwatched unless a monitor is "
+                    "attached to them.")
+        return "**Background jobs:**\n" + "\n".join(lines)
+
+    command_registry.register(
+        "jobs",
+        jobs_handler,
+        "List background jobs for this session and their monitors",
+    )
+
+    # /kb-organize — Manually trigger KB organizer sub-agent for the current agent
+    def kb_organize_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> str:
+        from backend.agent_runtime.memory_manager import (
+            trigger_kb_organizer, resolve_kb_organizer_mode, sefton_tidy_agent,
+        )
+        from models.db import db
+        agent = db.get_agent(agent_id)
+        if agent and resolve_kb_organizer_mode(agent) == 'sefton':
+            return sefton_tidy_agent(agent_id)
+        return trigger_kb_organizer(agent_id, session_id)
+
+    command_registry.register(
+        "kb-organize",
+        kb_organize_handler,
+        "Manually trigger KB organizer sub-agent for the current agent",
+    )
+
+    # /dump -- Dump current session as JSONL file for download
+    def dump_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> str:
+        """Dump the current agent session JSONL file and send it to the user."""
+        import shutil
+        from models.chatlog import _AGENTS_DIR
+        from backend.agent_runtime import agent_runtime
+
+        # Resolve the JSONL file path (same logic as ChatLog.__init__)
+        hash_part = session_id
+        if hash_part.startswith(f'{agent_id}-'):
+            hash_part = hash_part[len(agent_id) + 1:]
+        jsonl_path = os.path.join(_AGENTS_DIR, agent_id, 'sessions', f'{hash_part}.jsonl')
+
+        if not os.path.exists(jsonl_path):
+            return f"Session log not found: {jsonl_path}"
+
+        if os.path.getsize(jsonl_path) == 0:
+            return "Session log is empty. No messages to dump yet."
+
+        # Create a snapshot copy so the live file is not affected
+        dump_path = f"/tmp/dump-{agent_id}-{hash_part}.jsonl"
+        try:
+            shutil.copy2(jsonl_path, dump_path)
+        except Exception as e:
+            _logger.error("Failed to copy session log: %s", e, exc_info=True)
+            return f"Failed to create dump file: {e}"
+
+        # Send the dump file to the user via the chat UI
+        caption = f"Session dump: {session_id}"
+        mime_type = "application/jsonl"
+        try:
+            success = agent_runtime.send_file_as_bot(
+                session_id, dump_path, caption, mime_type
+            )
+        except Exception as e:
+            _logger.error("Failed to send dump file: %s", e, exc_info=True)
+            # Clean up the dump file on failure
+            try:
+                os.remove(dump_path)
+            except Exception:
+                pass
+            return f"Failed to send dump file: {e}"
+
+        return f"Session dump sent as: dump-{agent_id}-{hash_part}.jsonl"
+
+    command_registry.register(
+        "dump",
+        dump_handler,
+        "Dump current session as JSONL file for download",
+    )
 
 # Register builtins at import time
 _register_builtins()

@@ -29,6 +29,7 @@ class _PrefetchEntry:
     tools: List[Dict[str, Any]]
     system_prompt: str
     agent_context: Dict[str, Any]
+    summary_watermark: Any = None
     timestamp: float = field(default_factory=time.time)
     # Last user-message content in the cached messages list, used as a
     # lightweight staleness check (if a new user message arrived, the last
@@ -83,39 +84,109 @@ class TurnPrefetcher:
             from models.db import db
             from models.chatlog import chatlog_manager
             from backend.agent_runtime import context as _ctx
-            from backend.agent_runtime.memory_manager import get_memories_for_context
+            from backend.agent_runtime import simulation_spec as sim_spec
             from backend.channels.registry import channel_manager
 
             # Rebuild system prompt (may have changed since last turn)
             fresh_system_prompt = _ctx.build_system_prompt(agent)
 
             # Rebuild tools
-            fresh_tools = _ctx.build_tools(agent)
+            fresh_tools = _ctx.build_tools(agent, channel_id=ctx.channel_id)
 
-            # Rebuild agent context
-            assigned_tool_ids = db.get_agent_tools(db_agent_id)
+            # Rebuild agent context. Explorers use their own configured tool
+            # set; everyone else resolves through sim_spec so this allowlist
+            # matches what build_tools() exposed to the model.
+            if agent.get('is_explorer'):
+                from backend.agent_runtime import explorer as _explorer
+                assigned_tool_ids = list(_explorer.tool_ids(agent))
+            else:
+                assigned_tool_ids = list(sim_spec.tools(agent, db_agent_id))
 
-            # Agents with save_artifact automatically get list_artifacts + fetch_artifact.
-            # No DB assignment needed — every artifacts-enabled agent can search and fetch their files.
-            if 'save_artifact' in assigned_tool_ids:
-                if 'list_artifacts' not in assigned_tool_ids:
-                    assigned_tool_ids.append('list_artifacts')
-                if 'fetch_artifact' not in assigned_tool_ids:
-                    assigned_tool_ids.append('fetch_artifact')
+            # Inter-agent communication is enabled by the agent-level toggle;
+            # send_agent_message is therefore available without a separate tool
+            # assignment, matching build_tools() exposure.
+            if (agent.get('agent_messaging_enabled') != 0
+                    and 'send_agent_message' not in assigned_tool_ids):
+                assigned_tool_ids.append('send_agent_message')
+
+            # Inject skill tool IDs from assigned skills into assigned_tool_ids.
+            # This mirrors build_tools() Layer 9 auto-injection and ensures
+            # the authorization guard allows execution of skill tools that
+            # belong to skills explicitly assigned to the agent.
+            assigned_skill_ids = set(db.get_agent_skills(db_agent_id))
+            if assigned_skill_ids:
+                from backend.skills_manager import skills_manager
+                _existing_ids = set(assigned_tool_ids)
+                for _sd in skills_manager.get_all_skill_tool_defs():
+                    _tid = _sd.get('id', '')
+                    if not _tid:
+                        continue
+                    # Parse skill:<skill_id>:<fn_name>
+                    _parts = _tid.split(':', 2)
+                    if len(_parts) != 3 or _parts[0] != 'skill':
+                        continue
+                    _skill_id = _parts[1]
+                    if _skill_id in assigned_skill_ids and _tid not in _existing_ids:
+                        assigned_tool_ids.append(_tid)
+
+            # Auto-assign artifact tools (save_artifact, list_artifacts, fetch_artifact)
+            # only when artifacts_enabled is True for the agent.
+            if agent.get('artifacts_enabled', True):
+                if 'save_artifact' not in assigned_tool_ids:
+                    assigned_tool_ids.append('save_artifact')
+
+                # Agents with save_artifact automatically get list_artifacts.
+                # fetch_artifact is only auto-assigned for agents with workplace or sandbox;
+                # local agents can access artifacts directly via bash/runpy.
+                if 'save_artifact' in assigned_tool_ids:
+                    if 'list_artifacts' not in assigned_tool_ids:
+                        assigned_tool_ids.append('list_artifacts')
+                    if agent.get('workplace_id') or agent.get('sandbox_enabled', 0):
+                        if 'fetch_artifact' not in assigned_tool_ids:
+                            assigned_tool_ids.append('fetch_artifact')
+
+            # Agents with vision_enabled automatically get describe_image.
+            # No DB assignment needed — every vision-capable agent can analyze images.
+            if agent.get('vision_enabled', 1) and 'describe_image' not in assigned_tool_ids:
+                assigned_tool_ids.append('describe_image')
+
+            # ask_user_question is on unless the agent turned it off.
+            if agent.get('ask_user_enabled', 1) and 'ask_user_question' not in assigned_tool_ids:
+                assigned_tool_ids.append('ask_user_question')
+
+            # Agents with audio_enabled automatically get transcribe_audio.
+            if agent.get('audio_enabled') and 'transcribe_audio' not in assigned_tool_ids:
+                assigned_tool_ids.append('transcribe_audio')
+
+            # Check whether describe_image is assigned — passed through to
+            # build_message_entry so the hint is only injected when available.
+            has_describe_image = 'describe_image' in assigned_tool_ids
+
+            from backend.channels.whatsapp_identity import resolve_identity
+            _identity = resolve_identity(ctx.channel_id, ctx.external_user_id)
 
             fresh_agent_context = {
                 'id': agent_id,
+                '_db_agent_id': agent.get('_db_agent_id', agent_id),
                 'name': agent.get('name', ''),
                 'agent_name': agent.get('name', ''),
                 'agent_model': None,
                 'user_id': ctx.external_user_id,
+                'user_phone': _identity['user_phone'],
+                'user_jid': _identity['user_jid'],
+                'user_id_namespace': _identity['user_id_namespace'],
                 'channel_id': ctx.channel_id,
                 'session_id': session_id,
                 'assigned_tool_ids': assigned_tool_ids,
                 'workspace': agent.get('workspace') or None,
+                'workplace_id': agent.get('workplace_id') or None,
+                'send_file_allowed_path_regex': agent.get('send_file_allowed_path_regex', ''),
                 'is_super': bool(agent.get('is_super')),
                 'is_subagent': bool(agent.get('is_subagent')),
+                'is_explorer': bool(agent.get('is_explorer')),
                 'parent_id': agent.get('parent_id'),
+                '_sandbox_parent_session_id': agent.get('_sandbox_parent_session_id'),
+                '_sandbox_parent_workspace': agent.get('_sandbox_parent_workspace'),
                 'agent_messaging_enabled': bool(agent.get('agent_messaging_enabled')),
                 'sandbox_enabled': agent.get('sandbox_enabled', 1),
                 'safety_checker_enabled': agent.get('safety_checker_enabled', 1),
@@ -123,6 +194,13 @@ class TurnPrefetcher:
                 'disable_turn_prefetch': agent.get('disable_turn_prefetch', 0),
                 'variables': db.get_agent_variables_dict(agent_id),
                 'run_as_user': agent.get('run_as_user'),
+                'vision_model_id': agent.get('vision_model_id'),
+                'vision_enabled': agent.get('vision_enabled', 1),
+                'audio_enabled': agent.get('audio_enabled', 0),
+                'messaging_acl': agent.get('messaging_acl'),
+                'messaging_acl_mode': agent.get('messaging_acl_mode', 'whitelist'),
+                'enable_cmp': bool(agent.get('enable_cmp')) and bool(agent.get('enable_agent_state')),
+                'workplace_switch_enabled': bool(agent.get('workplace_switch_enabled')),
             }
 
             # Re-load messages from JSONL (most expensive I/O, ~10-200ms)
@@ -138,9 +216,29 @@ class TurnPrefetcher:
                     "content": f"## Prior conversation summary\n{summary_record['summary']}"
                 })
 
-            _jsonl_entries = chatlog.get_entries_for_llm(
-                after_ts=summary_record.get('last_message_ts') if summary_record else None,
-            )
+            # CMP offload: scope history to the active path's segments via the
+            # SAME shared builder the runtime uses (prefetch assumes the next
+            # turn continues the active path; the runtime discards the hit on
+            # a switch/branch decision).
+            _jsonl_entries = None
+            if agent.get('enable_cmp') and agent.get('enable_agent_state'):
+                try:
+                    import json as _json
+                    from backend.agent_runtime.cmp import assembler as _cmp_asm
+                    _sess_raw = db.get_session_state(session_id, agent_id=db_agent_id)
+                    _cmp_state = (_json.loads(_sess_raw) or {}).get('cmp') if _sess_raw else None
+                    if _cmp_asm.should_filter(_cmp_state):
+                        _jsonl_entries = _cmp_asm.build_history(
+                            chatlog, summary_record, _cmp_state)
+                except Exception:
+                    _logger.exception("CMP prefetch history filter failed — full history")
+                    _jsonl_entries = None
+            if _jsonl_entries is None:
+                from backend.agent_runtime import context as _ctx
+                _jsonl_entries = chatlog.get_entries_for_llm_trail(
+                    after_ts=summary_record.get('last_message_ts') if summary_record else None,
+                    **_ctx.trail_history_kwargs(agent_id),
+                )
             _use_jsonl = bool(_jsonl_entries) or chatlog.get_last_entry() is not None
 
             if _use_jsonl:
@@ -172,23 +270,21 @@ class TurnPrefetcher:
                         tail_start += 1
                     for msg in raw_tail[tail_start:]:
                         fresh_messages.append(
-                            _ctx.build_message_entry(msg, agent))
+                            _ctx.build_message_entry(msg, agent, has_describe_image))
                 else:
                     history = db.get_session_messages(
                         session_id, limit=50, agent_id=db_agent_id)
                     for msg in history:
                         fresh_messages.append(
-                            _ctx.build_message_entry(msg, agent))
+                            _ctx.build_message_entry(msg, agent, has_describe_image))
+
+            # Keep an authoritative metadata-only file index outside the prunable tail.
+            _ctx.sync_session_attachment_manifest(fresh_messages, session_id, db_agent_id)
 
             # Ensure messages don't end with assistant role
             while (len(fresh_messages) > 1
                    and fresh_messages[-1].get('role') == 'assistant'):
                 fresh_messages.pop()
-
-            # Inject long-term memories
-            memory_section = get_memories_for_context(agent_id, fresh_messages)
-            if memory_section:
-                fresh_messages.insert(1, {"role": "system", "content": memory_section})
 
             # Inject inter-agent context notes
             if ctx.external_user_id.startswith("__agent__"):
@@ -221,14 +317,13 @@ class TurnPrefetcher:
                     if chan_instr:
                         fresh_messages.insert(1, {"role": "system", "content": chan_instr})
 
-            # Inject channel user identity (authoritative name for this session).
-            # Skip if already present in the message list (from JSONL history) to
-            # avoid duplicates when rebuilding from scratch.
+            # Inject trusted channel sender identity.  Skip if already present in
+            # the message list (from JSONL history) to avoid duplicate blocks.
             _already_injected = any(
                 "## Current User" in (m.get("content") or "")
                 for m in fresh_messages[:6]
             )
-            if ctx.channel_id and not ctx.external_user_id.startswith("__agent__") and not _already_injected:
+            if not _already_injected:
                 user_id_ctx = _ctx.build_user_identity_context(
                     ctx.channel_id, ctx.external_user_id,
                 )
@@ -249,6 +344,8 @@ class TurnPrefetcher:
                 tools=fresh_tools,
                 system_prompt=fresh_system_prompt,
                 agent_context=fresh_agent_context,
+                summary_watermark=(summary_record.get('last_message_ts')
+                                   if summary_record else None),
                 last_user_content=last_user,
             )
 
@@ -260,13 +357,15 @@ class TurnPrefetcher:
         except Exception:
             _logger.debug("Prefetch failed for session %s", session_id, exc_info=True)
 
-    def try_get(self, session_id: str) -> Optional[_PrefetchEntry]:
-        """Try to retrieve prefetched context. Returns None if stale or missing."""
+    def try_get(self, session_id: str, *,
+                summary_watermark: Any = None) -> Optional[_PrefetchEntry]:
+        """Return context only when its age and summary watermark are current."""
         with self._lock:
             entry = self._cache.get(session_id)
             if entry is None:
                 return None
-            if time.time() - entry.timestamp > _PREFETCH_TTL_SECONDS:
+            if (time.time() - entry.timestamp > _PREFETCH_TTL_SECONDS
+                    or entry.summary_watermark != summary_watermark):
                 del self._cache[session_id]
                 return None
             return entry

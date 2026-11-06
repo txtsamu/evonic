@@ -1,0 +1,544 @@
+{# Users — search, filter, approve / block, per-user details drawer. Styles: .us-* in static/css/settings.css.
+   API: /api/settings/users (list with q/filter/sort + counts + contacts/agents/tags), .../approve, .../block,
+   .../unblock, PUT/DELETE .../<id>, .../audit. Logic: window.usersTab (below). #}
+<div class="us-page">
+    <div class="us-head">
+        <h2 class="us-title"><i data-lucide="users"></i>Users</h2>
+        <p class="us-desc">Everyone who has talked to your agents. Approve new people, block abusers, and see which channels and agents each user is tied to. Select a row for details.</p>
+    </div>
+
+    <!-- People waiting for approval -->
+    <div id="us-pending-banner" class="us-banner hidden" role="status">
+        <i data-lucide="user-check"></i>
+        <span><strong id="us-pending-count">0</strong> <span id="us-pending-label">users are waiting for approval.</span></span>
+        <button type="button" class="us-btn us-btn-primary" onclick="usersTab.setFilter('pending')">Review</button>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="us-toolbar">
+        <div class="us-search">
+            <svg class="us-search-ico" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <label for="us-search-input" class="sr-only">Search users</label>
+            <input id="us-search-input" type="search" class="us-input" autocomplete="off" placeholder="Search name, ID, phone number or notes…"
+                   oninput="usersTab.onSearch(this.value)">
+        </div>
+        <div class="us-chips" id="us-chips" role="tablist" aria-label="Filter users by status">
+            <button type="button" class="us-chip active" data-filter="all" role="tab" onclick="usersTab.setFilter('all')">All <span class="us-chip-n" data-count="all">0</span></button>
+            <button type="button" class="us-chip" data-filter="approved" role="tab" onclick="usersTab.setFilter('approved')">Approved <span class="us-chip-n" data-count="approved">0</span></button>
+            <button type="button" class="us-chip" data-filter="pending" role="tab" onclick="usersTab.setFilter('pending')">Pending <span class="us-chip-n" data-count="pending">0</span></button>
+            <button type="button" class="us-chip" data-filter="blocked" role="tab" onclick="usersTab.setFilter('blocked')">Blocked <span class="us-chip-n" data-count="blocked">0</span></button>
+        </div>
+        <select id="us-sort" class="us-select" aria-label="Sort users" onchange="usersTab.setSort(this.value)">
+            <option value="active">Last active</option>
+            <option value="name">Name A–Z</option>
+            <option value="newest">Newest first</option>
+        </select>
+    </div>
+
+    <!-- Bulk actions -->
+    <div id="us-bulk" class="us-bulk hidden">
+        <span><strong id="us-bulk-n">0</strong> selected</span>
+        <button type="button" class="us-btn us-btn-success" onclick="usersTab.bulk('approve')">Approve</button>
+        <button type="button" class="us-btn us-btn-danger" onclick="usersTab.bulk('block')">Block…</button>
+        <button type="button" class="us-btn" onclick="usersTab.clearSelection()">Clear</button>
+    </div>
+
+    <!-- List -->
+    <div class="us-card">
+        <div class="us-table-wrap">
+            <table class="us-table">
+                <thead>
+                    <tr>
+                        <th class="us-col-check"><input type="checkbox" id="us-check-all" aria-label="Select all users on this page" onchange="usersTab.toggleAll(this.checked)"></th>
+                        <th>User</th>
+                        <th>Contacts</th>
+                        <th>Agents</th>
+                        <th>Status</th>
+                        <th>Last active</th>
+                        <th class="us-col-actions">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="users-table-body">
+                    <tr><td colspan="7" class="us-empty">Loading…</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div id="users-pagination" class="us-pager hidden">
+            <span id="users-page-info" class="us-pager-info"></span>
+            <div class="us-pager-btns">
+                <button type="button" id="users-prev" class="us-btn" onclick="usersTab.goPage(usersTab.page - 1)">Previous</button>
+                <button type="button" id="users-next" class="us-btn" onclick="usersTab.goPage(usersTab.page + 1)">Next</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Details drawer -->
+<div id="us-drawer-backdrop" class="us-backdrop hidden" onclick="usersTab.closeDrawer()"></div>
+<aside id="us-drawer" class="us-drawer hidden" role="dialog" aria-modal="true" aria-label="User details">
+    <div class="us-drawer-head">
+        <div id="us-drawer-title" class="us-drawer-title"></div>
+        <button type="button" class="us-icon-btn" onclick="usersTab.closeDrawer()" aria-label="Close details">&times;</button>
+    </div>
+    <div id="us-drawer-body" class="us-drawer-body"></div>
+</aside>
+
+<!-- Block / confirm dialog -->
+<div id="us-dialog-backdrop" class="us-backdrop us-backdrop-modal hidden" onclick="usersTab.closeDialog()"></div>
+<div id="us-dialog" class="us-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="us-dialog-title">
+    <h3 id="us-dialog-title" class="us-dialog-title"></h3>
+    <p id="us-dialog-text" class="us-dialog-text"></p>
+    <label id="us-dialog-reason-wrap" class="us-dialog-reason hidden">
+        <span>Reason <em>(optional — shown in the audit trail)</em></span>
+        <textarea id="us-dialog-reason" class="us-input us-textarea" rows="3" placeholder="e.g. spam, abusive messages"></textarea>
+    </label>
+    <div class="us-dialog-actions">
+        <button type="button" class="us-btn" onclick="usersTab.closeDialog()">Cancel</button>
+        <button type="button" id="us-dialog-ok" class="us-btn us-btn-danger">Confirm</button>
+    </div>
+</div>
+
+<script>
+(function() {
+    var SEARCH_DEBOUNCE_MS = 250;
+
+    window.usersTab = {
+        page: 0,
+        limit: 25,
+        filter: 'all',
+        sort: 'active',
+        q: '',
+        users: [],
+        counts: { all: 0, approved: 0, pending: 0, blocked: 0 },
+        selected: {},
+        openId: null,
+        _searchTimer: null,
+        _req: 0,
+
+        init: function() {
+            usersTab.page = 0;
+            usersTab.load();
+            document.addEventListener('keydown', function(e) {
+                if (e.key !== 'Escape') return;
+                if (!document.getElementById('us-dialog').classList.contains('hidden')) usersTab.closeDialog();
+                else if (!document.getElementById('us-drawer').classList.contains('hidden')) usersTab.closeDrawer();
+            });
+        },
+
+        /* ---------- data ---------- */
+        load: function(opts) {
+            var myReq = ++usersTab._req;
+            var url = '/api/settings/users?filter=' + encodeURIComponent(usersTab.filter) +
+                '&sort=' + encodeURIComponent(usersTab.sort) +
+                '&q=' + encodeURIComponent(usersTab.q) +
+                '&limit=' + usersTab.limit + '&offset=' + (usersTab.page * usersTab.limit);
+            if (!(opts && opts.silent)) {
+                document.getElementById('users-table-body').innerHTML = '<tr><td colspan="7" class="us-empty">Loading…</td></tr>';
+            }
+            return fetch(url)
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (myReq !== usersTab._req) return;     // a newer request superseded this one
+                    usersTab.render(data);
+                })
+                .catch(function(err) {
+                    if (myReq !== usersTab._req) return;
+                    document.getElementById('users-table-body').innerHTML =
+                        '<tr><td colspan="7" class="us-empty us-error">Could not load users: ' + usersTab.esc(err.message) + '</td></tr>';
+                });
+        },
+
+        onSearch: function(value) {
+            clearTimeout(usersTab._searchTimer);
+            usersTab._searchTimer = setTimeout(function() {
+                usersTab.q = value.trim();
+                usersTab.page = 0;
+                usersTab.load();
+            }, SEARCH_DEBOUNCE_MS);
+        },
+
+        setFilter: function(f) {
+            usersTab.filter = f;
+            usersTab.page = 0;
+            usersTab.clearSelection(true);
+            usersTab.load();
+        },
+
+        setSort: function(s) {
+            usersTab.sort = s;
+            usersTab.page = 0;
+            usersTab.load();
+        },
+
+        goPage: function(p) {
+            usersTab.page = Math.max(0, p);
+            usersTab.clearSelection(true);
+            usersTab.load();
+        },
+
+        /* ---------- rendering ---------- */
+        render: function(data) {
+            usersTab.users = data.users || [];
+            usersTab.counts = data.counts || usersTab.counts;
+            var total = data.total || 0;
+            var tbody = document.getElementById('users-table-body');
+
+            // chips + pending banner
+            document.querySelectorAll('#us-chips .us-chip').forEach(function(c) {
+                c.classList.toggle('active', c.dataset.filter === usersTab.filter);
+                c.setAttribute('aria-selected', c.dataset.filter === usersTab.filter ? 'true' : 'false');
+            });
+            ['all', 'approved', 'pending', 'blocked'].forEach(function(k) {
+                var el = document.querySelector('[data-count="' + k + '"]');
+                if (el) el.textContent = usersTab.counts[k] || 0;
+            });
+            var pending = usersTab.counts.pending || 0;
+            var banner = document.getElementById('us-pending-banner');
+            banner.classList.toggle('hidden', !(pending > 0 && usersTab.filter !== 'pending'));
+            document.getElementById('us-pending-count').textContent = pending;
+            document.getElementById('us-pending-label').textContent = pending === 1 ? 'user is waiting for approval.' : 'users are waiting for approval.';
+
+            if (usersTab.users.length === 0) {
+                var searching = usersTab.q || usersTab.filter !== 'all';
+                tbody.innerHTML = '<tr><td colspan="7" class="us-empty">' +
+                    (searching ? 'No users match your search or filter.' : 'No users yet. People appear here after their first message to an agent.') + '</td></tr>';
+                document.getElementById('users-pagination').classList.add('hidden');
+                usersTab.syncBulk();
+                return;
+            }
+
+            tbody.innerHTML = usersTab.users.map(usersTab.row).join('');
+
+            var totalPages = Math.ceil(total / usersTab.limit);
+            var pager = document.getElementById('users-pagination');
+            var from = usersTab.page * usersTab.limit + 1;
+            var to = Math.min(total, from + usersTab.users.length - 1);
+            document.getElementById('users-page-info').textContent = from + '–' + to + ' of ' + total;
+            pager.classList.toggle('hidden', totalPages <= 1);
+            document.getElementById('users-prev').disabled = usersTab.page === 0;
+            document.getElementById('users-next').disabled = usersTab.page >= totalPages - 1;
+            usersTab.syncBulk();
+            if (window.lucide) { try { window.lucide.createIcons(); } catch (e) {} }
+        },
+
+        row: function(u) {
+            var id = usersTab.escAttr(u.id);
+            var contacts = u.contacts || [];
+            var agents = u.agents || [];
+            var chips = function(items, render, max, label) {
+                if (!items.length) return '<span class="us-muted">—</span>';
+                var html = items.slice(0, max).map(render).join('');
+                if (items.length > max) html += '<span class="us-pill us-pill-more" title="' + usersTab.esc(items.slice(max).map(label).join(', ')) + '">+' + (items.length - max) + '</span>';
+                return html;
+            };
+            var contactHtml = chips(contacts, function(c) {
+                return '<span class="us-pill" title="' + usersTab.esc(c.channel_type + ': ' + c.value) + '"><b>' + usersTab.esc(usersTab.channelLabel(c.channel_type)) + '</b>' + usersTab.esc(c.value) + '</span>';
+            }, 2, function(c) { return c.value; });
+            var agentHtml = chips(agents, function(a) { return '<span class="us-pill us-pill-agent">' + usersTab.esc(a.name) + '</span>'; }, 2, function(a) { return a.name; });
+            var initial = (u.name || u.id || '?').trim().charAt(0).toUpperCase() || '?';
+            var checked = usersTab.selected[u.id] ? ' checked' : '';
+            return '<tr class="us-row' + (usersTab.openId === u.id ? ' open' : '') + '" onclick="usersTab.openDrawer(\'' + id + '\')">' +
+                '<td class="us-col-check" onclick="event.stopPropagation()"><input type="checkbox"' + checked + ' aria-label="Select ' + usersTab.esc(u.name || u.id) + '" onchange="usersTab.toggle(\'' + id + '\', this.checked)"></td>' +
+                '<td><div class="us-user"><span class="us-avatar ' + usersTab.statusKey(u) + '">' + usersTab.esc(initial) + '</span>' +
+                '<div class="us-user-text"><div class="us-user-name">' + usersTab.esc(u.name || '(no name)') + '</div>' +
+                '<div class="us-user-id">' + usersTab.esc(u.id) + '</div></div></div></td>' +
+                '<td><div class="us-pills">' + contactHtml + '</div></td>' +
+                '<td><div class="us-pills">' + agentHtml + '</div></td>' +
+                '<td>' + usersTab.statusBadge(u) + '</td>' +
+                '<td class="us-nowrap" title="' + usersTab.esc(usersTab.formatDate(u.last_active_at)) + '">' + usersTab.esc(usersTab.ago(u.last_active_at)) + '</td>' +
+                '<td class="us-col-actions" onclick="event.stopPropagation()">' + usersTab.rowActions(u) + '</td></tr>';
+        },
+
+        rowActions: function(u) {
+            var id = usersTab.escAttr(u.id);
+            var name = usersTab.escAttr(u.name || u.id);
+            var key = usersTab.statusKey(u);
+            if (key === 'pending') {
+                return '<button type="button" class="us-btn us-btn-success us-btn-sm" onclick="usersTab.approve(\'' + id + '\')">Approve</button>' +
+                       '<button type="button" class="us-btn us-btn-danger-ghost us-btn-sm" onclick="usersTab.askBlock([\'' + id + '\'], \'' + name + '\')">Block</button>';
+            }
+            if (key === 'blocked') {
+                return '<button type="button" class="us-btn us-btn-success us-btn-sm" onclick="usersTab.unblock(\'' + id + '\')">Unblock</button>';
+            }
+            return '<button type="button" class="us-btn us-btn-danger-ghost us-btn-sm" onclick="usersTab.askBlock([\'' + id + '\'], \'' + name + '\')">Block</button>';
+        },
+
+        statusKey: function(u) {
+            if (u.is_approved === 2 || u.blocked_at) return 'blocked';
+            if (u.is_approved === 1) return 'approved';
+            return 'pending';
+        },
+
+        statusBadge: function(u) {
+            var k = usersTab.statusKey(u);
+            var label = { approved: 'Approved', blocked: 'Blocked', pending: 'Pending' }[k];
+            return '<span class="us-status us-status-' + k + '"><i></i>' + label + '</span>';
+        },
+
+        channelLabel: function(t) {
+            var map = { whatsapp: 'WhatsApp', telegram: 'Telegram', discord: 'Discord', web: 'Web', email: 'Email', slack: 'Slack' };
+            return map[t] || (t ? t.charAt(0).toUpperCase() + t.slice(1) : '?');
+        },
+
+        /* ---------- selection / bulk ---------- */
+        toggle: function(id, on) {
+            if (on) usersTab.selected[id] = true; else delete usersTab.selected[id];
+            usersTab.syncBulk();
+        },
+
+        toggleAll: function(on) {
+            usersTab.users.forEach(function(u) { if (on) usersTab.selected[u.id] = true; else delete usersTab.selected[u.id]; });
+            document.querySelectorAll('#users-table-body .us-col-check input').forEach(function(cb) { cb.checked = on; });
+            usersTab.syncBulk();
+        },
+
+        clearSelection: function(silent) {
+            usersTab.selected = {};
+            document.querySelectorAll('#users-table-body .us-col-check input').forEach(function(cb) { cb.checked = false; });
+            if (!silent) usersTab.syncBulk(); else document.getElementById('us-bulk').classList.add('hidden');
+        },
+
+        syncBulk: function() {
+            var n = Object.keys(usersTab.selected).length;
+            document.getElementById('us-bulk').classList.toggle('hidden', n === 0);
+            document.getElementById('us-bulk-n').textContent = n;
+            var all = document.getElementById('us-check-all');
+            var onPage = usersTab.users.filter(function(u) { return usersTab.selected[u.id]; }).length;
+            all.checked = usersTab.users.length > 0 && onPage === usersTab.users.length;
+            all.indeterminate = onPage > 0 && onPage < usersTab.users.length;
+        },
+
+        bulk: function(action) {
+            var ids = Object.keys(usersTab.selected);
+            if (!ids.length) return;
+            if (action === 'block') { usersTab.askBlock(ids, ids.length + ' users'); return; }
+            usersTab.runMany(ids, function(id) { return usersTab.post(id, 'approve'); }, 'approved');
+        },
+
+        runMany: function(ids, fn, doneLabel) {
+            return Promise.all(ids.map(function(id) { return fn(id).then(function() { return true; }, function() { return false; }); }))
+                .then(function(results) {
+                    var ok = results.filter(Boolean).length;
+                    usersTab.toast(ok + ' user' + (ok === 1 ? '' : 's') + ' ' + doneLabel + (ok < ids.length ? ' (' + (ids.length - ok) + ' failed)' : ''), ok < ids.length ? 'error' : 'success');
+                    usersTab.clearSelection(true);
+                    return usersTab.refresh();
+                });
+        },
+
+        /* ---------- actions ---------- */
+        post: function(id, action, body) {
+            return fetch('/api/settings/users/' + encodeURIComponent(id) + '/' + action, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {})
+            }).then(function(r) { return r.json().then(function(d) { if (!r.ok || d.error) throw new Error(d.error || 'Request failed'); return d; }); });
+        },
+
+        refresh: function() {
+            return usersTab.load({ silent: true }).then(function() {
+                if (usersTab.openId) usersTab.openDrawer(usersTab.openId, true);
+            });
+        },
+
+        approve: function(id) {
+            usersTab.post(id, 'approve')
+                .then(function() { usersTab.toast('User approved', 'success'); return usersTab.refresh(); })
+                .catch(function(e) { usersTab.toast(e.message, 'error'); });
+        },
+
+        unblock: function(id) {
+            usersTab.post(id, 'unblock')
+                .then(function() { usersTab.toast('User unblocked', 'success'); return usersTab.refresh(); })
+                .catch(function(e) { usersTab.toast(e.message, 'error'); });
+        },
+
+        askBlock: function(ids, label) {
+            usersTab.dialog({
+                title: 'Block ' + label + '?',
+                text: 'Blocked users can no longer message your agents. You can unblock them at any time.',
+                reason: true,
+                okLabel: 'Block',
+                onOk: function(reason) {
+                    usersTab.closeDialog();
+                    usersTab.runMany(ids, function(id) { return usersTab.post(id, 'block', { reason: reason }); }, 'blocked');
+                }
+            });
+        },
+
+        askDelete: function(id, label) {
+            usersTab.dialog({
+                title: 'Delete ' + label + '?',
+                text: 'The user is removed from this list. Their history is kept, and they are created again if they message an agent.',
+                okLabel: 'Delete',
+                onOk: function() {
+                    usersTab.closeDialog();
+                    fetch('/api/settings/users/' + encodeURIComponent(id), { method: 'DELETE' })
+                        .then(function(r) { return r.json().then(function(d) { if (!r.ok || d.error) throw new Error(d.error || 'Delete failed'); }); })
+                        .then(function() { usersTab.toast('User deleted', 'success'); usersTab.closeDrawer(); return usersTab.refresh(); })
+                        .catch(function(e) { usersTab.toast(e.message, 'error'); });
+                }
+            });
+        },
+
+        saveDetails: function(id) {
+            var name = document.getElementById('us-edit-name').value.trim();
+            var notes = document.getElementById('us-edit-notes').value;
+            if (!name) { usersTab.toast('Name cannot be empty', 'error'); return; }
+            fetch('/api/settings/users/' + encodeURIComponent(id), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: name, notes: notes })
+            })
+                .then(function(r) { return r.json().then(function(d) { if (!r.ok || d.error) throw new Error(d.error || 'Save failed'); }); })
+                .then(function() { usersTab.toast('Saved', 'success'); return usersTab.refresh(); })
+                .catch(function(e) { usersTab.toast(e.message, 'error'); });
+        },
+
+        /* ---------- dialog ---------- */
+        dialog: function(cfg) {
+            document.getElementById('us-dialog-title').textContent = cfg.title;
+            document.getElementById('us-dialog-text').textContent = cfg.text || '';
+            var wrap = document.getElementById('us-dialog-reason-wrap');
+            var reason = document.getElementById('us-dialog-reason');
+            wrap.classList.toggle('hidden', !cfg.reason);
+            reason.value = '';
+            var ok = document.getElementById('us-dialog-ok');
+            ok.textContent = cfg.okLabel || 'Confirm';
+            ok.onclick = function() { cfg.onOk(reason.value.trim()); };
+            document.getElementById('us-dialog-backdrop').classList.remove('hidden');
+            document.getElementById('us-dialog').classList.remove('hidden');
+            (cfg.reason ? reason : ok).focus();
+        },
+
+        closeDialog: function() {
+            document.getElementById('us-dialog-backdrop').classList.add('hidden');
+            document.getElementById('us-dialog').classList.add('hidden');
+        },
+
+        /* ---------- drawer ---------- */
+        openDrawer: function(id, keepScroll) {
+            var u = usersTab.users.filter(function(x) { return x.id === id; })[0];
+            if (!u) { usersTab.closeDrawer(); return; }
+            usersTab.openId = id;
+            var key = usersTab.statusKey(u);
+            var body = document.getElementById('us-drawer-body');
+            var scroll = keepScroll ? body.scrollTop : 0;
+            document.getElementById('us-drawer-title').innerHTML =
+                '<span class="us-avatar us-avatar-lg ' + key + '">' + usersTab.esc((u.name || u.id || '?').trim().charAt(0).toUpperCase() || '?') + '</span>' +
+                '<div class="us-user-text"><div class="us-drawer-name">' + usersTab.esc(u.name || '(no name)') + '</div><div class="us-user-id">' + usersTab.esc(u.id) + '</div></div>' + usersTab.statusBadge(u);
+
+            var contacts = (u.contacts || []).map(function(c) {
+                return '<li><b>' + usersTab.esc(usersTab.channelLabel(c.channel_type)) + '</b><span>' + usersTab.esc(c.value) + '</span>' + (c.is_primary ? '<em>primary</em>' : '') + '</li>';
+            }).join('') || '<li class="us-muted">No contacts recorded.</li>';
+            var agents = (u.agents || []).map(function(a) {
+                return '<li><b>Agent</b><span>' + usersTab.esc(a.name) + '</span><a href="/agents/' + encodeURIComponent(a.id) + '#chat" class="us-link">Open</a></li>';
+            }).join('') || '<li class="us-muted">Not linked to any agent yet.</li>';
+            var tags = (u.tags || []).map(function(t) { return '<span class="us-pill">' + usersTab.esc(t) + '</span>'; }).join('') || '<span class="us-muted">No tags.</span>';
+
+            var blockInfo = '';
+            if (key === 'blocked') {
+                blockInfo = '<div class="us-callout us-callout-danger"><strong>Blocked</strong>' + (u.blocked_at ? ' · ' + usersTab.esc(usersTab.formatDate(u.blocked_at)) : '') +
+                    '<div>' + usersTab.esc(u.blocked_reason || 'No reason given.') + '</div></div>';
+            } else if (key === 'pending') {
+                blockInfo = '<div class="us-callout us-callout-warn"><strong>Waiting for approval.</strong> Until approved, this user cannot use agents that require approval.</div>';
+            }
+
+            var primary = key === 'blocked'
+                ? '<button type="button" class="us-btn us-btn-success" onclick="usersTab.unblock(\'' + usersTab.escAttr(u.id) + '\')">Unblock</button>'
+                : (key === 'pending' ? '<button type="button" class="us-btn us-btn-success" onclick="usersTab.approve(\'' + usersTab.escAttr(u.id) + '\')">Approve</button>' : '') +
+                  '<button type="button" class="us-btn us-btn-danger" onclick="usersTab.askBlock([\'' + usersTab.escAttr(u.id) + '\'], \'' + usersTab.escAttr(u.name || u.id) + '\')">Block</button>';
+
+            body.innerHTML = blockInfo +
+                '<div class="us-actions">' + primary +
+                '<button type="button" class="us-btn us-btn-danger-ghost us-push" onclick="usersTab.askDelete(\'' + usersTab.escAttr(u.id) + '\', \'' + usersTab.escAttr(u.name || u.id) + '\')">Delete</button></div>' +
+                '<section class="us-sec"><h4>Details</h4>' +
+                '<label class="us-field"><span>Name</span><input id="us-edit-name" class="us-input" value="' + usersTab.esc(u.name || '') + '"></label>' +
+                '<label class="us-field"><span>Notes</span><textarea id="us-edit-notes" class="us-input us-textarea" rows="4" placeholder="Anything worth remembering about this user">' + usersTab.esc(u.notes || '') + '</textarea></label>' +
+                '<button type="button" class="us-btn us-btn-primary" onclick="usersTab.saveDetails(\'' + usersTab.escAttr(u.id) + '\')">Save changes</button></section>' +
+                '<section class="us-sec"><h4>Contacts</h4><ul class="us-list">' + contacts + '</ul></section>' +
+                '<section class="us-sec"><h4>Agents</h4><ul class="us-list">' + agents + '</ul></section>' +
+                '<section class="us-sec"><h4>Tags</h4><div class="us-pills">' + tags + '</div></section>' +
+                '<section class="us-sec"><h4>Activity</h4><ul class="us-list">' +
+                '<li><b>First seen</b><span>' + usersTab.esc(usersTab.formatDate(u.first_seen_at || u.created_at)) + '</span></li>' +
+                '<li><b>Last active</b><span>' + usersTab.esc(usersTab.formatDate(u.last_active_at)) + '</span></li></ul></section>' +
+                '<section class="us-sec"><h4>Audit trail</h4><div id="us-audit" class="us-audit"><span class="us-muted">Loading…</span></div></section>';
+            body.scrollTop = scroll;
+
+            document.getElementById('us-drawer-backdrop').classList.remove('hidden');
+            document.getElementById('us-drawer').classList.remove('hidden');
+            document.querySelectorAll('#users-table-body .us-row').forEach(function(r) { r.classList.remove('open'); });
+            usersTab.loadAudit(u.id);
+        },
+
+        closeDrawer: function() {
+            usersTab.openId = null;
+            document.getElementById('us-drawer-backdrop').classList.add('hidden');
+            document.getElementById('us-drawer').classList.add('hidden');
+            document.querySelectorAll('#users-table-body .us-row').forEach(function(r) { r.classList.remove('open'); });
+        },
+
+        loadAudit: function(id) {
+            fetch('/api/settings/users/' + encodeURIComponent(id) + '/audit')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var box = document.getElementById('us-audit');
+                    if (!box || usersTab.openId !== id) return;
+                    var logs = data.audit_logs || [];
+                    if (!logs.length) { box.innerHTML = '<span class="us-muted">No audit records.</span>'; return; }
+                    box.innerHTML = logs.map(function(log) {
+                        var reason = '';
+                        try { var d = JSON.parse(log.details || '{}'); if (d.reason) reason = d.reason; } catch (e) {}
+                        return '<div class="us-audit-item"><div class="us-audit-top"><strong class="us-audit-' + usersTab.esc(log.action) + '">' + usersTab.esc(log.action) + '</strong>' +
+                            '<span title="' + usersTab.esc(usersTab.formatDate(log.created_at)) + '">' + usersTab.esc(usersTab.ago(log.created_at)) + '</span></div>' +
+                            '<div class="us-audit-meta">by ' + usersTab.esc(log.actor_id || log.actor_type || 'system') + (reason ? ' · ' + usersTab.esc(reason) : '') + '</div></div>';
+                    }).join('');
+                })
+                .catch(function() {
+                    var box = document.getElementById('us-audit');
+                    if (box) box.innerHTML = '<span class="us-muted us-error">Could not load the audit trail.</span>';
+                });
+        },
+
+        /* ---------- helpers ---------- */
+        toast: function(msg, type) {
+            if (window.toast && typeof window.toast.show === 'function') window.toast.show(msg, type || 'info');
+        },
+
+        parseDate: function(dt) {
+            if (!dt) return null;
+            var s = String(dt).replace(' ', 'T');
+            if (!/[zZ]|[+-]\d\d:?\d\d$/.test(s)) s += 'Z';
+            var d = new Date(s);
+            return isNaN(d.getTime()) ? null : d;
+        },
+
+        formatDate: function(dt) {
+            var d = usersTab.parseDate(dt);
+            if (!d) return dt || '—';
+            return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) + ' ' +
+                d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        },
+
+        ago: function(dt) {
+            var d = usersTab.parseDate(dt);
+            if (!d) return '—';
+            var sec = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+            if (sec < 60) return 'just now';
+            var min = Math.round(sec / 60); if (min < 60) return min + 'm ago';
+            var hr = Math.round(min / 60); if (hr < 24) return hr + 'h ago';
+            var day = Math.round(hr / 24); if (day < 30) return day + 'd ago';
+            return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+        },
+
+        esc: function(s) {
+            if (s === null || s === undefined) return '';
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        },
+
+        escAttr: function(s) {
+            if (s === null || s === undefined) return '';
+            return String(s).replace(/\\/g, '\\\\').replace(/&/g, '&amp;').replace(/'/g, '\\\'').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+    };
+})();
+</script>

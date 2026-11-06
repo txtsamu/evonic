@@ -17,8 +17,8 @@ from typing import Any, Dict, List, Optional
 
 _logger = logging.getLogger(__name__)
 
-# Auto-destroy after 10 minutes of idle
-_SUBAGENT_IDLE_TTL = 600  # seconds
+# Auto-destroy after 30 minutes of idle (default), configurable via env
+_SUBAGENT_IDLE_TTL = int(os.environ.get("EVONIC_SUBAGENT_IDLE_TTL", "1800"))
 _MAX_SUBAGENTS_PER_PARENT = 10
 
 
@@ -118,6 +118,110 @@ class SubAgentManager:
         self._ensure_cleanup()
 
         return sub_id
+
+    def spawn_explorer(self, parent_agent: Dict[str, Any], build_config, id_kind: str = 'explorer') -> str:
+        """Spawn an explorer sub-agent from a pre-built config (NOT a parent copy).
+
+        Unlike ``spawn``, the explorer's config is supplied by ``build_config`` — a
+        callable that receives the allocated explorer id and returns the full config
+        dict (see backend.agent_runtime.explorer.build_config). The explorer does not
+        inherit the parent's model/tools/prompt. It is registered in the same
+        ``_subagents`` map so ``get``, idle cleanup, destroy, and the runtime
+        in-memory lookup all keep working.
+
+        Args:
+            parent_agent: Full agent dict from DB (must have 'id').
+            build_config: Callable[[explorer_id: str], Dict] returning the config.
+
+        Returns:
+            The explorer's ID string.
+
+        Raises:
+            ValueError: if parent_agent has no 'id' or the per-parent cap is reached.
+        """
+        parent_id = parent_agent.get('id', '')
+        if not parent_id:
+            raise ValueError("parent_agent must have an 'id'")
+
+        with self._lock:
+            active_count = sum(
+                1 for s in self._subagents.values()
+                if s.parent_id == parent_id
+            )
+            if active_count >= _MAX_SUBAGENTS_PER_PARENT:
+                raise ValueError(
+                    f"Cannot spawn more sub-agents: limit of "
+                    f"{_MAX_SUBAGENTS_PER_PARENT} active sub-agents reached. "
+                    f"Destroy existing sub-agents first."
+                )
+            counter = self._counters.get(parent_id, 0) + 1
+            self._counters[parent_id] = counter
+
+        # id_kind ('explorer' | 'organizer' | ...) marks the sub-agent's role in
+        # its id so the sessions UI / parent-resolution can label it correctly.
+        explorer_id = f"{parent_id}_{id_kind}_{counter}"
+        config = build_config(explorer_id)
+
+        sub = SubAgent(explorer_id, parent_id, config)
+
+        with self._lock:
+            self._subagents[explorer_id] = sub
+
+        _logger.info(
+            "Explorer spawned: %s (parent=%s, counter=%d)",
+            explorer_id, parent_id, counter,
+        )
+
+        self._ensure_cleanup()
+
+        return explorer_id
+
+    def register_ephemeral(self, agent_id: str, config: Dict[str, Any],
+                           parent_id: Optional[str] = None) -> str:
+        """Register a purely in-memory, row-less agent under *agent_id*.
+
+        Unlike :meth:`spawn` / :meth:`spawn_explorer` this does NOT inherit from a
+        parent and does NOT enforce the per-parent cap: the caller supplies the
+        complete, already-resolved config.  The id is placed in the same
+        ``_subagents`` map so every consumer keeps working unchanged:
+
+        * ``get`` / the runtime's in-memory lookup fall back to it when
+          ``db.get_agent`` returns None (row-less lookup);
+        * ``is_subagent`` returns True, which routes the /tmp sidecar trees
+          (per-agent chat DB, chatlog, llm_trace) away from the live
+          ``agents/<id>/`` directory.
+
+        Callers that want *own-id* resource resolution (e.g. template simulations)
+        must simply omit ``is_subagent`` from *config*: the manager's registry
+        membership still drives the /tmp routing, while ``context._effective_id``
+        keeps returning the agent's own id.
+
+        Returns *agent_id*.  Raises ValueError if the id is already registered.
+        """
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        with self._lock:
+            if agent_id in self._subagents:
+                raise ValueError(f"ephemeral agent already registered: {agent_id}")
+        sub = SubAgent(agent_id, parent_id or agent_id, config)
+        with self._lock:
+            self._subagents[agent_id] = sub
+        _logger.info("Ephemeral agent registered: %s", agent_id)
+        self._ensure_cleanup()
+        return agent_id
+
+    def deregister_ephemeral(self, agent_id: str) -> bool:
+        """Remove an ephemeral agent from the registry WITHOUT archiving.
+
+        Used by simulation teardown: the sim's own sessions live in a throwaway
+        /tmp chat DB that the caller deletes, so archiving into a (possibly
+        non-existent) parent would only leak rows into the live tree.
+        """
+        with self._lock:
+            removed = self._subagents.pop(agent_id, None)
+        if removed is not None:
+            _logger.info("Ephemeral agent deregistered: %s", agent_id)
+        return removed is not None
 
     def destroy(self, sub_agent_id: str) -> bool:
         """Destroy a sub-agent by ID.

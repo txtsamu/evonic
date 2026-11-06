@@ -13,7 +13,7 @@ class ChannelMixin:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM channels WHERE agent_id = ? ORDER BY name", (agent_id,))
+            cursor.execute("SELECT id, agent_id, type, name, config, enabled, created_at, updated_at FROM channels WHERE agent_id = ? ORDER BY name LIMIT 100", (agent_id,))
             results = []
             for row in cursor.fetchall():
                 d = dict(row)
@@ -29,7 +29,7 @@ class ChannelMixin:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM channels WHERE id = ?", (channel_id,))
+            cursor.execute("SELECT id, agent_id, type, name, config, enabled, created_at, updated_at FROM channels WHERE id = ?", (channel_id,))
             row = cursor.fetchone()
             if not row:
                 return None
@@ -41,8 +41,28 @@ class ChannelMixin:
                     pass
             return d
 
+    def get_shared_channels(self) -> List[Dict[str, Any]]:
+        """Channels not bound to any agent (agent_id IS NULL) — shared
+        channels managed centrally in System Settings."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, agent_id, type, name, config, enabled, created_at, updated_at "
+                "FROM channels WHERE agent_id IS NULL ORDER BY name LIMIT 100")
+            results = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                if d.get('config'):
+                    try:
+                        d['config'] = json.loads(d['config'])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                results.append(d)
+            return results
+
     def create_channel(self, channel: Dict[str, Any]) -> str:
-        agent_id = channel['agent_id']
+        agent_id = channel.get('agent_id')  # None for shared channels
         name = channel.get('name', '')
         chan_id = channel.get('id') or str(uuid.uuid4())
         cfg = channel.get('config', {})
@@ -52,8 +72,9 @@ class ChannelMixin:
         with self._connect() as conn:
             cursor = conn.cursor()
             # Guard: no duplicate channel name within the same agent
+            # (IS is NULL-safe equality — covers agentless shared channels)
             cursor.execute(
-                "SELECT id FROM channels WHERE agent_id = ? AND name = ?",
+                "SELECT id FROM channels WHERE agent_id IS ? AND name = ?",
                 (agent_id, name)
             )
             if cursor.fetchone():
@@ -115,11 +136,85 @@ class ChannelMixin:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ==================== Shared-Channel Inbox Methods ====================
+
+    _INBOX_MAX_PER_CHANNEL = 100
+    _INBOX_PREVIEW_LEN = 200
+
+    def record_inbox_sender(self, channel_id: str, external_user_id: str,
+                            alt_user_id: str = '', push_name: str = '',
+                            is_group: bool = False, group_name: str = '',
+                            preview: str = '') -> None:
+        """Upsert an unmapped sender into the shared-channel inbox so the
+        admin can assign them to an agent. Repeated messages bump the count
+        and refresh identity hints/preview. Capped per channel (oldest-seen
+        rows pruned) so a spammed public number can't grow it unboundedly."""
+        preview = (preview or '')[:self._INBOX_PREVIEW_LEN]
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO shared_channel_inbox
+                    (id, channel_id, external_user_id, alt_user_id, push_name,
+                     is_group, group_name, last_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id, external_user_id) DO UPDATE SET
+                    alt_user_id = CASE WHEN excluded.alt_user_id != '' THEN excluded.alt_user_id ELSE alt_user_id END,
+                    push_name = CASE WHEN excluded.push_name != '' THEN excluded.push_name ELSE push_name END,
+                    group_name = CASE WHEN excluded.group_name != '' THEN excluded.group_name ELSE group_name END,
+                    last_message = excluded.last_message,
+                    message_count = message_count + 1,
+                    last_seen = CURRENT_TIMESTAMP
+            """, (str(uuid.uuid4()), channel_id, external_user_id,
+                  alt_user_id or '', push_name or '',
+                  1 if is_group else 0, group_name or '', preview))
+            cursor.execute("""
+                DELETE FROM shared_channel_inbox WHERE channel_id = ? AND id NOT IN (
+                    SELECT id FROM shared_channel_inbox WHERE channel_id = ?
+                    ORDER BY last_seen DESC LIMIT ?)
+            """, (channel_id, channel_id, self._INBOX_MAX_PER_CHANNEL))
+            conn.commit()
+
+    def cleanup_expired_inbox_entries(self, retention_hours: int) -> int:
+        """Remove unassigned senders inactive longer than ``retention_hours``."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM shared_channel_inbox "
+                "WHERE last_seen < datetime('now', ?)",
+                (f'-{retention_hours} hours',),
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def get_inbox(self, channel_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM shared_channel_inbox WHERE channel_id = ? "
+                "ORDER BY last_seen DESC", (channel_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_inbox_entry(self, entry_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM shared_channel_inbox WHERE id = ?", (entry_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_inbox_entry(self, entry_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM shared_channel_inbox WHERE id = ?", (entry_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
     # ==================== Pending Approval Methods ====================
 
     @staticmethod
     def _generate_pair_code() -> str:
-        """Generate 6-char pairing code (unambiguous charset, no hyphen)."""
+        """Generate an EVN-XXXX pairing code (unambiguous charset)."""
         from backend.channels.pairing import generate_pair_code as _gen
         return _gen()
 
@@ -144,7 +239,7 @@ class ChannelMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""\
-                SELECT * FROM channel_pending_approvals
+                SELECT id, channel_id, external_user_id, user_name, pair_code, created_at, expires_at FROM channel_pending_approvals
                 WHERE channel_id = ? AND expires_at > CURRENT_TIMESTAMP
                 ORDER BY created_at DESC
             """, (channel_id,))
@@ -156,7 +251,7 @@ class ChannelMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""\
-                SELECT * FROM channel_pending_approvals
+                SELECT id, channel_id, external_user_id, user_name, pair_code, created_at, expires_at FROM channel_pending_approvals
                 WHERE pair_code = ? AND expires_at > CURRENT_TIMESTAMP
             """, (pair_code,))
             row = cursor.fetchone()
@@ -182,12 +277,12 @@ class ChannelMixin:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             # Get pending record
-            cursor.execute("SELECT * FROM channel_pending_approvals WHERE id = ?", (pending_id,))
+            cursor.execute("SELECT id, channel_id, external_user_id, user_name, pair_code, created_at, expires_at FROM channel_pending_approvals WHERE id = ?", (pending_id,))
             pending = cursor.fetchone()
             if not pending:
                 return False
             # Get channel
-            cursor.execute("SELECT * FROM channels WHERE id = ?", (pending["channel_id"],))
+            cursor.execute("SELECT id, agent_id, type, name, config, enabled, created_at, updated_at FROM channels WHERE id = ?", (pending["channel_id"],))
             channel = cursor.fetchone()
             if not channel:
                 return False
@@ -320,14 +415,14 @@ class ChannelMixin:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM channel_pending_approvals WHERE id = ?", (pending_id,))
+            cursor.execute("SELECT id, channel_id, external_user_id, user_name, pair_code, created_at, expires_at FROM channel_pending_approvals WHERE id = ?", (pending_id,))
             pending = cursor.fetchone()
             if not pending:
                 return None
             channel_id = pending["channel_id"]
             external_user_id = pending["external_user_id"]
             pending_user_name = (pending["user_name"] or "").strip()
-            cursor.execute("SELECT * FROM channels WHERE id = ?", (channel_id,))
+            cursor.execute("SELECT id, agent_id, type, name, config, enabled, created_at, updated_at FROM channels WHERE id = ?", (channel_id,))
             channel = cursor.fetchone()
             if not channel:
                 return None

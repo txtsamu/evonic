@@ -17,10 +17,10 @@
     // -- Banner styling per state ----------------------------------------
 
     var STYLES = {
-        available: 'border-t border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300',
-        updating:  'border-t border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300',
-        success:   'border-t border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950 text-green-700 dark:text-green-300',
-        failed:    'border-t border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950 text-red-700 dark:text-red-300',
+        available: 'ev-banner ev-banner-info',
+        updating:  'ev-banner ev-banner-warn',
+        success:   'ev-banner ev-banner-ok',
+        failed:    'ev-banner ev-banner-danger',
     };
 
     function updateHeaderHeight() {
@@ -97,7 +97,8 @@
             showBanner('updating', 'Updating...' + step, linkBtn('/system/update', 'View Progress'));
             connectSSE();
         } else if (data.status === 'success') {
-            showBanner('success', 'Update complete!', actionBtn('Restart', 'window._evUpdateRestart()'));
+            if (isDismissedToday()) { hideBanner(); return; }
+            showBanner('success', 'Update complete!', actionBtn('Restart', 'window._evUpdateRestart()') + closeBtn());
         } else if (data.status === 'failed') {
             var errMsg = data.error ? ': ' + data.error : '';
             showBanner('failed', 'Update failed' + errMsg, linkBtn('/system/update', 'View Details'));
@@ -106,39 +107,39 @@
         }
     }
 
-    // -- RealtimeClient connection (unified SSE) -----------------------------------
+    // -- Shared RealtimeClient connection (unified SSE) --------------------------
+
+    var _updateRegistered = false;
 
     function connectSSE() {
-        if (sse) return;
+        if (_updateRegistered) return;
 
-        // Use RealtimeClient if available
-        if (typeof RealtimeClient !== 'undefined') {
-            var rt = window._evUpdateRT = window._evUpdateRT || new RealtimeClient({
-                channels: 'update'
-            });
-            rt.on('update', 'status', function(data) {
+        if (typeof getSharedRealtime === 'undefined') {
+            // Fallback: old EventSource
+            if (sse) return;
+            sse = new EventSource('/api/system/update/stream');
+            sse.addEventListener('status', function(e) {
+                var data = JSON.parse(e.data);
                 renderBannerState(data);
             });
-            rt.on('update', 'done', function() {
+            sse.addEventListener('done', function() {
                 if (sse) { sse.close(); sse = null; }
             });
-            rt.start();
-            sse = { close: function() { rt.stop(); } };
+            sse.onerror = function() {
+                if (sse) { sse.close(); sse = null; }
+            };
             return;
         }
 
-        // Fallback: old EventSource
-        sse = new EventSource('/api/system/update/stream');
-        sse.addEventListener('status', function(e) {
-            var data = JSON.parse(e.data);
+        // Use shared RealtimeClient — no separate connection needed.
+        _updateRegistered = true;
+        var rt = getSharedRealtime();
+        rt.on('update', 'update_status', function(data) {
             renderBannerState(data);
         });
-        sse.addEventListener('done', function() {
-            if (sse) { sse.close(); sse = null; }
+        rt.on('update', 'update_done', function() {
+            _updateRegistered = false;
         });
-        sse.onerror = function() {
-            if (sse) { sse.close(); sse = null; }
-        };
     }
 
     // -- Restart handler (exposed globally for inline onclick) ------------

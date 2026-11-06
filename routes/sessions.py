@@ -10,6 +10,7 @@ import time
 from flask import Blueprint, render_template, jsonify, request, send_file
 
 from models.db import db
+from backend.audit_logger import audit
 
 _logger = logging.getLogger(__name__)
 
@@ -21,13 +22,30 @@ sessions_bp = Blueprint('sessions', __name__)
 
 _IMAGE_MIMES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
 
+
+def _human_size(size_bytes: int | None) -> str:
+    """Render a byte count as a human-friendly string."""
+    if size_bytes is None or size_bytes < 0:
+        return '0B'
+    units = ['B', 'KB', 'MB', 'GB']
+    n = float(size_bytes)
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            if unit == 'B':
+                return f"{int(n)}{unit}"
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{int(size_bytes)}B"
+
+
 # Reuse text/pdf detection from read_attachment
 from backend.tools.read_attachment import (
-    _is_textish, _is_pdf, _read_pdf_text, _TEXTISH_EXTS,
+    _is_textish, _is_anydoc, _read_anydoc_text, _TEXTISH_EXTS,
 )
 
 _ALLOWED_EXTS = (
-    {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf'}
+    {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf', '.zip',
+     '.docx', '.xlsx', '.pptx', '.odt', '.ods', '.odp', '.rtf', '.epub'}
     | _TEXTISH_EXTS
 )
 
@@ -59,7 +77,7 @@ def _process_upload(file_storage, agent_id: str, session_id: str,
     safe_name = _sanitize_filename(original_name)
     target_dir = os.path.join('data', 'attachments', agent_id, session_id)
     os.makedirs(target_dir, exist_ok=True)
-    target_path = os.path.join(target_dir, f"{int(time.time())}_{safe_name}")
+    target_path = os.path.join(target_dir, f"{time.time_ns()}_{safe_name}")
     with open(target_path, 'wb') as f:
         f.write(file_bytes)
 
@@ -89,6 +107,20 @@ def _process_upload(file_storage, agent_id: str, session_id: str,
         'file_path': target_path,
     }
 
+    # --- Sync to remote workplace if applicable (Phase 3: proactive sync) ---
+    workplace_path = None
+    try:
+        agent = db.get_agent(agent_id)
+        if agent and (agent.get('workplace_id') or agent.get('sandbox_enabled')):
+            from backend.tools._ensure_workplace_file import ensure_workplace_file
+            workplace_path = ensure_workplace_file(target_path, agent)
+            attachment_info['workplace_path'] = workplace_path
+    except Exception as e:
+        _logger.warning(
+            "Failed to sync attachment to remote workplace for agent %s: %s",
+            agent_id, e
+        )
+
     # --- Image: convert to JPEG base64 for LLM vision ---
     if is_image:
         try:
@@ -109,10 +141,12 @@ def _process_upload(file_storage, agent_id: str, session_id: str,
             image_url = None
         return {'image_url': image_url, 'text_prefix': None, 'attachment_info': attachment_info}
 
-    # --- PDF: extract text ---
-    if _is_pdf(mime_type, target_path):
-        text = _read_pdf_text(target_path, offset=1)
+    # --- Document (PDF/Office): extract text via anydoc ---
+    if _is_anydoc(mime_type, target_path):
+        text = _read_anydoc_text(target_path, offset=1)
         prefix = f"[Attached file: {original_name}]\n```\n{text}\n```"
+        if workplace_path:
+            prefix = f"[Workplace path: {workplace_path}]\n" + prefix
         return {'image_url': None, 'text_prefix': prefix, 'attachment_info': attachment_info}
 
     # --- Text/code file: read content ---
@@ -122,10 +156,14 @@ def _process_upload(file_storage, agent_id: str, session_id: str,
         except Exception:
             content = '[Could not decode file content]'
         prefix = f"[Attached file: {original_name}]\n```\n{content}\n```"
+        if workplace_path:
+            prefix = f"[Workplace path: {workplace_path}]\n" + prefix
         return {'image_url': None, 'text_prefix': prefix, 'attachment_info': attachment_info}
 
     # --- Other binary ---
     prefix = f"[Attached file: {original_name} ({mime_type}, {size_bytes} bytes) — binary file, content not readable]"
+    if workplace_path:
+        prefix += f"\n[Workplace path: {workplace_path}]"
     return {'image_url': None, 'text_prefix': prefix, 'attachment_info': attachment_info}
 
 
@@ -143,16 +181,26 @@ def api_list_sessions():
     exclude_test = request.args.get('exclude_test', '1') != '0'
     sessions, total = db.get_all_sessions(search=search, limit=limit, offset=offset,
                                           exclude_test=exclude_test)
+    # Tag sessions that are currently being processed by an agent
+    from backend.realtime_store import realtime_store
+    for s in sessions:
+        s['is_active'] = bool(realtime_store.active_turns(session_id=s['id']))
     return jsonify({'sessions': sessions, 'total': total})
 
 
 @sessions_bp.route('/api/sessions/<session_id>')
 def api_get_session(session_id):
+    from backend.realtime_store import realtime_store
+    realtime_cursor = realtime_store.high_water()
     session = db.get_session_with_details(session_id)
     if not session:
         return jsonify({'error': 'Session not found'}), 404
-    messages = db.get_session_messages_full(session_id)
-    return jsonify({'session': session, 'messages': messages})
+    limit = request.args.get('limit', 200, type=int)
+    before_id = request.args.get('before_id', None, type=int)
+    messages, has_more = db.get_session_messages_full(session_id, limit=limit, before_id=before_id)
+    response = jsonify({'session': session, 'messages': messages, 'has_more': has_more})
+    response.headers['X-Evonic-Realtime-Cursor'] = str(realtime_cursor)
+    return response
 
 
 @sessions_bp.route('/api/sessions/<session_id>/poll')
@@ -168,13 +216,21 @@ def api_session_reply(session_id):
     # Support both JSON and multipart/form-data
     if request.content_type and request.content_type.startswith('multipart/form-data'):
         text = (request.form.get('text') or '').strip()
-        perspective = (request.form.get('perspective') or 'B').strip()
+        perspective = (request.form.get('perspective') or 'A').strip()
+        client_message_id = (request.form.get('client_message_id') or '').strip()
         file = request.files.get('file')
     else:
-        data = request.get_json()
+        data = request.get_json() or {}
         text = (data.get('text') or '').strip()
-        perspective = (data.get('perspective') or 'B').strip()
+        perspective = (data.get('perspective') or 'A').strip()
+        raw_client_message_id = data.get('client_message_id')
+        if raw_client_message_id is not None and not isinstance(raw_client_message_id, str):
+            return jsonify({'error': 'Invalid client_message_id'}), 400
+        client_message_id = (raw_client_message_id or '').strip()
         file = None
+
+    if client_message_id and not re.fullmatch(r'[A-Za-z0-9._:-]{1,128}', client_message_id):
+        return jsonify({'error': 'Invalid client_message_id'}), 400
 
     if not text and not file:
         return jsonify({'error': 'Text or file is required'}), 400
@@ -200,8 +256,11 @@ def api_session_reply(session_id):
             return jsonify({'error': 'Session not found'}), 404
         agent_id = session['agent_id']
 
-        # Check file size against agent config
+        # Check if attachments are enabled for this agent
         cfg = db.get_agent_attachment_config(agent_id)
+        if not cfg.get('enabled'):
+            return jsonify({'error': 'File attachments are not enabled for this agent. Enable them in agent settings.'}), 400
+
         max_bytes = cfg.get('max_size_mb', 20) * 1024 * 1024
         file.seek(0, os.SEEK_END)
         fsize = file.tell()
@@ -223,25 +282,37 @@ def api_session_reply(session_id):
         attachment_info = result['attachment_info']
         upload_meta = {'attachment_info': attachment_info}
 
-        # For non-image files, prepend extracted text to user message
-        if result['text_prefix']:
-            text = f"{result['text_prefix']}\n\n{text}" if text else result['text_prefix']
+        # Build [Attached: ... id=N] line so agents can use read_attachment(attachment_id=N)
+        att = result['attachment_info']
+        info_line = (
+            f"[Attached: {att['filename']} "
+            f"({att['mime_type']}, {_human_size(att['size_bytes'])}) "
+            f"id={att['attachment_id']} path={att['file_path']}]"
+        )
 
-        # Fallback display text when no user text provided
-        if not text:
-            text = '[Image]' if attachment_info.get('is_image') else f"[File: {attachment_info['filename']}]"
+        # Prepend info_line to text; for non-image files also prepend extracted content
+        if result['text_prefix']:
+            text = f"{info_line}\n\n{result['text_prefix']}\n\n{text}" if text else f"{info_line}\n\n{result['text_prefix']}"
+        else:
+            text = f"{info_line}\n\n{text}" if text else info_line
 
     if perspective == 'A':
+        upload_meta = dict(upload_meta or {})
+        if client_message_id:
+            upload_meta['client_message_id'] = client_message_id
         result = agent_runtime.send_as_user(session_id, text,
                                             image_url=image_url, metadata=upload_meta)
     else:
-        result = agent_runtime.send_as_bot(session_id, text)
+        result = agent_runtime.send_as_bot(
+            session_id, text,
+            metadata={'client_message_id': client_message_id} if client_message_id else None,
+        )
 
     if not result:
         return jsonify({'error': 'Session not found'}), 404
 
     # Build response — for slash commands, include the response text directly
-    resp = {'success': True}
+    resp = {'success': True, 'client_message_id': client_message_id or None}
     if isinstance(result, str):
         # send_as_user returned the slash command response text
         resp['slash_command'] = True
@@ -304,6 +375,7 @@ def api_force_summarize(session_id):
 @sessions_bp.route('/api/sessions/<session_id>', methods=['DELETE'])
 def api_delete_session(session_id):
     result = db.delete_session(session_id)
+    audit.log_session(user_id='admin', session_id=session_id, action='delete', ip=request.remote_addr or '')
     return jsonify({'success': result})
 
 
@@ -312,6 +384,7 @@ def api_clear_all_sessions():
     """Delete all chat sessions, messages, summaries, and attachments
     across all agents."""
     db.clear_all_sessions()
+    audit.log_session(user_id='admin', session_id='*', action='clear_all', ip=request.remote_addr or '')
     return jsonify({'success': True})
 
 
@@ -341,5 +414,27 @@ def api_attachment_download(attachment_id):
         file_path,
         mimetype=mime_type,
         as_attachment=True,
+        download_name=original_filename,
+    )
+
+
+@sessions_bp.route('/api/attachments/<int:attachment_id>/view')
+def api_attachment_view(attachment_id):
+    """Serve an attachment file for inline viewing (browser display)."""
+    attachment = db.get_attachment(attachment_id)
+    if not attachment:
+        return jsonify({'error': 'Attachment not found'}), 404
+
+    file_path = attachment.get('file_path', '')
+    if not file_path or not os.path.isfile(file_path):
+        return jsonify({'error': 'File unavailable'}), 404
+
+    original_filename = attachment.get('original_filename') or os.path.basename(file_path)
+    mime_type = attachment.get('mime_type') or 'application/octet-stream'
+
+    return send_file(
+        file_path,
+        mimetype=mime_type,
+        as_attachment=False,
         download_name=original_filename,
     )

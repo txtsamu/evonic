@@ -52,37 +52,45 @@ func (t *logTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) co
 // GUIAvailable returns true — the real GUI is compiled in.
 func GUIAvailable() bool { return true }
 
-// RunGUI launches the connector window directly (config already available).
+// RunGUI launches the main window. If the store has a usable active server it
+// shows the connector view; otherwise it shows the pairing form (first run).
 // Must be called from the main goroutine.
-func RunGUI(cfg *config.Config) {
+func RunGUI(store *config.Store) {
+	defer recoverPanic("gui")
+
+	if path := redirectStderr(); path != "" {
+		log.Printf("[evonet] logging to %s", path)
+	}
+
 	a := app.New()
 	w := a.NewWindow("Evonet v" + version.Version)
 	w.Resize(fyne.NewSize(700, 420))
 
+	w.SetMainMenu(fyne.NewMainMenu(
+		fyne.NewMenu("Evonet",
+			fyne.NewMenuItem("About Evonet", func() { showAboutDialog(w) }),
+		),
+	))
+
 	root := container.NewStack()
 	w.SetContent(root)
-	showConnectorView(a, w, root, cfg)
+
+	active := store.ActiveConfig()
+	if active.ConnectorToken != "" && active.ServerURL != "" {
+		showConnectorView(a, w, root, store)
+	} else {
+		showPairingView(a, w, root, store, "")
+	}
 
 	w.ShowAndRun()
 }
 
-// ShowPairingDialog shows a pairing form first, then transitions to the connector view.
-// Must be called from the main goroutine.
-func ShowPairingDialog(prefilledServerURL string) {
-	a := app.New()
-	w := a.NewWindow("Evonet v" + version.Version)
-	w.Resize(fyne.NewSize(700, 420))
+// showConnectorView renders the log area with a server dropdown plus
+// Servers/Clear/Stop buttons. Creates its own LogWriter and wires window close.
+// Safe to call from main goroutine.
+func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, store *config.Store) {
+	cfg := store.ActiveConfig()
 
-	root := container.NewStack()
-	w.SetContent(root)
-	showPairingView(a, w, root, prefilledServerURL)
-
-	w.ShowAndRun()
-}
-
-// showConnectorView renders the log area with Stop/Start and Reset buttons.
-// Creates its own LogWriter and wires window close. Safe to call from main goroutine.
-func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *config.Config) {
 	logEntry := widget.NewRichText()
 	logEntry.Wrapping = fyne.TextWrapWord
 	logScroll := container.NewScroll(logEntry)
@@ -105,7 +113,7 @@ func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *con
 	toggleBtn := widget.NewButton("Stop", nil)
 	toggleBtn.Importance = widget.DangerImportance
 
-	resetBtn := widget.NewButton("Reset", nil)
+	serversBtn := widget.NewButton("Servers", nil)
 
 	clearBtn := widget.NewButton("Clear", nil)
 
@@ -115,22 +123,25 @@ func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *con
 		showAboutDialog(w)
 	}
 
-	topBar := container.NewBorder(nil, nil, aboutBtn,
-		container.NewHBox(resetBtn, clearBtn, toggleBtn),
-		container.NewStack(statusLabel, container.NewPadded(connectedText)),
-	)
-	connectorView := container.NewBorder(topBar, nil, nil, nil, logScroll)
-
-	root.Objects = []fyne.CanvasObject{connectorView}
-	root.Refresh()
+	// Server dropdown: one entry per configured server.
+	serverOptions := make([]string, len(store.Servers))
+	for i, srv := range store.Servers {
+		serverOptions[i] = srv.Label()
+	}
+	serverSelect := widget.NewSelect(serverOptions, nil)
+	serverSelect.SetSelected(cfg.Label())
 
 	var client *ws.Client
 	var running bool
+	var switching bool
+	var gen int
 
 	startClient := func() {
+		cfg = store.ActiveConfig()
 		exec := executor.New(workDir(cfg), true) // GUI always verbose
 		client = ws.New(cfg, exec)
 		running = true
+		gen++
 		connectedText.Hide()
 		statusLabel.Show()
 		statusLabel.SetText("Connecting to " + cfg.ServerURL + "...")
@@ -138,14 +149,22 @@ func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *con
 		toggleBtn.Importance = widget.DangerImportance
 		toggleBtn.Refresh()
 
+		myGen := gen
+		myClient := client
 		client.OnConnected = func() {
-			fyne.Do(func() {
+			doUI(func() {
+				if myGen != gen {
+					return
+				}
 				statusLabel.Hide()
 				connectedText.Show()
 			})
 		}
 		client.OnDisconnected = func() {
-			fyne.Do(func() {
+			doUI(func() {
+				if myGen != gen {
+					return
+				}
 				connectedText.Hide()
 				statusLabel.Show()
 				statusLabel.SetText("Connecting to " + cfg.ServerURL + "...")
@@ -153,9 +172,13 @@ func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *con
 		}
 
 		go func() {
+			defer recoverPanic("client run")
 			log.Printf("[evonet] Connecting to %s...", cfg.ServerURL)
-			client.Run()
-			fyne.Do(func() {
+			myClient.Run()
+			doUI(func() {
+				if myGen != gen {
+					return
+				}
 				running = false
 				connectedText.Hide()
 				statusLabel.Show()
@@ -167,6 +190,68 @@ func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *con
 		}()
 	}
 
+	// Switching servers can close a connection with an in-flight write and save
+	// configuration to disk. Keep both operations off the Cocoa/Fyne event loop.
+	serverSelect.OnChanged = func(string) {
+		idx := serverSelect.SelectedIndex()
+		if switching || idx < 0 || idx >= len(store.Servers) {
+			return
+		}
+		picked := store.Servers[idx]
+		if picked.Label() == cfg.Label() && running {
+			return
+		}
+
+		switching = true
+		gen++ // invalidate callbacks queued by the old client before it is stopped
+		switchGen := gen
+		oldClient := client
+		store.SetActive(serverKeyOf(picked))
+		running = false
+		serverSelect.Disable()
+		toggleBtn.Disable()
+		serversBtn.Disable()
+		clearBtn.Disable()
+		connectedText.Hide()
+		statusLabel.Show()
+		statusLabel.SetText("Switching to " + picked.ServerURL + "...")
+
+		go func() {
+			defer recoverPanic("server switch")
+			if oldClient != nil {
+				oldClient.Stop()
+			}
+			if err := config.SaveStore(store); err != nil {
+				log.Printf("[evonet] saving selected server: %v", err)
+			}
+			doUI(func() {
+				if gen == switchGen {
+					lw.Clear()
+					startClient()
+				}
+				// Always release the switch guard and re-enable the controls: a
+				// superseded switch must not leave the top bar permanently
+				// disabled, which looks exactly like a frozen window.
+				switching = false
+				serverSelect.Enable()
+				toggleBtn.Enable()
+				serversBtn.Enable()
+				clearBtn.Enable()
+			})
+		}()
+	}
+
+	selectBox := container.NewGridWrap(fyne.NewSize(220, serverSelect.MinSize().Height), serverSelect)
+	topBar := container.NewBorder(nil, nil,
+		container.NewHBox(aboutBtn, selectBox),
+		container.NewHBox(serversBtn, clearBtn, toggleBtn),
+		container.NewStack(statusLabel, container.NewPadded(connectedText)),
+	)
+	connectorView := container.NewBorder(topBar, nil, nil, nil, logScroll)
+
+	root.Objects = []fyne.CanvasObject{connectorView}
+	root.Refresh()
+
 	toggleBtn.OnTapped = func() {
 		if running {
 			client.Stop()
@@ -175,13 +260,12 @@ func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *con
 		}
 	}
 
-	resetBtn.OnTapped = func() {
+	serversBtn.OnTapped = func() {
 		if client != nil {
 			client.Stop()
 		}
 		lw.close()
-		config.Save(&config.Config{}) //nolint — best-effort clear
-		showPairingView(a, w, root, "")
+		showManagerView(a, w, root, store)
 	}
 
 	clearBtn.OnTapped = func() {
@@ -196,6 +280,128 @@ func showConnectorView(a fyne.App, w fyne.Window, root *fyne.Container, cfg *con
 	})
 
 	startClient()
+}
+
+// serverKeyOf mirrors config.serverKey for use in the GUI (HomeID, else URL).
+func serverKeyOf(c *config.Config) string {
+	if c.HomeID != "" {
+		return c.HomeID
+	}
+	return c.ServerURL
+}
+
+// showManagerView lists configured servers and lets the user add, edit, or
+// delete them. Must be called from the main goroutine.
+func showManagerView(a fyne.App, w fyne.Window, root *fyne.Container, store *config.Store) {
+	title := widget.NewLabelWithStyle("Remote Servers", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+
+	selected := -1
+	list := widget.NewList(
+		func() int { return len(store.Servers) },
+		func() fyne.CanvasObject {
+			name := widget.NewLabel("")
+			name.TextStyle = fyne.TextStyle{Bold: true}
+			url := widget.NewLabel("")
+			return container.NewVBox(name, url)
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			box := o.(*fyne.Container)
+			srv := store.Servers[i]
+			box.Objects[0].(*widget.Label).SetText(srv.Label())
+			box.Objects[1].(*widget.Label).SetText(srv.ServerURL)
+		},
+	)
+
+	editBtn := widget.NewButton("Edit", nil)
+	editBtn.Disable()
+	deleteBtn := widget.NewButton("Delete", nil)
+	deleteBtn.Importance = widget.DangerImportance
+	deleteBtn.Disable()
+
+	list.OnSelected = func(id widget.ListItemID) {
+		selected = id
+		editBtn.Enable()
+		deleteBtn.Enable()
+	}
+	list.OnUnselected = func(widget.ListItemID) {
+		selected = -1
+		editBtn.Disable()
+		deleteBtn.Disable()
+	}
+
+	backToConnector := func() {
+		if len(store.Servers) == 0 {
+			showPairingView(a, w, root, store, "")
+		} else {
+			showConnectorView(a, w, root, store)
+		}
+	}
+
+	addBtn := widget.NewButton("Add", func() {
+		showPairingView(a, w, root, store, "")
+	})
+	addBtn.Importance = widget.HighImportance
+
+	doneBtn := widget.NewButton("Done", backToConnector)
+
+	editBtn.OnTapped = func() {
+		if selected < 0 || selected >= len(store.Servers) {
+			return
+		}
+		srv := store.Servers[selected]
+		nameEntry := widget.NewEntry()
+		nameEntry.SetPlaceHolder(srv.HomeName)
+		nameEntry.SetText(srv.Name)
+		workEntry := widget.NewEntry()
+		workEntry.SetPlaceHolder("(binary directory)")
+		workEntry.SetText(srv.WorkDir)
+		items := []*widget.FormItem{
+			{Text: "Name", Widget: nameEntry},
+			{Text: "Work dir", Widget: workEntry},
+		}
+		dialog.ShowForm("Edit "+srv.Label(), "Save", "Cancel", items, func(ok bool) {
+			if !ok {
+				return
+			}
+			srv.Name = strings.TrimSpace(nameEntry.Text)
+			srv.WorkDir = strings.TrimSpace(workEntry.Text)
+			_ = config.SaveStore(store)
+			list.Refresh()
+		}, w)
+	}
+
+	deleteBtn.OnTapped = func() {
+		if selected < 0 || selected >= len(store.Servers) {
+			return
+		}
+		srv := store.Servers[selected]
+		dialog.ShowConfirm("Delete server", "Remove \""+srv.Label()+"\"?", func(ok bool) {
+			if !ok {
+				return
+			}
+			store.Remove(serverKeyOf(srv))
+			_ = config.SaveStore(store)
+			selected = -1
+			editBtn.Disable()
+			deleteBtn.Disable()
+			list.UnselectAll()
+			list.Refresh()
+		}, w)
+	}
+
+	buttons := container.NewBorder(nil, nil,
+		addBtn,
+		container.NewHBox(editBtn, deleteBtn, doneBtn),
+	)
+	managerView := container.NewBorder(
+		container.NewPadded(title),
+		container.NewPadded(buttons),
+		nil, nil,
+		list,
+	)
+
+	root.Objects = []fyne.CanvasObject{managerView}
+	root.Refresh()
 }
 
 // showAboutDialog displays the About modal with app info, version, creator, and links.
@@ -216,8 +422,6 @@ func showAboutDialog(w fyne.Window) {
 
 	versionLabel := widget.NewLabelWithStyle("Version "+version.Version+" (GUI Mac)", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
 
-	separator := widget.NewSeparator()
-
 	creator := widget.NewLabelWithStyle("Created by Robin Syihab (@anvie)", fyne.TextAlignCenter, fyne.TextStyle{})
 
 	xLink := widget.NewHyperlink("X (Twitter): @anvie", xURL)
@@ -228,20 +432,22 @@ func showAboutDialog(w fyne.Window) {
 
 	content := container.NewVBox(
 		title,
-		separator,
+		widget.NewSeparator(),
 		desc,
 		versionLabel,
-		separator,
 		creator,
 		xLink,
 		ghLink,
 	)
 
-	dialog.ShowCustom("About Evonet", "Close", container.NewPadded(content), w)
+	d := dialog.NewCustom("About Evonet", "Close", container.NewPadded(content), w)
+	d.Resize(fyne.NewSize(420, 380))
+	d.Show()
 }
 
-// showPairingView renders the pairing form into root. Must be called from main goroutine.
-func showPairingView(a fyne.App, w fyne.Window, root *fyne.Container, prefilledServerURL string) {
+// showPairingView renders the pairing form into root. On success the paired
+// server is added to the store and made active. Must be called from main goroutine.
+func showPairingView(a fyne.App, w fyne.Window, root *fyne.Container, store *config.Store, prefilledServerURL string) {
 	serverEntry := widget.NewEntry()
 	serverEntry.SetPlaceHolder("https://your-evonic-server.com")
 	if prefilledServerURL != "" {
@@ -265,9 +471,18 @@ func showPairingView(a fyne.App, w fyne.Window, root *fyne.Container, prefilledS
 	}
 	title := widget.NewLabelWithStyle("Evonet Setup", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 
+	// Allow cancelling back to the manager when there are existing servers.
+	bottom := container.NewVBox(pairBtn, statusLabel)
+	if len(store.Servers) > 0 {
+		backBtn := widget.NewButton("Cancel", func() {
+			showManagerView(a, w, root, store)
+		})
+		bottom = container.NewVBox(pairBtn, backBtn, statusLabel)
+	}
+
 	pairingView := container.NewBorder(
 		nil,
-		container.NewPadded(container.NewVBox(pairBtn, statusLabel)),
+		container.NewPadded(bottom),
 		nil, nil,
 		container.NewPadded(container.NewVBox(title, form)),
 	)
@@ -285,23 +500,26 @@ func showPairingView(a fyne.App, w fyne.Window, root *fyne.Container, prefilledS
 		statusLabel.SetText("Pairing...")
 
 		go func() {
+			defer recoverPanic("pairing")
 			cfg, err := doPair(serverURL, code)
 			if err != nil {
-				fyne.Do(func() {
+				doUI(func() {
 					statusLabel.SetText("Error: " + err.Error())
 					pairBtn.Enable()
 				})
 				return
 			}
-			if err := config.Save(cfg); err != nil {
-				fyne.Do(func() {
+			store.Upsert(cfg)
+			store.SetActive(serverKeyOf(cfg))
+			if err := config.SaveStore(store); err != nil {
+				doUI(func() {
 					statusLabel.SetText("Paired but failed to save config: " + err.Error())
 					pairBtn.Enable()
 				})
 				return
 			}
-			fyne.Do(func() {
-				showConnectorView(a, w, root, cfg)
+			doUI(func() {
+				showConnectorView(a, w, root, store)
 			})
 		}()
 	}

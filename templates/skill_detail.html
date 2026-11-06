@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from 'partials/toggle.html' import toggle_widget %}
 {% block content %}
-<div class="p-4 md:p-6">
+<div class="px-3 py-4 md:p-6">
     <!-- Header -->
     <div class="flex flex-wrap justify-between items-center gap-2 mb-6">
         <div class="flex flex-wrap items-center gap-2">
@@ -10,10 +10,40 @@
             <h2 class="text-xl font-bold text-gray-800 dark:text-gray-100" id="skill-title">Loading...</h2>
             <span id="skill-version" class="text-xs bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 px-2 py-0.5 rounded font-mono"></span>
         </div>
-        <div class="flex items-center gap-3">
-            <label class="inline-flex items-center cursor-pointer gap-2">
+        <div class="flex items-center gap-3 w-full justify-end sm:w-auto">
+            <!-- Actions Dropdown Menu -->
+            <div class="relative" id="skill-actions-dropdown">
+                <button id="skill-actions-btn" onclick="toggleActionsMenu()" aria-expanded="false" aria-haspopup="true"
+                        class="px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5"
+                        title="Skill actions">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z"/></svg>
+                    Actions
+                </button>
+                <div id="skill-actions-menu" class="hidden absolute left-0 mt-1 w-52 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg z-50 py-1" role="menu" aria-labelledby="skill-actions-btn">
+                    <button onclick="toggleEnabledFromMenu(); closeActionsMenu()" id="menu-toggle-skill"
+                            class="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2.5 transition-colors"
+                            role="menuitem">
+                        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"/></svg>
+                        <span id="menu-toggle-label">Enable</span>
+                    </button>
+                    <button onclick="exportSkill(); closeActionsMenu()"
+                            class="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2.5 transition-colors"
+                            role="menuitem">
+                        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                        Export
+                    </button>
+                    <hr class="my-1 border-gray-200 dark:border-gray-600">
+                    <button onclick="deleteSkillFromDetail(); closeActionsMenu()" id="menu-delete-skill"
+                            class="w-full text-left px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center gap-2.5 transition-colors"
+                            role="menuitem">
+                        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                        Delete
+                    </button>
+                </div>
+            </div>
+            <label class="inline-flex items-center cursor-pointer gap-2" id="skill-enabled-label">
                 {{ toggle_widget(id='skill-enabled', onchange='toggleEnabled(this.checked)') }}
-                <span class="text-sm text-gray-600 dark:text-gray-400">Enabled</span>
+                <span class="text-sm text-gray-600 dark:text-gray-400" id="skill-enabled-text">Enabled</span>
             </label>
         </div>
     </div>
@@ -21,11 +51,11 @@
     <!-- Meta -->
     <div id="skill-meta" class="text-sm text-gray-500 dark:text-gray-400 mb-6"></div>
 
-    <!-- Two-column layout -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- Settings + System Prompt side-by-side -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         <!-- Left: Settings -->
-        <div>
-            <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 p-6">
+        <div id="settings-column">
+            <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 p-4 md:p-6">
                 <h3 class="text-base font-semibold text-gray-800 dark:text-gray-100 mb-4">Settings</h3>
                 <div id="settings-form">
                     <p class="text-sm text-gray-400 dark:text-gray-500">Loading...</p>
@@ -43,9 +73,15 @@
                         <p class="text-sm">This skill has no configurable settings</p>
                     </div>
                 </div>
-                <!-- SYSTEM.md Editor -->
-                <div id="system-md-editor" class="hidden mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
-                    <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">System Prompt (SYSTEM.md)</h4>
+            </div>
+        </div>
+
+        <!-- Right: System Prompt + Tools stacked -->
+        <div class="flex flex-col gap-6">
+            <!-- System Prompt -->
+            <div id="system-md-editor" class="hidden">
+                <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 p-4 md:p-6">
+                    <h3 class="text-base font-semibold text-gray-800 dark:text-gray-100 mb-4">System Prompt (SYSTEM.md)</h3>
                     <textarea id="system-md-content" rows="12"
                               class="w-full p-2.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 rounded-md text-xs font-mono focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/10"
                               placeholder="Loading SYSTEM.md..."></textarea>
@@ -59,24 +95,24 @@
                     </div>
                 </div>
             </div>
-        </div>
 
-        <!-- Right: Tools -->
-        <div>
-            <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 p-6">
-                <div class="flex justify-between items-center mb-4">
-                    <h3 class="text-base font-semibold text-gray-800 dark:text-gray-100">Tools <span id="tool-count" class="text-sm font-normal text-gray-400 dark:text-gray-500"></span></h3>
-                </div>
-                <div class="mb-3">
-                    <input type="text" id="tool-filter" placeholder="Filter tools..."
-                           oninput="filterTools()"
-                           class="w-full p-2 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 placeholder-gray-400 dark:placeholder-gray-500 rounded-md text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/10">
-                </div>
-                <div id="tools-list" class="space-y-2 max-h-[600px] overflow-y-auto pr-1">
-                    <p class="text-sm text-gray-400 dark:text-gray-500">Loading...</p>
-                </div>
-                <div id="tools-empty-filter" class="hidden text-center py-6 text-gray-400 dark:text-gray-500">
-                    <p class="text-sm">No tools match your filter</p>
+            <!-- Tools -->
+            <div>
+                <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 p-4 md:p-6">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-base font-semibold text-gray-800 dark:text-gray-100">Tools <span id="tool-count" class="text-sm font-normal text-gray-400 dark:text-gray-500"></span></h3>
+                    </div>
+                    <div class="mb-3">
+                        <input type="text" id="tool-filter" placeholder="Filter tools..."
+                               oninput="filterTools()"
+                               class="w-full p-2 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 placeholder-gray-400 dark:placeholder-gray-500 rounded-md text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/10">
+                    </div>
+                    <div id="tools-list" class="space-y-2 max-h-[600px] overflow-y-auto pr-1">
+                        <p class="text-sm text-gray-400 dark:text-gray-500">Loading...</p>
+                    </div>
+                    <div id="tools-empty-filter" class="hidden text-center py-6 text-gray-400 dark:text-gray-500">
+                        <p class="text-sm">No tools match your filter</p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -150,6 +186,23 @@ async function loadSkill() {
     document.getElementById('skill-version').textContent = 'v' + (skillData.version || '?');
     document.getElementById('skill-enabled').checked = skillData.enabled;
 
+    // Core skills cannot be disabled — lock the toggle and label it accordingly.
+    if (skillData.protected) {
+        const toggle = document.getElementById('skill-enabled');
+        toggle.disabled = true;
+        const label = document.getElementById('skill-enabled-label');
+        label.classList.remove('cursor-pointer');
+        label.classList.add('opacity-60', 'cursor-not-allowed');
+        label.title = 'Core skill — required by the Explore agent and cannot be disabled.';
+        document.getElementById('skill-enabled-text').textContent = 'Core skill (always on)';
+        // Disable toggle & delete in dropdown
+        const menuToggle = document.getElementById('menu-toggle-skill');
+        const menuDelete = document.getElementById('menu-delete-skill');
+        if (menuToggle) { menuToggle.disabled = true; menuToggle.classList.add('opacity-40', 'cursor-not-allowed'); }
+        if (menuDelete) { menuDelete.disabled = true; menuDelete.classList.add('opacity-40', 'cursor-not-allowed'); }
+    }
+    updateActionsMenuLabel();
+
     const meta = [];
     if (skillData.author) meta.push('by ' + esc(skillData.author));
     if (skillData.description) meta.push(esc(skillData.description));
@@ -175,50 +228,182 @@ async function loadToolDefs() {
     }
 }
 
+let settingsState = {};
+let settingsVariables = [];
+let selectedSettingsProvider = '';
+
+function inputClass() {
+    return 'w-full p-2.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 rounded-md text-sm font-mono focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/10';
+}
+
+function captureSettingsState() {
+    document.querySelectorAll('[data-var]').forEach(el => {
+        settingsState[el.dataset.var] = el.dataset.type === 'boolean' ? el.checked : el.value;
+    });
+}
+
+// Combobox fields: the select either fills the text input or reveals it for a custom value.
+document.addEventListener('change', event => {
+    const select = event.target.closest && event.target.closest('select[data-combo-select]');
+    if (!select) return;
+    const input = select.closest('[data-combo]').querySelector('input[data-var]');
+    if (select.value === '__custom__') {
+        input.classList.remove('hidden');
+        input.focus();
+    } else {
+        input.classList.add('hidden');
+        input.value = select.value;
+    }
+});
+
+function valueFor(variable) {
+    return settingsState[variable.name] !== undefined ? settingsState[variable.name] : (variable.default || '');
+}
+
+function renderSettingField(v) {
+    const val = valueFor(v);
+    if (v.type === 'boolean') {
+        return `
+        <div class="mb-4">
+            <label class="flex items-center gap-3 cursor-pointer select-none">
+                <span class="relative inline-flex items-center">
+                    <input type="checkbox" data-var="${esc(v.name)}" data-type="boolean" ${val ? 'checked' : ''} class="sr-only peer">
+                    <span class="dyn-toggle"></span>
+                </span>
+                <div>
+                    <span class="text-gray-700 dark:text-gray-200 text-sm font-medium">${esc(v.label || v.name)}</span>
+                    ${v.description ? `<p class="text-xs text-gray-400 dark:text-gray-500 mt-0.5">${esc(v.description)}</p>` : ''}
+                </div>
+            </label>
+        </div>`;
+    }
+    const labelHtml = `<label class="block mb-1 text-gray-700 dark:text-gray-200 text-sm font-medium">${esc(v.label || v.name)}</label>`;
+    const descHtml = v.description ? `<p class="text-xs text-gray-400 dark:text-gray-500 mt-1">${esc(v.description)}</p>` : '';
+    if (v.type === 'select') {
+        const staticOpts = Array.isArray(v.options) ? v.options : [];
+        const optsHtml = staticOpts.map(o => {
+            const ov = (o && typeof o === 'object') ? o.value : o;
+            const ol = (o && typeof o === 'object') ? (o.label || o.value) : o;
+            return `<option value="${esc(String(ov))}" ${String(ov) === String(val) ? 'selected' : ''}>${esc(String(ol))}</option>`;
+        }).join('');
+        return `<div class="mb-4">${labelHtml}<select data-var="${esc(v.name)}" data-type="select" ${v.options_source ? `data-options-source="${esc(v.options_source)}"` : ''} data-current="${esc(String(val))}" class="${inputClass()}"><option value="">${esc(v.empty_label || '— Default —')}</option>${optsHtml}</select>${descHtml}</div>`;
+    }
+    if (v.type === 'textarea') {
+        return `<div class="mb-4">${labelHtml}<textarea data-var="${esc(v.name)}" data-type="textarea" rows="8" placeholder="${esc(String(v.default || ''))}" class="${inputClass()}">${esc(String(val))}</textarea>${descHtml}</div>`;
+    }
+    if (v.allow_custom && Array.isArray(v.options) && v.options.length) {
+        // Combobox: pick a known value, or choose "Custom…" to type any value.
+        // The text input carries data-var so save/capture logic is unchanged.
+        const optValue = o => String((o && typeof o === 'object') ? o.value : o);
+        const optLabel = o => String((o && typeof o === 'object') ? (o.label || o.value) : o);
+        const known = v.options.some(o => optValue(o) === String(val));
+        const isCustom = String(val) !== '' && !known;
+        const comboOpts = v.options.map(o => `<option value="${esc(optValue(o))}" ${known && optValue(o) === String(val) ? 'selected' : ''}>${esc(optLabel(o))}</option>`).join('');
+        return `<div class="mb-4" data-combo>${labelHtml}<select data-combo-select aria-label="${esc(v.label || v.name)}" class="${inputClass()}"><option value="">${esc(v.empty_label || '— Default —')}</option>${comboOpts}<option value="__custom__" ${isCustom ? 'selected' : ''}>Custom…</option></select><input type="text" data-var="${esc(v.name)}" data-type="string" value="${esc(String(val))}" placeholder="${esc(String(v.default || ''))}" class="${inputClass()} mt-2 ${isCustom ? '' : 'hidden'}">${descHtml}</div>`;
+    }
+    const inputType = v.type === 'number' ? 'number' : (v.type === 'secret' || v.type === 'password' ? 'password' : 'text');
+    return `<div class="mb-4">${labelHtml}<input type="${inputType}" data-var="${esc(v.name)}" data-type="${esc(v.type || 'string')}" value="${esc(String(val))}" placeholder="${esc(String(v.default || ''))}" class="${inputClass()}">${descHtml}</div>`;
+}
+
+function providerStatus(provider, variables) {
+    const required = variables.filter(v => v.required);
+    const configured = required.every(v => {
+        const value = valueFor(v);
+        return v.type === 'boolean' ? Boolean(value) : String(value || '').trim().length > 0;
+    });
+    return configured ? 'Configured' : 'Needs configuration';
+}
+
+function renderProviderSettings(layout) {
+    const form = document.getElementById('settings-form');
+    const providers = Array.isArray(layout.providers) ? layout.providers : [];
+    const providerVariables = settingsVariables.filter(v => v.provider);
+    const globalVariables = settingsVariables.filter(v => !v.provider);
+    const selected = providers.find(p => p.id === selectedSettingsProvider);
+    const activeVariables = selected ? providerVariables.filter(v => v.provider === selected.id) : [];
+    const basic = activeVariables.filter(v => !v.advanced);
+    const advanced = activeVariables.filter(v => v.advanced);
+    const options = providers.map(p => `<option value="${esc(p.id)}" ${p.id === selectedSettingsProvider ? 'selected' : ''}>${esc(p.label || p.id)}</option>`).join('');
+    const status = selected ? providerStatus(selected, activeVariables) : 'Select a provider to configure';
+    const globalSection = layout.global_section || {};
+    // Keep the fallback explicit so schemas may omit global_section safely.
+    const globalSectionLabel = layout.global_section?.label || 'Global defaults';
+    form.innerHTML = `
+        <section class="mb-6" aria-labelledby="provider-configuration-heading">
+            <h4 id="provider-configuration-heading" class="text-sm font-semibold text-gray-800 dark:text-gray-100 mb-3">Provider configuration</h4>
+            <label for="settings-provider-picker" class="block mb-1 text-gray-700 dark:text-gray-200 text-sm font-medium">${esc(layout.label || 'Provider')}</label>
+            <select id="settings-provider-picker" class="${inputClass()}" aria-describedby="provider-configuration-status">
+                <option value="">${esc(layout.empty_label || '— Select a provider —')}</option>${options}
+            </select>
+            ${layout.description ? `<p class="text-xs text-gray-400 dark:text-gray-500 mt-1">${esc(layout.description)}</p>` : ''}
+            <p id="provider-configuration-status" class="text-xs text-gray-400 dark:text-gray-500 mt-1" aria-live="polite">${esc(status)}</p>
+            ${selected ? `<div class="mt-5 pt-5 border-t border-gray-200 dark:border-gray-600"><h5 class="text-sm font-semibold text-gray-700 dark:text-gray-200 mb-4">${esc(selected.label || selected.id)} settings</h5>${basic.map(renderSettingField).join('') || '<p class="text-sm text-gray-400">This provider has no additional settings.</p>'}${advanced.length ? `<details class="mb-4"><summary class="cursor-pointer text-sm font-medium text-indigo-600 dark:text-indigo-400">Advanced settings</summary><div class="mt-4">${advanced.map(renderSettingField).join('')}</div></details>` : ''}</div>` : '<div class="mt-5 rounded-md border border-dashed border-gray-300 dark:border-gray-600 p-4 text-sm text-gray-500 dark:text-gray-400">Choose a provider to view its configuration fields.</div>'}
+        </section>
+        <section class="pt-5 border-t border-gray-200 dark:border-gray-600" aria-labelledby="global-defaults-heading">
+            <h4 id="global-defaults-heading" class="text-sm font-semibold text-gray-800 dark:text-gray-100 mb-1">${esc(globalSectionLabel)}</h4>
+            ${globalSection.description ? `<p class="text-xs text-gray-400 dark:text-gray-500 mb-4">${esc(globalSection.description)}</p>` : ''}
+            ${globalVariables.map(renderSettingField).join('')}
+        </section>`;
+    document.getElementById('settings-provider-picker').addEventListener('change', event => {
+        captureSettingsState();
+        selectedSettingsProvider = event.target.value;
+        renderProviderSettings(layout);
+        populateDynamicSelects();
+    });
+}
+
 function renderSettings(variables, config) {
     const form = document.getElementById('settings-form');
     const actions = document.getElementById('settings-actions');
     const noVars = document.getElementById('no-variables');
-
     if (!variables.length) {
-        form.classList.add('hidden');
-        actions.classList.add('hidden');
-        noVars.classList.remove('hidden');
+        form.classList.add('hidden'); actions.classList.add('hidden'); noVars.classList.remove('hidden'); return;
+    }
+    noVars.classList.add('hidden'); actions.classList.remove('hidden');
+    settingsVariables = variables;
+    settingsState = {...config};
+    const settingsUi = skillData.settings_ui || {};
+    const providerSelector = settingsUi.provider_selector;
+    if (settingsUi.layout === 'provider-first' && providerSelector) {
+        const layout = {
+            providers: providerSelector.providers || [],
+            label: providerSelector.label || 'Provider',
+            description: providerSelector.description || '',
+            empty_label: providerSelector.empty_label || '— Select a provider —',
+            global_section: settingsUi.global_section || {}
+        };
+        // Prefer the configured default when it is a known provider. Otherwise
+        // start in the intentional empty state instead of guessing a provider.
+        selectedSettingsProvider = (providerSelector.providers || []).some(
+            provider => provider.id === settingsState.default_provider
+        ) ? settingsState.default_provider : '';
+        renderProviderSettings(layout);
+    } else {
+        form.innerHTML = variables.map(renderSettingField).join('');
+    }
+    populateDynamicSelects();
+}
+
+// Populate <select data-options-source="models"> from /api/models, preserving
+// each select's saved value (stored in data-current).
+async function populateDynamicSelects() {
+    const sels = document.querySelectorAll('select[data-options-source="models"]');
+    if (!sels.length) return;
+    let models = [];
+    try {
+        const res = await fetch('/api/models');
+        const data = await res.json();
+        models = data.models || [];
+    } catch (e) {
+        console.error('Failed to load models for select:', e);
         return;
     }
-
-    noVars.classList.add('hidden');
-    actions.classList.remove('hidden');
-
-    form.innerHTML = variables.map(v => {
-        const val = config[v.name] !== undefined ? config[v.name] : (v.default || '');
-        if (v.type === 'boolean') {
-            return `
-            <div class="mb-4">
-                <label class="flex items-center gap-3 cursor-pointer select-none">
-                    <span class="relative inline-flex items-center">
-                        <input type="checkbox" data-var="${esc(v.name)}" data-type="boolean"
-                               ${val ? 'checked' : ''} class="sr-only peer">
-                        <span class="dyn-toggle"></span>
-                    </span>
-                    <div>
-                        <span class="text-gray-700 dark:text-gray-200 text-sm font-medium">${esc(v.label || v.name)}</span>
-                        ${v.description ? `<p class="text-xs text-gray-400 dark:text-gray-500 mt-0.5">${esc(v.description)}</p>` : ''}
-                    </div>
-                </label>
-            </div>`;
-        }
-        const inputType = v.type === 'number' ? 'number' : 'text';
-        return `
-        <div class="mb-4">
-            <label class="block mb-1 text-gray-700 dark:text-gray-200 text-sm font-medium">${esc(v.label || v.name)}</label>
-            <input type="${inputType}" data-var="${esc(v.name)}" data-type="${esc(v.type || 'string')}"
-                   value="${esc(String(val))}"
-                   placeholder="${esc(String(v.default || ''))}"
-                   class="w-full p-2.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200 rounded-md text-sm font-mono focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/10">
-            ${v.description ? `<p class="text-xs text-gray-400 dark:text-gray-500 mt-1">${esc(v.description)}</p>` : ''}
-        </div>`;
-    }).join('');
+    sels.forEach(sel => {
+        ui.populateModelSelect(sel, models, {
+            labelFor: m => (m.name || m.model_name || m.id) + (m.is_default ? ' (default)' : ''),
+            selectedValue: sel.dataset.current || ''
+        });
+    });
 }
 
 function renderTools(tools) {
@@ -275,17 +460,13 @@ async function saveConfig() {
     btn.textContent = 'Saving...';
     status.classList.add('hidden');
 
+    captureSettingsState();
     const values = {};
-    document.querySelectorAll('[data-var]').forEach(el => {
-        const name = el.dataset.var;
-        const type = el.dataset.type;
-        if (type === 'boolean') {
-            values[name] = el.checked;
-        } else if (type === 'number') {
-            values[name] = el.value;
-        } else {
-            values[name] = el.value;
-        }
+    settingsVariables.forEach(variable => {
+        const value = settingsState[variable.name] !== undefined
+            ? settingsState[variable.name]
+            : (variable.default || '');
+        values[variable.name] = variable.type === 'boolean' ? Boolean(value) : value;
     });
 
     try {
@@ -316,9 +497,29 @@ async function toggleEnabled(enabled) {
     });
     if (!res.ok) {
         const err = await res.json();
-        toast.show(err.error || 'Failed to toggle', 'error');
         document.getElementById('skill-enabled').checked = !enabled;
+        if (err.missing_requires && err.missing_requires.length) {
+            await showMissingRequiresDialog(err);
+        } else {
+            toast.show(err.error || 'Failed to toggle', 'error');
+        }
+    } else {
+        skillData.enabled = enabled;
+        updateActionsMenuLabel();
     }
+}
+
+// Dialog shown when enabling a skill whose required dependencies are off.
+async function showMissingRequiresDialog(err) {
+    const dep = err.missing_requires[0];
+    const go = await showConfirm({
+        danger: false,
+        title: 'Required skill not enabled',
+        message: err.error || 'A required skill must be enabled first.',
+        confirmText: dep ? `Open ${dep.name}` : 'OK',
+        cancelText: 'Close',
+    });
+    if (go && dep) window.location.href = `/skills/${dep.id}`;
 }
 
 function esc(s) {
@@ -379,6 +580,94 @@ async function saveSystemPrompt() {
 
 loadSkill();
 loadSystemPrompt();
+
+function exportSkill() {
+    const link = document.createElement('a');
+    link.href = `/api/skills/${SKILL_ID}/export`;
+    link.download = `${SKILL_ID}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+// ==================== Actions Dropdown Menu ====================
+
+function toggleActionsMenu() {
+    const menu = document.getElementById('skill-actions-menu');
+    const btn = document.getElementById('skill-actions-btn');
+    const isOpen = !menu.classList.contains('hidden');
+    if (isOpen) {
+        closeActionsMenu();
+    } else {
+        menu.classList.remove('hidden');
+        btn.setAttribute('aria-expanded', 'true');
+    }
+}
+
+function closeActionsMenu() {
+    const menu = document.getElementById('skill-actions-menu');
+    const btn = document.getElementById('skill-actions-btn');
+    menu.classList.add('hidden');
+    btn.setAttribute('aria-expanded', 'false');
+}
+
+function updateActionsMenuLabel() {
+    const label = document.getElementById('menu-toggle-label');
+    if (!label || !skillData) return;
+    label.textContent = skillData.enabled ? 'Disable' : 'Enable';
+}
+
+function toggleEnabledFromMenu() {
+    if (!skillData) return;
+    if (skillData.protected) {
+        toast.show('Core skills cannot be disabled.', 'error');
+        return;
+    }
+    toggleEnabled(!skillData.enabled);
+}
+
+async function deleteSkillFromDetail() {
+    if (!skillData) return;
+    if (skillData.protected) {
+        toast.show('Core skills cannot be deleted.', 'error');
+        return;
+    }
+    const name = skillData.name || skillData.id;
+    const confirmed = await showConfirm({
+        title: `Delete "${name}"?`,
+        message: 'This will uninstall the skill and remove all its files. This cannot be undone.',
+        confirmText: 'Delete',
+        danger: true
+    });
+    if (!confirmed) return;
+
+    const res = await fetch(`/api/skills/${SKILL_ID}`, {method: 'DELETE'});
+    if (!res.ok) {
+        const err = await res.json();
+        toast.show(err.error || 'Failed to delete skill', 'error');
+    } else {
+        window.location.href = '/skills';
+    }
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('click', function(e) {
+    const dropdown = document.getElementById('skill-actions-dropdown');
+    if (dropdown && !dropdown.contains(e.target)) {
+        closeActionsMenu();
+    }
+});
+
+// Close dropdown on Escape key
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        const menu = document.getElementById('skill-actions-menu');
+        if (menu && !menu.classList.contains('hidden')) {
+            closeActionsMenu();
+            document.getElementById('skill-actions-btn').focus();
+        }
+    }
+});
 
 // ==================== Tool Modal ====================
 

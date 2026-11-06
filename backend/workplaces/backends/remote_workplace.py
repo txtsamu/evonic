@@ -1,7 +1,7 @@
 """
 RemoteWorkplaceBackend — wraps SSHBackend for a Workplace execution environment.
 
-Unlike the sshc tool (manual per-session), this backend is managed by WorkplaceManager:
+Unlike a manual per-session SSH connection, this backend is managed by WorkplaceManager:
 it auto-connects when the workplace is first accessed and is shared across all sessions
 using the same workplace.
 
@@ -53,9 +53,9 @@ class RemoteWorkplaceBackend(ExecutionBackend):
             return f"cd '{escaped}' && "
         return ''
 
-    def run_bash(self, script: str, timeout: int, env: dict) -> dict:
+    def run_bash(self, script: str, timeout: int, env: dict, on_output=None) -> dict:
         prefixed = self._cwd_prefix() + script if self._workspace else script
-        return self._ssh.run_bash(prefixed, timeout, env)
+        return self._ssh.run_bash(prefixed, timeout, env, on_output=on_output)
 
     def run_python(self, code: str, timeout: int, env: dict) -> dict:
         # Ensure evonic helpers are available on the remote (lazy upload on first call)
@@ -73,6 +73,10 @@ class RemoteWorkplaceBackend(ExecutionBackend):
 __PYEOF__"""
             return self._ssh.run_bash(bash_script, timeout, {})
         return self._ssh.run_python(code, timeout, env)
+
+    def set_workspace(self, path: str) -> None:
+        """Update the remote workspace path (for /cd command)."""
+        self._workspace = path
 
     def destroy(self) -> dict:
         if self._ssh:

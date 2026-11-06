@@ -62,7 +62,7 @@ preferences, and communication style instructions.
 
 ## Usage
 
-- Read this file: read("notes.md")
+- Read this file: read_file(file_path="/_self/kb/notes.md")
 - Update via write_file with path /_self/kb/notes.md
 - Update immediately when the user gives a new preference
 - Prioritize notes.md over `remember` for non-factual preference information
@@ -140,6 +140,18 @@ _TOOL_DEFS = [
                     "run_as_user": {
                         "type": "string",
                         "description": "Linux username to run bash/python as when sandbox is disabled. Set to empty string to clear. Only super agents can change this."
+                    },
+                    "workplace_id": {
+                        "type": "string",
+                        "description": "Workplace ID to assign this agent to (e.g. 'a15117f03576'). Use list_workplaces to discover available workplaces. Set to empty string to unassign."
+                    },
+                    "sandbox_enabled": {
+                        "type": "boolean",
+                        "description": "Whether the sandbox (Docker) execution environment is enabled for this agent."
+                    },
+                    "bash_exec_enabled": {
+                        "type": "boolean",
+                        "description": "Whether the agent can execute arbitrary bash commands."
                     }
                 },
                 "required": ["agent_id"]
@@ -250,51 +262,6 @@ _TOOL_DEFS = [
                     }
                 },
                 "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_skillsets",
-            "description": "List all available skillset templates for creating pre-configured agents.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_skillset",
-            "description": "Create a new agent from a skillset template with pre-configured tools, skills, and prompt.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_id": {
-                        "type": "string",
-                        "description": "The skillset template ID to apply (e.g., 'coder', 'devops')"
-                    },
-                    "agent_id": {
-                        "type": "string",
-                        "description": "Agent ID for the new agent (lowercase snake_case: alphanumeric and underscores only)"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Display name for the new agent (optional, uses skillset default)"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Description for the new agent (optional, uses skillset default)"
-                    },
-                    "model_id": {
-                        "type": "string",
-                        "description": "Optional model ID to assign (optional, uses skillset default)"
-                    }
-                },
-                "required": ["skill_id", "agent_id"]
             }
         }
     },
@@ -422,6 +389,8 @@ def _exec_create_agent(args: dict) -> dict:
     name = (args.get('name') or '').strip()
     if not agent_id or not _re.match(r'^[a-z0-9_]+$', agent_id):
         return {'error': 'Invalid ID. Use only lowercase alphanumeric characters and underscores (snake_case).'}
+    if _re.search(r'_sub_\d+$', agent_id):
+        return {'error': 'Agent ID cannot end with a sub-agent pattern (e.g. _sub_1). This naming convention is reserved for internal use.'}
     if not name:
         return {'error': 'Name is required.'}
     if db.get_agent(agent_id):
@@ -469,6 +438,11 @@ def _exec_update_agent(args: dict, agent_context: dict = None) -> dict:
     update_data = {k: v for k, v in args.items() if k != 'agent_id'}
     if 'system_prompt' in update_data:
         _write_system_prompt(agent_id, update_data.pop('system_prompt'))
+    if 'model_id' in update_data and update_data['model_id'] == '':
+        update_data['model_id'] = None  # empty string resets to global default
+    if 'messaging_acl' in update_data and isinstance(update_data['messaging_acl'], list):
+        import json as _json
+        update_data['messaging_acl'] = _json.dumps(update_data['messaging_acl'])
     if update_data:
         db.update_agent(agent_id, update_data)
     return {'success': True, 'message': f"Agent '{agent_id}' updated."}
@@ -488,6 +462,11 @@ def _exec_delete_agent(args: dict) -> dict:
         agent_dir = os.path.join(AGENTS_DIR, agent_id)
         if os.path.isdir(agent_dir):
             shutil.rmtree(agent_dir)
+        try:
+            from models.chat import agent_chat_manager
+            agent_chat_manager.drop(agent_id)
+        except Exception:
+            pass
         return {'success': True, 'message': f"Agent '{agent_id}' deleted."}
     except Exception as e:
         return {'error': str(e)}
@@ -565,88 +544,6 @@ def _exec_manage_skill(args: dict) -> dict:
     return {'error': f"Unknown action '{action}'. Use: list, enable, disable."}
 
 
-def _exec_list_skillsets(args: dict) -> dict:
-    from backend.skillsets import list_skillsets as ls
-    skillsets = ls()
-    return {'skillsets': skillsets, 'count': len(skillsets)}
-
-
-def _exec_apply_skillset(args: dict) -> dict:
-    import re as _re
-    from backend.skillsets import apply_skillset as apply_ss
-    from backend.skills_manager import skills_manager
-
-    skill_id = (args.get('skill_id') or '').strip()
-    agent_id = (args.get('agent_id') or '').strip().lower()
-    if not skill_id:
-        return {'error': 'skill_id is required.'}
-    if not agent_id or not _re.match(r'^[a-z0-9_]+$', agent_id):
-        return {'error': 'Invalid agent_id. Use only lowercase alphanumeric characters and underscores (snake_case).'}
-
-    if db.get_agent(agent_id):
-        return {'error': f"Agent ID '{agent_id}' already exists."}
-
-    agent_data = {
-        'id': agent_id,
-        'name': args.get('name', ''),
-        'description': args.get('description', ''),
-        'model_id': args.get('model_id', ''),
-    }
-
-    result = apply_ss(skill_id, agent_data)
-    if 'error' in result:
-        return result
-
-    try:
-        agents_dir = AGENTS_DIR
-        agent_dir = os.path.join(agents_dir, agent_id)
-        kb_dir = os.path.join(agent_dir, 'kb')
-        os.makedirs(kb_dir, exist_ok=True)
-
-        system_prompt_path = os.path.join(agent_dir, 'SYSTEM.md')
-        with open(system_prompt_path, 'w', encoding='utf-8') as f:
-            f.write(result.get('system_prompt', ''))
-
-        # Create workspace directory at shared/agents/[agent-id]
-        workspace_dir = os.path.join(WORKSPACE_DIR, agent_id)
-        os.makedirs(workspace_dir, exist_ok=True)
-
-        db.create_agent({
-            'id': agent_id,
-            'name': result.get('name', ''),
-            'description': result.get('description', ''),
-            'system_prompt': result.get('system_prompt', ''),
-            'model_id': result.get('model'),
-            'workspace': workspace_dir,
-        })
-
-        tools = result.get('tools', [])
-        if tools:
-            db.set_agent_tools(agent_id, tools)
-
-        for skill_name in result.get('skills', []):
-            skills_manager.set_skill_enabled(skill_name, True)
-
-        for fname, content in result.get('kb_files', {}).items():
-            kb_file_path = os.path.join(kb_dir, fname)
-            with open(kb_file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-
-        # Create notes.md template if it does not already exist
-        _notes_md = os.path.join(kb_dir, 'notes.md')
-        if not os.path.isfile(_notes_md):
-            with open(_notes_md, 'w', encoding='utf-8') as _f:
-                _f.write(_NOTES_MD_TEMPLATE)
-
-        return {
-            'success': True,
-            'agent_id': agent_id,
-            'message': f"Agent '{result.get('name', agent_id)}' created from skillset '{skill_id}'."
-        }
-    except Exception as e:
-        return {'error': str(e)}
-
-
 def _exec_set_owner_name(args: dict) -> dict:
     name = (args.get('name') or '').strip()
     if not name:
@@ -670,9 +567,6 @@ def _exec_set_owner_name(args: dict) -> dict:
 
 def _exec_restart(args: dict, agent_context: dict = None) -> dict:
     """Restart the Evonic server. Same mechanism as /restart slash command."""
-    import sys as _sys
-    import threading
-    import time
     import json as _json
     import logging
 
@@ -685,6 +579,12 @@ def _exec_restart(args: dict, agent_context: dict = None) -> dict:
         session_id = agent_context.get('session_id')
     else:
         agent_id = channel_id = external_user_id = session_id = None
+
+    if agent_context and agent_context.get('restart_origin'):
+        return {
+            'error': 'Restart is disabled for restart-origin turns.',
+            'blocked': True,
+        }
 
     # ── Inter-agent restart guard ──────────────────────────────────────
     # When a regular agent messages the super agent asking for a restart,
@@ -733,102 +633,91 @@ def _exec_restart(args: dict, agent_context: dict = None) -> dict:
             },
         }
 
-    # Persist caller info so the new process can notify them after boot
-    recent_context = ''
-    try:
-        summary_data = db.get_summary(session_id, agent_id=agent_id) if session_id else None
-        summary_text = summary_data.get('summary', '') if summary_data else ''
-
-        last_messages = db.get_session_messages(session_id, limit=12, agent_id=agent_id) if session_id else []
-
-        parts = []
-        if summary_text:
-            parts.append('=== CONVERSATION SUMMARY ===')
-            parts.append(summary_text)
-
-        if last_messages:
-            parts.append('=== LAST MESSAGES ===')
-            # Pre-pass: find indices of restart tool calls + their triggering user messages
-            _restart_idx = set()
-            for _i, _m in enumerate(last_messages):
-                _tcs = _m.get('tool_calls') or []
-                if _m.get('role') == 'assistant' and any(
-                    isinstance(_tc, dict) and _tc.get('function', {}).get('name') == 'restart'
-                    for _tc in (_tcs if isinstance(_tcs, list) else [])
-                ):
-                    _restart_idx.add(_i)
-                    if _i > 0:
-                        _restart_idx.add(_i - 1)
-            for _i, msg in enumerate(last_messages):
-                if _i in _restart_idx:
-                    continue
-                role = msg.get('role', 'unknown')
-                if role == 'tool':
-                    continue
-                if role == 'assistant' and msg.get('tool_calls') and not (msg.get('content') or '').strip():
-                    continue
-                content = msg.get('content', '') or ''
-                # Skip user slash commands to prevent the LLM from re-issuing them
-                if role == 'user' and content.startswith('/'):
-                    continue
-                # Skip assistant responses to slash commands (metadata.slash_command)
-                if role == 'assistant' and msg.get('metadata', {}).get('slash_command'):
-                    continue
-                if content:
-                    parts.append(f'[{role}]: {content}')
-
-        recent_context = '\n\n'.join(parts)
-        if len(recent_context) > 3000:
-            recent_context = recent_context[:3000] + '\n...(truncated)'
-
-        _logger.info("Captured %d chars context from DB (summary + last_messages)", len(recent_context))
-    except Exception as _e:
-        _logger.error("Failed to read context from DB: %s", _e, exc_info=True)
-        recent_context = ''
-
+    # Persist routing only. The existing session history remains available after
+    # boot, so replaying it inside a new user message is both redundant and unsafe.
     db.set_setting('restart_greeting_needed', _json.dumps({
         'channel_id': channel_id,
         'external_user_id': external_user_id,
         'session_id': session_id,
-        'context': recent_context,
     }))
 
-    def _do_restart():
-        time.sleep(1.5)
-        from backend.channels.registry import channel_manager
-        channel_manager.stop_all()
-        time.sleep(1.0)
-        # `resource` is POSIX-only; skip FD cleanup on Windows.
-        if _sys.platform != 'win32':
-            try:
-                import resource
-                maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-                if maxfd == resource.RLIM_INFINITY or maxfd > 65535:
-                    maxfd = 4096
-                os.closerange(3, maxfd)
-            except Exception:
-                pass
-        # Resolve the correct restart target:
-        # - Release mode (BASE_DIR inside releases/): follow current symlink
-        # - Dev mode: restart from project root (BASE_DIR)
-        import config as _config
-        _base = os.path.realpath(_config.BASE_DIR)
-        _rel_marker = os.sep + 'releases' + os.sep
-        if _rel_marker in _base:
-            _project_root = _base.split(_rel_marker)[0]
-            _current = os.path.join(_project_root, 'current')
-            _target = os.path.realpath(_current) if os.path.islink(_current) else _base
-        else:
-            _target = _base
-        _app_py = os.path.join(_target, 'app.py')
-        _venv_python = os.path.join(_target, '.venv', 'bin', 'python')
-        _python = _venv_python if os.path.exists(_venv_python) else _sys.executable
-        os.chdir(_target)
-        os.execv(_python, [_python, _app_py])
-
-    t = threading.Thread(target=_do_restart, daemon=True)
-    t.start()
+    from backend.restart import restart_service
+    restart_service()
     return {'result': 'Restarting...'}
+
+
+def _sync_skill_tools(agent_id: str, final_skill_ids: list) -> dict:
+    """Sync skills and auto-manage tools for the given agent.
+
+    For each newly-added non-lazy skill, auto-assign its tools as
+    ``skill:<skill_id>:<fn_name>``.  For each removed skill, strip all
+    ``skill:<skill_id>:*`` tool IDs from the agent's tool list.
+    Persists both the final skill list and updated tool list.
+
+    Returns a dict with:
+      - added_skills, removed_skills (list[str])
+      - tools_added, tools_removed (int)
+      - final_skills, final_tools (list[str])
+    """
+    from backend.skills_manager import skills_manager
+
+    current_skills = db.get_agent_skills(agent_id)
+    current_tools = db.get_agent_tools(agent_id)
+
+    added = [s for s in final_skill_ids if s not in current_skills]
+    removed = [s for s in current_skills if s not in final_skill_ids]
+
+    tools_changed = False
+
+    # ---- auto-assign tools for newly-added non-lazy skills ----
+    total_added = 0
+    for skill_id in added:
+        skill = skills_manager.get_skill(skill_id)
+        if not skill:
+            continue
+        if skill.get('lazy_tools', False):
+            continue
+        # Use _load_tool_defs with _dir to bypass is_skill_enabled guard.
+        # Admin explicitly assigning a skill wants its tools regardless of
+        # global enable/disable status.  Fall back to get_skill_tool_defs
+        # when _dir is missing (e.g. mocked skills in tests).
+        skill_dir = skill.get('_dir', '')
+        if skill_dir:
+            tool_defs = skills_manager._load_tool_defs(skill_dir, skill)
+        else:
+            tool_defs = skills_manager.get_skill_tool_defs(skill_id)
+        for td in tool_defs:
+            fn_name = td['function']['name'] if isinstance(td, dict) and 'function' in td else td.get('name', '')
+            tool_id = f"skill:{skill_id}:{fn_name}" if fn_name else ''
+            if tool_id and tool_id not in current_tools:
+                current_tools.append(tool_id)
+                total_added += 1
+    if total_added > 0:
+        tools_changed = True
+
+    # ---- strip tools for removed skills ----
+    total_removed = 0
+    if removed:
+        before = len(current_tools)
+        current_tools = [t for t in current_tools
+                         if not any(t.startswith(f"skill:{s}:") for s in removed)]
+        total_removed = before - len(current_tools)
+        if total_removed > 0:
+            tools_changed = True
+
+    # ---- persist ----
+    db.set_agent_skills(agent_id, final_skill_ids)
+    if tools_changed:
+        db.set_agent_tools(agent_id, current_tools)
+
+    return {
+        'added_skills': added,
+        'removed_skills': removed,
+        'tools_added': total_added,
+        'tools_removed': total_removed,
+        'final_skills': final_skill_ids,
+        'final_tools': current_tools,
+    }
 
 
 def _exec_assign_skills(args: dict) -> dict:
@@ -845,39 +734,12 @@ def _exec_assign_skills(args: dict) -> dict:
     if not new_skills:
         return {'message': f"All {len(skill_ids)} skill(s) are already assigned to agent '{agent_id}'. No changes made."}
     merged = current_skills + new_skills
-    db.set_agent_skills(agent_id, merged)
 
-    # Auto-assign tools for non-lazy skills
-    from backend.skills_manager import skills_manager
-    current_tools = db.get_agent_tools(agent_id)
-    total_tools_added = 0
-    for skill_id in new_skills:
-        skill = skills_manager.get_skill(skill_id)
-        if not skill:
-            continue
-        if skill.get('lazy_tools', False):
-            continue  # skip lazy skills — tools loaded on demand via use_skill
-        # Use _load_tool_defs with _dir to bypass is_skill_enabled guard.
-        # Admin explicitly assigning a skill wants its tools regardless of
-        # global enable/disable status.  Fall back to get_skill_tool_defs
-        # when _dir is missing (e.g. mocked skills in tests).
-        skill_dir = skill.get('_dir', '')
-        if skill_dir:
-            tool_defs = skills_manager._load_tool_defs(skill_dir, skill)
-        else:
-            tool_defs = skills_manager.get_skill_tool_defs(skill_id)
-        for td in tool_defs:
-            fn_name = td['function']['name'] if isinstance(td, dict) and 'function' in td else td.get('name', '')
-            tool_id = f"skill:{skill_id}:{fn_name}" if fn_name else ''
-            if tool_id and tool_id not in current_tools:
-                current_tools.append(tool_id)
-                total_tools_added += 1
-    if total_tools_added > 0:
-        db.set_agent_tools(agent_id, current_tools)
+    result = _sync_skill_tools(agent_id, merged)
 
     msg = f"Added {len(new_skills)} new skill(s) to agent '{agent_id}' ({len(skill_ids)} requested, {len(skill_ids) - len(new_skills)} already assigned). Total: {len(merged)} skill(s)."
-    if total_tools_added > 0:
-        msg += f" Auto-assigned {total_tools_added} tool(s) from non-lazy skills."
+    if result['tools_added'] > 0:
+        msg += f" Auto-assigned {result['tools_added']} tool(s) from non-lazy skills."
     return {'success': True, 'message': msg}
 
 
@@ -894,8 +756,13 @@ def _exec_unassign_skill(args: dict) -> dict:
     if skill_id not in current_skills:
         return {'message': f"Skill '{skill_id}' was not assigned to agent '{agent_id}'. No changes made."}
     updated_skills = [s for s in current_skills if s != skill_id]
-    db.set_agent_skills(agent_id, updated_skills)
-    return {'success': True, 'message': f"Removed skill '{skill_id}' from agent '{agent_id}'. {len(updated_skills)} skill(s) remaining."}
+
+    result = _sync_skill_tools(agent_id, updated_skills)
+
+    msg = f"Removed skill '{skill_id}' from agent '{agent_id}'. {len(updated_skills)} skill(s) remaining."
+    if result['tools_removed'] > 0:
+        msg += f" Cleaned up {result['tools_removed']} orphaned tool(s)."
+    return {'success': True, 'message': msg}
 
 
 def _exec_agent_info(args: dict) -> dict:
@@ -915,8 +782,6 @@ _EXECUTORS: Dict[str, Callable] = {
     'assign_tools': _exec_assign_tools,
     'list_tools': _exec_list_tools,
     'manage_skill': _exec_manage_skill,
-    'list_skillsets': _exec_list_skillsets,
-    'apply_skillset': _exec_apply_skillset,
     'set_owner_name': _exec_set_owner_name,
     'restart': _exec_restart,
     'assign_skills': _exec_assign_skills,

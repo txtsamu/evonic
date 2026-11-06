@@ -5,13 +5,14 @@ Pure data preparation — no LLM calls, no threading.
 """
 from __future__ import annotations
 
-import base64
+import copy
 import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import tiktoken
 
@@ -28,10 +29,13 @@ def _token_count(text: str) -> int:
     return len(_TIKTOKEN_ENCODING.encode(text))
 
 from models.db import db
+from models.boolean import message_wrapper_enabled
+from models.chat import is_human_facing_external_user_id
 from backend.tools import tool_registry
+from backend.tools.registry import BUILTIN_TOOL_IDS
 from backend.skills_manager import SkillsManager, skills_manager
+from backend.agent_runtime import simulation_spec as sim_spec
 from backend.agent_runtime.evomem_client import (
-    get_kb_graph_metadata,
     get_evomem_db_mtime,
 )
 from config import AGENT_MAX_TOOL_RESULT_CHARS as MAX_TOOL_RESULT_CHARS
@@ -53,7 +57,14 @@ def _effective_id(agent: Dict[str, Any]) -> str:
     Sub-agents don't exist in the agents table or agents/ directory.
     They inherit the parent's SYSTEM.md, KB files, tool assignments,
     and skill assignments.
+
+    Explorers are the exception: although they are sub-agents, they must NOT
+    inherit the parent — they use their own (row-less) id so the system prompt
+    falls back to their configured prompt and KB/tool/variable lookups resolve
+    to empty. (Guard is a no-op for every non-explorer.)
     """
+    if agent.get('is_explorer'):
+        return agent['id']
     if agent.get('is_subagent'):
         return agent.get('parent_id', agent['id'])
     return agent['id']
@@ -61,6 +72,14 @@ def _effective_id(agent: Dict[str, Any]) -> str:
 
 def _system_prompt_path(agent_id: str) -> str:
     return os.path.join(_AGENTS_DIR, agent_id, 'SYSTEM.md')
+
+
+def _kb_dir(agent: Dict[str, Any], eid: str) -> str:
+    """KB directory for *agent*: under the simulation tree for sim agents."""
+    if sim_spec.is_simulation(agent):
+        from backend.tools.lib import simulation_scope as _sim_scope
+        return os.path.join(_sim_scope.agents_dir(agent), eid, 'kb')
+    return os.path.join(_AGENTS_DIR, eid, 'kb')
 
 
 def _get_mtime(path: str) -> float:
@@ -142,319 +161,86 @@ def _build_portal_info(agent_id: str) -> list:
     return lines
 
 
-def _extract_kb_frontmatter(filepath: str) -> dict:
-    """Parse YAML front matter in a KB file and return description + tags.
+def _resolve_workspace(agent: Dict[str, Any]) -> str:
+    """Return the effective workspace directory for this agent.
 
-    Returns a dict: {description: str|None, tags: [str]}.
+    Resolution order:
+    1. Sandbox agents: always /workspace (the Docker container mount)
+    2. Agents with workplace: use workplace.config.workspace_path
+    3. Fallback: agent.workspace field from DB
     """
-    result = {"description": None, "tags": []}
+    if agent.get('sandbox_enabled'):
+        return '/workspace'
+    wp_id = agent.get('workplace_id')
+    if wp_id:
+        try:
+            wp = db.get_workplace(wp_id)
+            if wp:
+                cfg = wp.get('config', {})
+                if isinstance(cfg, str):
+                    cfg = json.loads(cfg)
+                ws = cfg.get('workspace_path')
+                if ws:
+                    return ws
+        except Exception:
+            pass
+    return agent.get('workspace') or '/workspace'
+
+
+# Allowed doc `type` frontmatter values (mirrors Rust validate::VALID_TYPES and
+# evomem_writer.DOC_TYPES). Used for write-time validation + KB-graph node colors.
+KB_VALID_TYPES = ("note", "session", "group", "person", "place", "venue", "event",
+                  "organization", "company", "product", "contact")
+
+
+def validate_kb_frontmatter(content: str) -> str | None:
+    """Validate a KB markdown file's frontmatter. Return an error message if
+    invalid, else None.
+
+    Requires a leading YAML frontmatter block (`---` … `---`) with non-empty
+    `title`, `description`, and `type`, where `type` ∈ KB_VALID_TYPES.
+    """
+    lines = content.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return ("Missing YAML frontmatter. KB files must start with a `---` block "
+                "containing title, description, and type.")
+    fields = {}
+    closed = False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            closed = True
+            break
+        key, sep, val = line.partition(":")
+        if sep:
+            fields[key.strip()] = val.strip().strip("\"'")
+    if not closed:
+        return "Unterminated frontmatter block (missing closing `---`)."
+
+    missing = [k for k in ("title", "description", "type") if not fields.get(k)]
+    if missing:
+        return f"Missing required frontmatter field(s): {', '.join(missing)}."
+    if fields["type"] not in KB_VALID_TYPES:
+        return (f"Invalid type '{fields['type']}'; must be one of: "
+                f"{', '.join(KB_VALID_TYPES)}.")
+    return None
+
+
+def kb_frontmatter_warning(filepath: str) -> str | None:
+    """Soft-warn helper for KB edits: validate a file's current content and
+    return a user-facing warning if its frontmatter is incomplete, else None.
+
+    Never raises — used to attach a non-blocking warning after an edit.
+    """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
-            first_line = f.readline().strip()
-            if first_line != "---":
-                return result
-            for line in f:
-                line_stripped = line.strip()
-                if line_stripped == "---":
-                    break
-                if line_stripped.startswith("description:"):
-                    val = line_stripped[len("description:"):].strip().strip("\"'")
-                    result["description"] = val if val else None
-                elif line_stripped.startswith("tags:"):
-                    tag_val = line_stripped[len("tags:"):].strip()
-                    if tag_val.startswith("[") and tag_val.endswith("]"):
-                        inner = tag_val[1:-1].strip()
-                        if inner:
-                            result["tags"] = [t.strip().strip("\"'") for t in inner.split(",") if t.strip()]
+            err = validate_kb_frontmatter(f.read())
     except Exception:
-        pass
-    return result
+        return None
+    if err:
+        return (f"⚠ KB frontmatter incomplete: {err} "
+                f"Add title, description, and type (note|session|group).")
+    return None
 
-
-def _format_size(size_bytes: int) -> str:
-    """Format file size in human-readable KB or MB."""
-    if size_bytes >= 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
-    return f"{size_bytes / 1024:.1f} KB"
-
-
-def _compute_staleness_flag(
-    source_updated_at: str | None,
-    target_slug: str,
-    target_updated_at: dict,
-) -> str:
-    """Compute staleness flag for an outgoing link target.
-
-    Returns a string like " ⚠ (updated 3 days ago, target may have changed)"
-    or empty string if the target is not newer than the source.
-    """
-    if not source_updated_at:
-        return ""
-    target_ts = target_updated_at.get(target_slug)
-    if not target_ts:
-        return ""
-
-    try:
-        src_dt = datetime.fromisoformat(source_updated_at)
-        tgt_dt = datetime.fromisoformat(target_ts)
-    except (ValueError, TypeError):
-        return ""
-
-    if tgt_dt <= src_dt:
-        return ""
-
-    # Compute "N days ago" relative to target's update time
-    now = datetime.now(timezone.utc)
-    if tgt_dt.tzinfo is None:
-        tgt_dt = tgt_dt.replace(tzinfo=timezone.utc)
-    delta = now - tgt_dt
-    days = delta.days
-    if days == 0:
-        age = "today"
-    elif days == 1:
-        age = "1 day ago"
-    else:
-        age = f"{days} days ago"
-
-    return f" ⚠ (updated {age}, target may have changed)"
-
-
-def _build_kb_listing(effective_id: str) -> list:
-    """Build the KB listing.
-
-    When _kb_index.md exists, shows its content as the primary listing,
-    followed by auto-generated graph metadata. Otherwise falls back to
-    a flat graph-aware listing.
-
-    Returns a list of prompt lines, or empty list if no KB dir or no files.
-    """
-    kb_dir = os.path.join(_AGENTS_DIR, effective_id, 'kb')
-    if not os.path.isdir(kb_dir):
-        return []
-
-    files = sorted(
-        f for f in os.listdir(kb_dir)
-        if os.path.isfile(os.path.join(kb_dir, f))
-    )
-    if not files:
-        return []
-
-    lines = []
-    lines.append("\n## Available Knowledge Files")
-
-    # --- Try to use _kb_index.md as canonical index ---
-    index_path = os.path.join(kb_dir, '_kb_index.md')
-    if os.path.isfile(index_path):
-        # Read _kb_index.md content, strip YAML frontmatter
-        index_body = ""
-        try:
-            with open(index_path, 'r', encoding='utf-8') as f:
-                raw = f.read()
-            # Strip YAML frontmatter (--- ... ---)
-            if raw.startswith('---'):
-                second = raw.find('---', 3)
-                if second != -1:
-                    index_body = raw[second + 3:].strip()
-                else:
-                    index_body = raw
-            else:
-                index_body = raw
-        except Exception:
-            index_body = ""
-
-        if index_body:
-            lines.append(
-                "Your KB index (read with read(\"_kb_index.md\")):\n"
-            )
-            lines.append(index_body)
-            lines.append("")
-
-        # --- Auto-generated graph metadata (compact) ---
-        graph = get_kb_graph_metadata(effective_id)
-        graph_pages = graph["pages"] if graph else {}
-        target_updated_at = graph["target_updated_at"] if graph else {}
-
-        # Filter out _kb_index.md from graph metadata
-        regular_files = [f for f in files if f != '_kb_index.md']
-        if regular_files:
-            lines.append("### Graph metadata (auto-generated):")
-            if graph_pages:
-                for f in regular_files:
-                    gdata = graph_pages.get(f, {})
-                    incoming = gdata.get('incoming_slugs', [])
-                    outgoing = gdata.get('outgoing_slugs', [])
-                    tags = gdata.get('tags', [])
-                    tag_str = f" [tags: {', '.join(tags)}]" if tags else ""
-
-                    inc_str = f"↑{len(incoming)} incoming" if incoming else "↑0 incoming"
-                    out_str = f"→{len(outgoing)} outgoing" if outgoing else "→0 outgoing"
-
-                    source_ts = gdata.get('updated_at')
-                    if outgoing:
-                        out_parts = []
-                        for tgt in outgoing:
-                            flag = _compute_staleness_flag(source_ts, tgt, target_updated_at)
-                            out_parts.append(tgt + flag)
-                        out_str = f"→ {', '.join(out_parts)}"
-
-                    lines.append(f"- {f}: {inc_str}, {out_str}{tag_str}")
-            else:
-                for f in regular_files:
-                    lines.append(f"- {f}: no graph data available yet")
-            lines.append("")
-    else:
-        # --- Fallback: graph-aware listing (no _kb_index.md) ---
-        lines.append(
-            "You can read these files using the `read` tool. "
-            "Use [[kb/filename]] to link between KB docs."
-        )
-        lines.append("")
-
-        # Disk metadata
-        file_info: dict = {}
-        for f in files:
-            fp = os.path.join(kb_dir, f)
-            size = os.path.getsize(fp)
-            fm = _extract_kb_frontmatter(fp)
-            file_info[f] = {
-                "size": size,
-                "description": fm["description"],
-                "tags": fm["tags"],
-            }
-
-        # Graph metadata from evomem
-        graph = get_kb_graph_metadata(effective_id)
-        graph_pages = graph["pages"] if graph else {}
-        target_updated_at = graph["target_updated_at"] if graph else {}
-
-        for slug, gdata in graph_pages.items():
-            if slug in file_info:
-                if gdata.get("tags"):
-                    file_info[slug]["tags"] = gdata["tags"]
-
-        for f in files:
-            info = file_info[f]
-            gdata = graph_pages.get(f, {})
-
-            size_str = _format_size(info["size"])
-            tags = info.get("tags") or gdata.get("tags") or []
-            tag_str = f" [tags: {', '.join(tags)}]" if tags else ""
-            desc = info["description"]
-            if desc and len(desc) > 120:
-                desc = desc[:117] + "..."
-            desc_str = f" — {desc}" if desc else ""
-
-            lines.append(f"- {f} ({size_str}){tag_str}{desc_str}")
-
-            incoming = gdata.get("incoming_slugs", [])
-            if incoming:
-                lines.append(f"    ↑ referenced by: {', '.join(incoming)}")
-            else:
-                lines.append("    ↑ referenced by: <none>")
-
-            outgoing = gdata.get("outgoing_slugs", [])
-            if outgoing:
-                source_ts = gdata.get("updated_at")
-                out_parts = []
-                for tgt in outgoing:
-                    flag = _compute_staleness_flag(source_ts, tgt, target_updated_at)
-                    out_parts.append(tgt + flag)
-                lines.append(f"    → references: {', '.join(out_parts)}")
-            else:
-                lines.append("    → references: <none>")
-
-            lines.append("")
-
-    # --- KB Usage section (common to both paths) ---
-    lines.append("### KB Usage")
-    lines.append(
-        "- **Save**: Use `write_file` with path `/_self/kb/filename` to "
-        "store a new KB file."
-    )
-    lines.append(
-        "- **Read**: Use the `read` tool with the bare filename (no path) "
-        "to read a KB file."
-    )
-    lines.append(
-        "- **KB vs Remember**: Use `read` for reference documents, guides, "
-        "and long-form content. Use `remember` for short, searchable facts "
-        "you want to recall across conversations."
-    )
-    lines.append(
-        "- **Frontmatter**: KB files MUST include YAML frontmatter "
-        "(delimited by `---` lines) with a `description` field. This "
-        "description appears as a snippet in the \"Available Knowledge Files\" "
-        "listing, helping agents decide whether to read the full file."
-    )
-    lines.append(
-        "- **Best practices**: Store structured reference material in KB "
-        "(specs, API docs, conventions). Keep each file focused on one topic. "
-        "Update KB files when information changes. Always include frontmatter "
-        "with a `description` when creating a new KB file."
-    )
-    lines.append(
-        "- **Wiki-links**: Use `[[kb/filename]]` (without `.md` extension) "
-        "to link between KB documents. "
-        "Update `_kb_index.md` when adding new KB files."
-    )
-
-    # --- KB Coaching ---
-    lines.append("")
-    lines.append("### KB Coaching")
-    lines.append(
-        "When creating new KB files, add `[[kb/...]]` wiki-links to related "
-        "documents so the knowledge graph stays connected. Use the `kb_graph` "
-        "tool to explore existing link neighborhoods. Keep `_kb_index.md` "
-        "updated when you add or remove KB documents."
-    )
-
-    # Inject notes.md instructions only if notes.md exists in KB
-    if 'notes.md' in files:
-        lines.append("")
-        lines.append("### Notes.md - User Preferences & Instructions")
-        lines.append(
-            "You have a `notes.md` file in your KB. This file is your primary "
-            "location for storing your user's personal preferences, tastes, "
-            "language preferences, and communication style instructions."
-        )
-        lines.append("")
-        lines.append("**Use notes.md for:**")
-        lines.append(
-            "- User's preferred language (e.g., 'User prefers Bahasa Indonesia')"
-        )
-        lines.append(
-            "- Communication style preferences (e.g., 'User likes concise "
-            "answers', 'User dislikes emoji')"
-        )
-        lines.append("- Personal instructions (e.g., 'Call the user Pak')")
-        lines.append(
-            "- Tastes and preferences (e.g., 'User prefers bullet points "
-            "over paragraphs')"
-        )
-        lines.append("")
-        lines.append("**Do NOT put in notes.md -- use `remember` instead:**")
-        lines.append(
-            "- Factual/memorization data: addresses, phone numbers, email, birthday"
-        )
-        lines.append(
-            "- Secret/sensitive data: passwords, tokens, PINs, secret codes, "
-            "bank accounts"
-        )
-        lines.append("")
-        lines.append("**Usage rules:**")
-        lines.append('- Read this file: `read(\"notes.md\")`')
-        lines.append(
-            "- Update via `write_file` with path `/_self/kb/notes.md`"
-        )
-        lines.append(
-            "- Update immediately when the user communicates a new preference"
-        )
-        lines.append(
-            "- Prioritize notes.md over `remember` for non-factual preference "
-            "information"
-        )
-
-    return lines
 
 
 def _build_static_prompt(agent: Dict[str, Any]) -> str:
@@ -496,7 +282,7 @@ def _build_static_prompt(agent: Dict[str, Any]) -> str:
             parts.append(f"\n## Language\n{_lang_text}")
 
     # Inject system_prompt from assigned tool definitions
-    assigned_ids = set(db.get_agent_tools(eid))
+    assigned_ids = set(sim_spec.tools(agent, eid))
 
     if assigned_ids:
         seen_fn_names = set()
@@ -511,65 +297,107 @@ def _build_static_prompt(agent: Dict[str, Any]) -> str:
                 if tool_prompt:
                     if not agent.get('sandbox_enabled'):
                         tool_prompt = tool_prompt.replace('/workspace/shared/agents/', '')
-                        tool_prompt = tool_prompt.replace('/workspace', 'the agents working directory')
+                        tool_prompt = tool_prompt.replace('/workspace', _resolve_workspace(agent))
                     parts.append(tool_prompt)
 
-    # List available KB files with graph-aware metadata (links, tags, staleness)
-    _kb_listing_lines = _build_kb_listing(eid)
-    if _kb_listing_lines:
-        parts.extend(_kb_listing_lines)
+    # Scratchpad policy — only injected for agents that can create/run scripts
+    # (bash / runpy / write_file). Keeps throwaway operational scripts and temp
+    # files out of the project root and workspace by pointing them at a dedicated
+    # per-agent scratchpad directory.
+    _script_tools = {'bash', 'runpy', 'write_file'}
+    if assigned_ids & _script_tools:
+        from backend.tools._workspace import scratch_dir
+        scratch = scratch_dir(agent.get('agent_id') or aid)
+        parts.append(
+            "\n## Script & Scratch File Policy (MANDATORY)\n"
+            "You have tools that create and run scripts. Write EVERY throwaway "
+            "script, temporary file, and intermediate operational output to your "
+            f"dedicated scratchpad directory:\n\n    {scratch}/\n\n"
+            f"- Create it first if missing: `mkdir -p {scratch}`\n"
+            "- Never scatter one-off scripts or temp files in the project root, the "
+            "workspace, or arbitrary /tmp paths.\n"
+            "- Only durable, intentional deliverables belong outside the scratchpad."
+        )
 
-    # Message Wrapper Protocol
-    parts.append("")
-    parts.append("## Message Wrapper Protocol")
-    parts.append(
-        "After EVERY user message, before your main response, you MUST:"
-    )
-    parts.append(
-        "1. Scan the message for any new preference, instruction, rule, or personal fact."
-    )
-    parts.append(
-        "2. If found: store it immediately via remember() (factual data), "
-        "update notes.md (tastes/preferences/style), or update SYSTEM.md (critical rules)."
-    )
-    parts.append(
-        "3. This applies to BOTH explicit and implicit cues. Even casual mentions count."
-    )
+    if message_wrapper_enabled(agent, db):
+        parts.append("")
+        parts.append("## Message Wrapper Protocol")
+        parts.append(
+            "After EVERY user message, before your main response, you MUST:"
+        )
+        parts.append(
+            "1. Scan the message for any new preference, instruction, rule, or personal fact."
+        )
+        parts.append(
+            "2. If found: store it immediately via remember() (factual data), "
+            "store it as a preference via remember() for non-factual style notes, or update SYSTEM.md (critical rules)."
+        )
+        parts.append(
+            "3. This applies to BOTH explicit and implicit cues. Even casual mentions count."
+        )
 
     # Memory Retrieval Protocol — coach the agent on the retrieval side of
-    # long-term memory (the capture side is covered above). Relevant facts are
-    # auto-injected each turn, but the agent should reach for these tools when it
-    # needs more than what was injected.
+    # long-term memory (the capture side is covered above). Memories are NOT
+    # auto-injected; the agent must use recall() to explicitly fetch them.
     parts.append("")
     parts.append("## Memory Retrieval Protocol")
     parts.append(
-        "You have long-term memory that persists across conversations. Relevant facts "
-        "are injected automatically each turn under a \"## Memory\" heading, so you "
-        "usually do not need to fetch them. When you need MORE than what was injected:"
+        "You have long-term memory that persists across conversations. You MUST use "
+        "the `recall` tool to look up past facts — nothing is injected automatically."
+    )
+    parts.append(
+        "- `recall(query=\"<key>\", mode=\"key\")` — exact current value of a keyed "
+        "fact. Fastest and most precise; prefer it whenever the key is listed below."
     )
     parts.append(
         "- `recall(query=\"...\")` — fast keyword lookup of a specific stored fact "
-        "(e.g. a phone number, an address, a name)."
+        "(e.g. a phone number, an address, a name). This is the default (mode='fts')."
     )
     parts.append(
-        "- `think(query=\"...\")` — reason over EVERYTHING you know about a topic; "
-        "returns a synthesis plus what is still missing. Prefer this over `recall` for "
+        "- `recall(query=\"...\", mode=\"think\")` — reason over EVERYTHING you know "
+        "about a topic; returns a synthesis plus what is still missing. Prefer this for "
         "open questions like \"what do I know about the user's project?\"."
     )
     parts.append(
-        "- `graph_query(entity=\"...\")` — follow relationships between people, "
+        "- `recall(query=\"...\", mode=\"graph\")` — follow relationships between people, "
         "organizations, and projects (e.g. where someone works, what they founded, "
-        "who they advise)."
+        "who they advise); `query` is the entity name."
     )
     parts.append(
         "Look facts up instead of guessing or asking the user for something you may "
         "already know."
     )
+    parts.append(
+        "- If you are not sure about a thing or what the user wants, check first "
+        "using the `recall` tool \u2014 the information might already be there."
+    )
+    parts.append(
+        "- **Recall before filesystem search**: When you need to locate a project "
+        "directory, binary, configuration file, or any file path, you MUST use "
+        "`recall` first to check if the location is already stored in long-term "
+        "memory. Only after confirming the information is not in memory should you "
+        "resort to filesystem exploration."
+    )
 
-    # List available skills with SYSTEM.md so the agent knows what it can load
+    # Keys-only memory index: show WHAT the agent knows (a few tokens per key)
+    # without paying for the contents. Enables precise recall(mode='key') and
+    # keeps remember() key naming consistent (the agent reuses listed keys).
+    try:
+        _mem_keys = db.get_active_dimensions(aid, limit=50)
+    except Exception:
+        _mem_keys = []
+    if _mem_keys:
+        parts.append(
+            "Known memory keys (current value via `recall(query=\"<key>\", "
+            "mode=\"key\")`; reuse a listed key in remember() to update that fact):"
+        )
+        parts.append("`" + "`, `".join(_mem_keys) + "`")
+
+    # List available lazy skills so the agent knows what it can load. SYSTEM.md
+    # is optional: a lazy skill can expose tools without additional instructions.
     skills_mgr = skills_manager
-    _allowed_skills = None if agent.get('is_super') else set(db.get_agent_skills(eid))
-    skills_with_system_md = []
+    _allowed_skills = None if agent.get('is_super') else set(sim_spec.skills(agent, eid))
+    lazy_skills = []
     skill_briefs = []
     for skill in skills_mgr.list_skills():
         if not skills_mgr.is_skill_enabled(skill.get('id', '')):
@@ -583,19 +411,16 @@ def _build_static_prompt(agent: Dict[str, Any]) -> str:
         # Only list lazy skills — eager skills' tools are already in the tool list
         if not skill.get('lazy_tools', False):
             continue
-        skill_dir = skill.get('_dir', os.path.join(_BASE_DIR, 'skills', skill['id']))
-        system_md_path = os.path.join(skill_dir, 'SYSTEM.md')
-        if os.path.isfile(system_md_path):
-            skills_with_system_md.append(skill['id'])
-            # brief is for agents; fall back to description if no brief defined
-            brief = skill.get('brief', '').strip() or skill.get('description', '').strip()
-            if brief:
-                skill_briefs.append(brief)
+        lazy_skills.append(skill['id'])
+        # brief is for agents; fall back to description if no brief defined
+        brief = skill.get('brief', '').strip() or skill.get('description', '').strip()
+        if brief:
+            skill_briefs.append(brief)
 
-    if skills_with_system_md:
+    if lazy_skills:
         parts.append("\n## Skills")
         parts.append("You have these skills that can be loaded using `use_skill` tool:")
-        for skill_id in skills_with_system_md:
+        for skill_id in lazy_skills:
             parts.append(f"- `{skill_id}`")
         # Inject skill briefs — short usage hints defined in skill.json
         if skill_briefs:
@@ -642,6 +467,11 @@ def _build_static_prompt(agent: Dict[str, Any]) -> str:
         f"- `/_self/plan/` — your plan files\n"
         f"- `/_self/artifacts/` — your artifacts directory"
     )
+    parts.append(
+        "**Important**: `/_self/` paths only work with file tools "
+        "(`read_file`, `write_file`, `patch`, `str_replace`) — "
+        "NOT with `bash` or `runpy`."
+    )
 
     # Inform agents about portal virtual paths configured for them
     _portal_lines = _build_portal_info(eid)
@@ -676,7 +506,7 @@ def _build_static_prompt(agent: Dict[str, Any]) -> str:
 
     # List available agent variables (names only, never values) so the LLM
     # knows to reference $VAR_NAME in bash/runpy instead of literal secrets.
-    agent_vars = db.get_agent_variables(eid)
+    agent_vars = sim_spec.variables(agent, eid)
     if agent_vars:
         parts.append("\n## Environment Variables")
         parts.append(
@@ -702,7 +532,7 @@ def _cache_key_valid(agent: Dict[str, Any], cache_entry: Dict[str, Any]) -> bool
         return False
 
     # Check KB dir mtime
-    kb_dir = os.path.join(_AGENTS_DIR, eid, 'kb')
+    kb_dir = _kb_dir(agent, eid)
     if _get_mtime(kb_dir) != cache_entry['kb_mtime']:
         return False
 
@@ -711,7 +541,7 @@ def _cache_key_valid(agent: Dict[str, Any], cache_entry: Dict[str, Any]) -> bool
         return False
 
     # Check tools hash (assigned tool IDs)
-    assigned_ids = frozenset(db.get_agent_tools(eid))
+    assigned_ids = frozenset(sim_spec.tools(agent, eid))
     if str(sorted(assigned_ids)) != cache_entry['tools_hash']:
         return False
 
@@ -724,7 +554,7 @@ def _cache_key_valid(agent: Dict[str, Any], cache_entry: Dict[str, Any]) -> bool
         return False
 
     # Check agent variables hash (adding/removing/changing variables must invalidate)
-    current_vars = db.get_agent_variables(eid)
+    current_vars = sim_spec.variables(agent, eid)
     vars_key = str(sorted((v['key'], v.get('is_secret', False)) for v in current_vars))
     if hashlib.sha256(vars_key.encode()).hexdigest() != cache_entry.get('vars_hash', ''):
         return False
@@ -733,10 +563,41 @@ def _cache_key_valid(agent: Dict[str, Any], cache_entry: Dict[str, Any]) -> bool
     if get_evomem_db_mtime(eid) != cache_entry.get('evomem_mtime', 0.0):
         return False
 
+    # Check run_as_user — changing the execution user must invalidate the cache
+    if agent.get('run_as_user') != cache_entry.get('run_as_user'):
+        return False
+
+    # Check workspace — changing via /cd must invalidate the cache
+    if _resolve_workspace(agent) != cache_entry.get('workspace'):
+        return False
+
+    if message_wrapper_enabled(agent, db) != cache_entry.get('message_wrapper_enabled'):
+        return False
+
     return True
 
 
-def build_system_prompt(agent: Dict[str, Any]) -> str:
+def trail_history_kwargs(agent_id: str) -> dict:
+    """Extra kwargs for chatlog.get_entries_for_llm_trail().
+
+    Normally empty, so trail history keeps its default 50-message sliding
+    window. For agent ids listed in the `trail_history_full_agents` setting,
+    raise the message limit to `trail_history_limit` (default 1_000_000), i.e.
+    TRUE full history — the whole transcript is sent every turn until the model
+    hits its context ceiling. Used by the CMP endurance benchmark to run a
+    genuine full-history baseline against the bounded windowed/CMP arms.
+    """
+    try:
+        from models.db import db
+        full = (db.get_setting('trail_history_full_agents', '') or '')
+        if agent_id and agent_id in {a.strip() for a in full.split(',') if a.strip()}:
+            return {'limit': int(db.get_setting('trail_history_limit', '1000000') or 1000000)}
+    except Exception:
+        pass
+    return {}
+
+
+def build_system_prompt(agent: Dict[str, Any], injected_system_vars: Dict[str, str] = None) -> str:
     """Build the system prompt including tool injections and KB file listing.
 
     The static portion (SYSTEM.md, KB files, skills) is cached per-agent and
@@ -756,13 +617,13 @@ def build_system_prompt(agent: Dict[str, Any]) -> str:
 
         # Build mtime snapshot for cache validation
         sp_path = _system_prompt_path(eid)
-        kb_dir = os.path.join(_AGENTS_DIR, eid, 'kb')
+        kb_dir = _kb_dir(agent, eid)
         skills_hash = _get_skills_mtime_hash()
 
-        assigned_ids = frozenset(db.get_agent_tools(eid))
+        assigned_ids = frozenset(sim_spec.tools(agent, eid))
 
         # Compute variables hash for cache invalidation
-        current_vars = db.get_agent_variables(eid)
+        current_vars = sim_spec.variables(agent, eid)
         vars_key = str(sorted((v['key'], v.get('is_secret', False)) for v in current_vars))
         vars_hash = hashlib.sha256(vars_key.encode()).hexdigest()
 
@@ -776,9 +637,20 @@ def build_system_prompt(agent: Dict[str, Any]) -> str:
             'ctx_mtime': _get_mtime(__file__),
             'sandbox_enabled': agent.get('sandbox_enabled', 0),
             'vars_hash': vars_hash,
+            'run_as_user': agent.get('run_as_user'),
+            'workspace': _resolve_workspace(agent),
+            'message_wrapper_enabled': message_wrapper_enabled(agent, db),
         }
 
     prompt = static_prompt
+
+    # Expand injected system vars (session-scoped, after cache)
+    if injected_system_vars is None:
+        injected_system_vars = agent.get('injected_system_vars')
+    if injected_system_vars:
+        for key, value in injected_system_vars.items():
+            placeholder = '{{' + key + '}}'
+            prompt = prompt.replace(placeholder, str(value))
 
     # Onboarding injection for super agent (one-time, until owner name is known).
     # Once set_owner_name is called, defaults/super_agent_system_prompt.md is copied
@@ -811,6 +683,44 @@ def build_system_prompt(agent: Dict[str, Any]) -> str:
         if not has_template_vars:
             prompt += (f"\n\nCurrent date/time: {now.strftime('%A')}, "
                        f"{now.strftime('%Y-%m-%d')}, {now.strftime('%H:%M:%S')} (WIB/UTC+7)")
+
+    # Run-as-user awareness: tell agent which user they execute as (no sudo needed).
+    # Only the local backend honours run_as_user; an agent with a workplace runs
+    # through that workplace's backend (for an Evonet tunnel: the user running
+    # the Evonet process on the target host), so claiming it would be a lie.
+    run_as_user = agent.get('run_as_user')
+    if run_as_user and not agent.get('sandbox_enabled') and not agent.get('workplace_id'):
+        prompt += f"\n\nYou are run as the **{run_as_user}** user."
+
+    # Bwrap sandbox awareness: agents executing inside a bubblewrap sandbox
+    # (bwrap workplace, or global SANDBOX_BACKEND=bwrap) need to know its rules.
+    _bwrap_active = False
+    _wp_id = agent.get('workplace_id')
+    if _wp_id:
+        try:
+            _wp = db.get_workplace(_wp_id)
+            _bwrap_active = bool(_wp and _wp.get('type') == 'bwrap')
+        except Exception:
+            pass
+    elif agent.get('sandbox_enabled'):
+        try:
+            from config import SANDBOX_BACKEND
+            _bwrap_active = SANDBOX_BACKEND == 'bwrap'
+        except ImportError:
+            pass
+    if _bwrap_active:
+        prompt += (
+            "\n\n## Sandbox Environment\n"
+            "You run inside a lightweight Linux sandbox (bubblewrap):\n"
+            "- No root/sudo — the OS filesystem is read-only. Install tools into your "
+            "home instead (`pip install --user`, `npm --prefix ~/…`, or binaries in `~/bin`); "
+            "your home persists.\n"
+            "- Work in `/workspace` (visible to file tools) or `~` (`/home/agent`). "
+            "Files under `/tmp` are invisible to file tools.\n"
+            "- Background processes (servers, tunnels, tmux) keep running between "
+            "commands, but die when the platform restarts.\n"
+            "- `ping` may be unavailable (no raw sockets) — use `curl` to test connectivity."
+        )
 
     # Dynamic enabled-agent roster for super agents.
     # Injects a lightweight list of enabled agents (id, name, description) so the
@@ -850,6 +760,15 @@ def build_system_prompt(agent: Dict[str, Any]) -> str:
         except Exception:
             _logger.warning("Failed to lookup workplace for agent %s", aid, exc_info=True)
 
+    # CWD awareness: tell non-sandbox agents their actual working directory.
+    # Sandbox agents already know they run at /workspace from the Sandbox
+    # Environment section. Tunnel/remote agents need this since their tool
+    # descriptions no longer show a generic placeholder.
+    if not agent.get('sandbox_enabled'):
+        workspace = _resolve_workspace(agent)
+        if workspace:
+            prompt += f"\n\nYour current working directory is `{workspace}`.\n"
+
     # Always append the empty-response recovery instruction
     prompt += (
         "\n\n## Response Recovery Rule\n"
@@ -866,15 +785,60 @@ def build_system_prompt(agent: Dict[str, Any]) -> str:
         ("/help", "Show available commands"),
         ("/summary", "Force regenerate session summary"),
         ("/stop", "Stop the agent's current processing loop"),
+        ("/detach", "Stop waiting on the running long-running process and attach an on-exit monitor to it, so we can keep chatting and you report back once it finishes (persistent, survives restarts; the monitor removes itself)"),
+        ("/jobs", "List background jobs for this session and any monitors attached to them"),
+        ("/dump", "Dump current session as JSONL file for download"),
+        ("/model", "Show or switch LLM model"),
+        ("/fast", "Show or set Codex Fast mode for this session"),
     ]
     slash_commands.append(("/plan", "Switch to plan mode"))
     slash_commands.append(("/unfocus", "Force-clear focus mode — use when agent is stuck in focus after a failed task"))
-    if is_super:
-        slash_commands.append(("/restart", "Restart the service (super agent only)"))
+    # /cd and /cwd are available to super agents and agents with remote/tunnel workplaces
+    has_remote_workplace = False
+    if not is_super:
+        workplace_id = agent.get('workplace_id')
+        if workplace_id:
+            try:
+                workplace = db.get_workplace(workplace_id)
+                if workplace and workplace.get('type') in ('remote', 'tunnel'):
+                    has_remote_workplace = True
+            except Exception:
+                pass
+    if is_super or has_remote_workplace:
         slash_commands.append(("/cwd", "Show current workspace directory"))
         slash_commands.append(("/cd", "Change workspace directory"))
+    if is_super:
+        slash_commands.append(("/restart", "Restart the service (super agent only)"))
         slash_commands.append(("/shutdown", "Shut down the Evonic server completely (super agent only)"))
     # /autopilot is not yet implemented, omit from listing
+
+    # Filter slash commands based on per-agent hidden/disabled settings.
+    # Super agents are exempt — they always see all commands.
+    if not is_super:
+        all_cmd_names = {name for name, _desc in slash_commands}
+
+        def _expand(raw_value: str) -> set:
+            if not raw_value or not raw_value.strip():
+                return set()
+            raw = raw_value.strip()
+            if raw == '*':
+                return set(all_cmd_names)
+            if raw.startswith('!'):
+                allowed = {c.strip() for c in raw[1:].split(',') if c.strip()}
+                return set(all_cmd_names) - allowed
+            return {c.strip() for c in raw.split(',') if c.strip()}
+
+        hidden = _expand(agent.get('hidden_slash_commands', ''))
+        disabled = _expand(agent.get('disabled_slash_commands', ''))
+        remove_set = hidden | disabled
+        if remove_set:
+            slash_commands = [(n, d) for n, d in slash_commands if n not in remove_set]
+
+    # Hide /help from the advertised command list when the per-agent help
+    # toggle is off — the command is silently ignored at runtime (no reply,
+    # no LLM fallthrough), so advertising it would be misleading.
+    if not bool(agent.get('help_enabled', True)):
+        slash_commands = [(n, d) for n, d in slash_commands if n != '/help']
 
     if slash_commands:
         prompt += "\n\n## Slash Commands\n\n**Available commands:**\n"
@@ -886,85 +850,162 @@ def build_system_prompt(agent: Dict[str, Any]) -> str:
         if agent.get('sandbox_enabled'):
             artifacts_path = os.path.join('/workspace/shared/agents', aid, 'artifacts')
             artifacts_note = (
-                f"Your artifacts directory is: `{artifacts_path}`\n"
-                "Files you save here will appear in the Artifacts tab on your agent detail page.\n"
-                "Use `save_artifact(source_path=\"...\")` for files already on disk (binaries, images, PDFs) "
-                "or `save_artifact(content=\"...\")` for text generated in your response.\n"
-                "You can also access it via `/_self/artifacts/` with any file tool.\n\n"
-                f"**Artifact public URL**: `/api/agents/{aid}/artifacts/<filename>`\n"
-                "This URL serves the file directly in the browser (no download prompt for images).\n"
-                "To display an image inline in chat, save it via `save_artifact(source_path=\"...\")` "
-                f"then embed in your markdown response: `<img src=\"/api/agents/{aid}/artifacts/filename.webp\" alt=\"...\">`\n\n"
-                "**Important**: `/_self/` paths only work with file tools (`read_file`, `write_file`, `patch`, `str_replace`) "
-                "— NOT with `bash` or `runpy`. When saving from bash/runpy, use the full workspace path "
-                f"`{artifacts_path}` or the `save_artifact` tool."
+                f"Directory: `{artifacts_path}` (also `/_self/artifacts/` via file tools only). "
+                "Save with `save_artifact(content=\"...\")` or `save_artifact(source_path=\"...\")`; "
+                "files appear in the Artifacts tab. "
+                f"Public URL: `/api/agents/{aid}/artifacts/<filename>`. "
+                f"Embed images with `<img src=\"/api/agents/{aid}/artifacts/filename.webp\" alt=\"...\">`. "
+                "Deliver files to the user with `send_file` (or `save_artifact` for the Artifacts tab). "
+                "Never give local filesystem paths (e.g. `/home/...`, `sandbox:...`) as chat links — "
+                "the user cannot open them. "
+                f"`bash`/`runpy` must use `{artifacts_path}`, not `/_self/`."
             )
         else:
             artifacts_note = (
-                f"Your artifacts are served at: `/api/agents/{aid}/artifacts/<filename>`\n"
-                "Use the `save_artifact` tool to save files. "
-                "Use `save_artifact(source_path=\"...\")` for files already on disk (binaries, images) "
-                "or `save_artifact(content=\"...\")` for text generated in your response. "
-                "You can also access the directory via `/_self/artifacts/` with file tools.\n\n"
-                "To display an image inline in chat: save it via `save_artifact(source_path=\"...\")` "
-                f"then embed in your markdown response: `<img src=\"/api/agents/{aid}/artifacts/filename.webp\" alt=\"...\">`\n\n"
-                "**Important**: `/_self/` paths only work with file tools (`read_file`, `write_file`, `patch`, `str_replace`) "
-                "— NOT with `bash` or `runpy`."
+                f"Public URL: `/api/agents/{aid}/artifacts/<filename>`. "
+                "Save with `save_artifact(content=\"...\")` or `save_artifact(source_path=\"...\")`; "
+                "files are also available at `/_self/artifacts/` via file tools. "
+                f"Embed images with `<img src=\"/api/agents/{aid}/artifacts/filename.webp\" alt=\"...\">`. "
+                "Deliver files to the user with `send_file` (or `save_artifact` for the Artifacts tab). "
+                "Never give local filesystem paths (e.g. `/home/...`, `sandbox:...`) as chat links — "
+                "the user cannot open them. "
+                "`bash`/`runpy` cannot use `/_self/`."
             )
         prompt += "\n\n## Artifacts Directory\n" + artifacts_note
 
     return prompt
 
 
-def build_tools(agent: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Build the OpenAI function tool list for this agent."""
+def build_tools(agent: Dict[str, Any], channel_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Build the OpenAI function tool list for this agent.
+
+    ``channel_id`` is the external channel the session runs on (None for the
+    web chat). Tools declared ``"web_only": true`` in their definition are left
+    out of the list on external channels, so the model never sees them. Tools
+    declaring ``"channels": ["web", "telegram", ...]`` are listed only on those
+    channel types ("web" is the web chat).
+    """
     tools = []
 
-    # Always include built-in tools (read, etc.)
-    # Pass workplace_id so built-in factories can tailor descriptions for remote agents
-    # (e.g. read() tool mentions /_self/kb/ when workplace_id is set).
+    # Explorer sub-agents (the Explore tool's explorers AND the KB organizer) are
+    # isolated workers: they get ONLY their configured tools — the direxplorer
+    # read-only set (Grep/Read/Glob) plus any EXTRAS the user added in the explorer
+    # skill settings. They must NOT receive built-ins (remember/recall/...),
+    # universal, messaging, or parent tools. Resolve FIRST and return; their tools
+    # may come from a LAZY skill, hence resolving directly via _explorer.tool_defs.
+    if agent.get('is_explorer'):
+        from backend.agent_runtime import explorer as _explorer
+        seen_fn_names = set()
+        for tool_def in _explorer.tool_defs(agent):
+            fn_name = tool_def.get('function', {}).get('name', '')
+            if fn_name and fn_name not in seen_fn_names:
+                seen_fn_names.add(fn_name)
+                tools.append(tool_def)
+        return compact_tool_definitions(tools)
+
+    # Resolve explicit assignments before adding messaging definitions so the LLM
+    # sees only messaging tools the agent can actually execute. Sub-agents inherit
+    # their parent's assignments.
+    eid = _effective_id(agent)
+    assigned_ids = set(sim_spec.tools(agent, eid))
+
+    # Built-in tools (use_skill, set_mode, remember, recall, etc.)
+    # Can be disabled per-agent via builtin_tools_enabled advanced setting.
     agent_context = {
         'id': agent['id'],
         'is_super': bool(agent.get('is_super')),
         'workplace_id': agent.get('workplace_id'),
+        'workplace_switch_enabled': bool(agent.get('workplace_switch_enabled')),
+        'send_file_allowed_path_regex': agent.get('send_file_allowed_path_regex', ''),
+        'enable_cmp': bool(agent.get('enable_cmp')) and bool(agent.get('enable_agent_state')),
+        'always_execute': bool(agent.get('always_execute')),
     }
-    tools.extend(tool_registry.get_builtin_tools(agent_context))
+    if agent.get('builtin_tools_enabled', True):
+        tools.extend(tool_registry.get_builtin_tools(agent_context))
+
+    # Universal tools — always available to all agents without explicit assignment.
+    # These are regular backend/tools/.py implementations (save_artifact, send_file)
+    # that should behave like built-in tools but don't use the built-in factory pattern.
+    seen_fn_names = {t['function']['name'] for t in tools if t.get('function', {}).get('name')}
+    for tool_def in tool_registry.get_all_tool_defs():
+        fn_name = tool_def.get('function', {}).get('name', '')
+        tool_id = tool_def.get('id', '')
+        if not fn_name or tool_id.startswith('skill:'):
+            continue
+        if fn_name not in BUILTIN_TOOL_IDS:
+            continue
+        if fn_name == 'save_artifact' and not agent.get('artifacts_enabled', True):
+            continue
+        if fn_name in seen_fn_names:
+            continue
+        seen_fn_names.add(fn_name)
+        tools.append({
+            "type": "function",
+            "function": tool_def['function']
+        })
 
     # Super agent gets its own administrative built-in tools
     if agent.get('is_super'):
         from backend.tools.super_agent_tools import get_super_agent_tool_defs
         tools.extend(get_super_agent_tool_defs())
 
-    # Super agent gets ALL skill tools automatically — no per-skill assignment needed
-    if agent.get('is_super'):
-        seen_fn_names = {t['function']['name'] for t in tools if t.get('function', {}).get('name')}
-        for tool_def in tool_registry.get_all_tool_defs():
-            tool_id = tool_def.get('id', '')
-            fn_name = tool_def.get('function', {}).get('name', '')
-            if not tool_id.startswith('skill:') or not fn_name:
-                continue
-            if fn_name in seen_fn_names:
-                continue
-            seen_fn_names.add(fn_name)
-            tools.append({
-                "type": "function",
-                "function": tool_def['function']
-            })
-
-    # Agent messaging tools — available to super agent and agents with messaging enabled
+    # Agent messaging tools are gated by messaging enablement and assignment.
+    # This keeps definitions advertised to the LLM aligned with runtime
+    # authorization, while super agents retain access to the full messaging set.
     if agent.get('is_super') or agent.get('agent_messaging_enabled') != 0:
         from backend.tools.agent_messaging import get_agent_messaging_tool_defs
-        tools.extend(get_agent_messaging_tool_defs())
+        seen_fn_names = {t['function']['name'] for t in tools if t.get('function', {}).get('name')}
+        for tool_def in get_agent_messaging_tool_defs():
+            fn_name = tool_def.get('function', {}).get('name', '')
+            if not fn_name or fn_name in seen_fn_names:
+                continue
+            # send_agent_message is the core inter-agent communication tool: an
+            # enabled agent receives it without a separate tool assignment. The
+            # remaining messaging tools retain assignment-based exposure.
+            if (not agent.get('is_super')
+                    and fn_name != 'send_agent_message'
+                    and fn_name not in assigned_ids):
+                continue
+            seen_fn_names.add(fn_name)
+            tools.append(tool_def)
 
-    # Add assigned tools from the registry (including skill tools)
-    # Sub-agents inherit parent's tool assignments
-    eid = _effective_id(agent)
-    assigned_ids = set(db.get_agent_tools(eid))
+    # Add assigned tools from the registry (including skill tools).
+
+    # Auto-assign describe_image for vision-enabled agents.
+    # Mirrors the auto-assignment in runtime.py and prefetch.py so that
+    # build_tools includes the tool definition (not just the hint).
+    if agent.get('vision_enabled', 1):
+        assigned_ids.add('describe_image')
+
+    # Auto-assign transcribe_audio for audio-enabled agents.
+    if agent.get('audio_enabled'):
+        assigned_ids.add('transcribe_audio')
+
+    # ask_user_question follows the agent's setting, even if assigned by hand.
+    if agent.get('ask_user_enabled', 1):
+        assigned_ids.add('ask_user_question')
+    else:
+        assigned_ids.discard('ask_user_question')
+
+    # Auto-assign monitor wherever bash is available — it is the opt-in way to
+    # be notified about background processes, which only bash can start.
+    if 'bash' in assigned_ids:
+        assigned_ids.add('monitor')
+
     if assigned_ids:
         seen_fn_names = {t['function']['name'] for t in tools if t.get('function', {}).get('name')}
+        channel_type = None  # resolved lazily: only tools declaring "channels" need it
         for tool_def in tool_registry.get_all_tool_defs():
             tool_id = tool_def.get('id', '')
             fn_name = tool_def.get('function', {}).get('name', '')
+            if channel_id and tool_def.get('web_only'):
+                continue
+            if tool_def.get('channels'):
+                if channel_type is None:
+                    channel = db.get_channel(channel_id) if channel_id else None
+                    channel_type = (channel or {}).get('type', '') if channel_id else 'web'
+                if channel_type not in tool_def['channels']:
+                    continue
             # Match by namespaced id OR bare function name (backward compat)
             if tool_id in assigned_ids or fn_name in assigned_ids:
                 # One function name per agent — skip duplicates
@@ -980,31 +1021,30 @@ def build_tools(agent: Dict[str, Any]) -> List[Dict[str, Any]]:
     # This ensures that when an agent has a skill assigned in agent_skills and that skill
     # is eagerly loaded (no lazy_tools=true), the tools are available without manual
     # tool assignment in agent_tools.
-    if not agent.get('is_super'):
-        assigned_skill_ids = set(db.get_agent_skills(eid))
-        if assigned_skill_ids:
-            for skill in skills_manager.list_skills():
-                skill_id = skill.get('id', '')
-                if skill_id not in assigned_skill_ids:
+    assigned_skill_ids = set(sim_spec.skills(agent, eid))
+    if assigned_skill_ids:
+        for skill in skills_manager.list_skills():
+            skill_id = skill.get('id', '')
+            if skill_id not in assigned_skill_ids:
+                continue
+            # Skip lazy-loaded skills — their tools are injected via use_skill
+            if skill.get('lazy_tools', False):
+                continue
+            # Skip super_only skills for non-super agents
+            if skill.get('super_only', False) and not agent.get('is_super'):
+                continue
+            defs = skills_manager.get_skill_tool_defs(skill_id)
+            for tool_def in defs:
+                fn_name = tool_def.get('function', {}).get('name', '')
+                if not fn_name:
                     continue
-                # Skip lazy-loaded skills — their tools are injected via use_skill
-                if skill.get('lazy_tools', False):
+                # Avoid duplicates
+                if any(t['function']['name'] == fn_name for t in tools):
                     continue
-                # Skip super_only skills for non-super agents
-                if skill.get('super_only', False):
-                    continue
-                defs = skills_manager.get_skill_tool_defs(skill_id)
-                for tool_def in defs:
-                    fn_name = tool_def.get('function', {}).get('name', '')
-                    if not fn_name:
-                        continue
-                    # Avoid duplicates
-                    if any(t['function']['name'] == fn_name for t in tools):
-                        continue
-                    tools.append({
-                        "type": "function",
-                        "function": tool_def['function']
-                    })
+                tools.append({
+                    "type": "function",
+                    "function": tool_def['function']
+                })
 
     # ── Patch /workspace and Docker/container references for non-sandbox agents ──
     # Tool JSON definitions contain /workspace paths and Docker/container
@@ -1012,6 +1052,7 @@ def build_tools(agent: Dict[str, Any]) -> List[Dict[str, Any]]:
     # (workplace/remote) aren't running in Docker, so sanitize these.
     if not agent.get('sandbox_enabled'):
         # Ordered replacements — most specific first to avoid partial matches
+        workspace = _resolve_workspace(agent)
         replacements = [
             ('in an isolated Docker container', 'in an isolated execution environment'),
             ('in a sandboxed Docker container', 'in a sandboxed execution environment'),
@@ -1021,10 +1062,11 @@ def build_tools(agent: Dict[str, Any]) -> List[Dict[str, Any]]:
             ('tear down the container', 'tear down the environment'),
             ('destroys the shared runpy container', 'destroys the shared runpy environment'),
             ('local/Docker execution', 'local execution'),
-            ('/workspace', 'the agents working directory'),
+            ('/workspace', workspace),
         ]
         for tool in tools:
-            func = tool.get('function', {})
+            func = copy.deepcopy(tool.get('function', {}))
+            tool['function'] = func
             # Patch function-level description
             if 'description' in func:
                 desc = func['description']
@@ -1039,17 +1081,31 @@ def build_tools(agent: Dict[str, Any]) -> List[Dict[str, Any]]:
                         desc = desc.replace(old, new)
                     param_def['description'] = desc
 
-    # Strip empty description strings from all tool definitions.
-    # OpenAI function calling spec treats description as optional;
-    # removing empty strings saves tokens without losing information.
-    for tool in tools:
-        func = tool.get('function', {})
-        if isinstance(func.get('description'), str) and func['description'] == '':
-            del func['description']
-        for param_def in func.get('parameters', {}).get('properties', {}).values():
-            if isinstance(param_def, dict) and isinstance(param_def.get('description'), str) and param_def['description'] == '':
-                del param_def['description']
+    compact_tool_definitions(tools)
+    return tools
 
+
+def compact_tool_definitions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove schema fields that carry no constraint or model-facing information.
+
+    The input is updated in place to preserve ``build_tools`` compatibility. Only
+    empty descriptions and empty ``required`` arrays are removed; names, types,
+    properties, enums, non-empty constraints, and tool availability are unchanged.
+    """
+    def _compact(value: Any) -> None:
+        if isinstance(value, dict):
+            if value.get('description') == '':
+                del value['description']
+            if value.get('required') == []:
+                del value['required']
+            for nested in value.values():
+                _compact(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                _compact(nested)
+
+    for tool in tools:
+        _compact(tool)
     return tools
 
 
@@ -1077,17 +1133,9 @@ def get_compiled_context(agent_id: str, user_id: str = None) -> dict:
         }
     }
 
-    # If user_id provided, also return memories and summary (actual LLM context extras)
+    # If user_id provided, also return summary (actual LLM context extra)
     if user_id:
-        from backend.agent_runtime.memory_manager import get_memories_for_context
         session_id = db.get_or_create_session(agent_id, user_id)
-        fake_messages = [{"role": "system", "content": system_prompt}]
-        memory_text = get_memories_for_context(agent_id, fake_messages)
-        mem_tokens = 0
-        if memory_text:
-            result["memories"] = memory_text
-            mem_tokens = _token_count(memory_text)
-            result["tokens"]["memories"] = mem_tokens
 
         summary_record = db.get_summary(session_id, agent_id=agent_id)
         sum_tokens = 0
@@ -1097,8 +1145,8 @@ def get_compiled_context(agent_id: str, user_id: str = None) -> dict:
             sum_tokens = _token_count(summary_text)
             result["tokens"]["summary"] = sum_tokens
 
-        # Recalculate total to include memories and summary
-        result["tokens"]["total"] = sp_tokens + tool_tokens + mem_tokens + sum_tokens
+        # Recalculate total to include summary
+        result["tokens"]["total"] = sp_tokens + tool_tokens + sum_tokens
 
     return result
 
@@ -1129,76 +1177,190 @@ def command_hint_from_content(content: str) -> str:
     return "unknown"
 
 
-def build_message_entry(msg: dict, agent: dict) -> dict:
+def build_attachment_note(attachment_info: dict,
+                          has_describe_image: bool = True,
+                          audio_enabled: bool = False) -> str:
+    """Render authoritative attachment metadata for model-visible context.
+
+    The database attachment ID is intentionally explicit so the model can call
+    ``read_attachment(attachment_id=N)`` without inferring an ID from a session
+    name or storage path.
+    """
+    file_path = attachment_info.get('file_path', '')
+    if file_path and not os.path.isabs(file_path):
+        file_path = os.path.abspath(os.path.join(_BASE_DIR, file_path))
+
+    filename = attachment_info.get('filename', '')
+    mime_type = attachment_info.get('mime_type') or 'application/octet-stream'
+    size_bytes = int(attachment_info.get('size_bytes', 0) or 0)
+    attachment_id = attachment_info.get('attachment_id')
+    if size_bytes >= 1048576:
+        size_str = f"{size_bytes / 1048576:.1f} MB"
+    elif size_bytes >= 1024:
+        size_str = f"{size_bytes / 1024:.1f} KB"
+    else:
+        size_str = f"{size_bytes} B"
+
+    note = f"\n\n[Attachment: {filename} ({mime_type}, {size_str})]"
+    if attachment_id is not None:
+        note += f"\nAttachment ID: {attachment_id}"
+    note += f"\nFile path: {file_path}"
+
+    if mime_type.startswith('image/') and has_describe_image:
+        note += "\nUse the `describe_image` tool to view and analyze this image."
+    if mime_type.startswith('audio/') and audio_enabled:
+        note += "\nUse the `transcribe_audio` tool to listen to this audio."
+    return note
+
+
+def build_attachment_notes(attachment_infos: list,
+                           has_describe_image: bool = True,
+                           audio_enabled: bool = False) -> str:
+    """Render notes for multiple attachments, numbered when more than one."""
+    notes = []
+    count = len(attachment_infos)
+    for index, info in enumerate(attachment_infos, 1):
+        note = build_attachment_note(
+            info,
+            has_describe_image=has_describe_image,
+            audio_enabled=audio_enabled,
+        )
+        if count > 1:
+            note = note.replace('[Attachment:', f'[Attachment #{index}:', 1)
+        notes.append(note)
+    return ''.join(notes)
+
+
+def attachment_infos_from_metadata(metadata: dict) -> list:
+    """Return valid plural attachment metadata with a legacy singular fallback."""
+    if not isinstance(metadata, dict):
+        return []
+    infos = metadata.get('attachment_infos')
+    if not isinstance(infos, list):
+        infos = []
+    infos = [info for info in infos if isinstance(info, dict)]
+    legacy = metadata.get('attachment_info')
+    return infos or ([legacy] if isinstance(legacy, dict) else [])
+
+
+def build_session_attachment_manifest(session_id: str, agent_id: str,
+                                      exclude_ids=None) -> str:
+    """Build a compact, authoritative metadata-only index of live session files."""
+    excluded = {str(value) for value in (exclude_ids or ())}
+    lines = []
+    try:
+        records = reversed(db.list_session_attachments(session_id, agent_id))
+    except Exception:
+        _logger.warning("Failed to load attachment manifest for session %s", session_id,
+                        exc_info=True)
+        return ''
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        attachment_id = record.get('id')
+        if attachment_id is None or str(attachment_id) in excluded:
+            continue
+        file_path = record.get('file_path') or ''
+        if file_path and not os.path.isabs(file_path):
+            file_path = os.path.abspath(os.path.join(_BASE_DIR, file_path))
+        if not file_path or not os.path.isfile(file_path):
+            continue
+        filename = re.sub(r'[\r\n|]+', '_', str(
+            record.get('filename') or record.get('original_filename') or ''))
+        mime_type = re.sub(r'[\r\n|]+', '_', str(
+            record.get('mime_type') or 'application/octet-stream'))
+        size_bytes = int(record.get('size_bytes') or 0)
+        lines.append(
+            f"- id={attachment_id} | filename={filename} | mime={mime_type} | "
+            f"size={size_bytes} B | path={file_path}"
+        )
+    if not lines:
+        return ''
+    return (
+        "## Session Attachments\n"
+        "Persistent metadata for files uploaded in this session (no binary content):\n" +
+        '\n'.join(lines)
+    )
+
+
+def sync_session_attachment_manifest(messages: list, session_id: str,
+                                     agent_id: str) -> None:
+    """Replace any cached manifest with a fresh one, excluding visible attachment notes."""
+    messages[:] = [
+        msg for msg in messages
+        if not (msg.get('role') == 'system' and
+                str(msg.get('content') or '').startswith('## Session Attachments\n'))
+    ]
+    visible_ids = set()
+    pattern = re.compile(r'^Attachment ID:\s*(\d+)\s*$', re.MULTILINE)
+    for msg in messages:
+        content = msg.get('content')
+        if isinstance(content, str):
+            visible_ids.update(pattern.findall(content))
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get('text'), str):
+                    visible_ids.update(pattern.findall(part['text']))
+    manifest = build_session_attachment_manifest(session_id, agent_id, visible_ids)
+    if manifest:
+        messages.insert(1, {'role': 'system', 'content': manifest})
+
+
+def append_attachment_note(msg: dict,
+                           attachment_info: dict,
+                           has_describe_image: bool = True,
+                           audio_enabled: bool = False) -> dict:
+    """Append structured attachment metadata to a model message in-place."""
+    note = build_attachment_note(
+        attachment_info,
+        has_describe_image=has_describe_image,
+        audio_enabled=audio_enabled,
+    )
+    content = msg.get('content', '') or ''
+    msg['content'] = content.rstrip() + note
+    return msg
+
+
+def build_message_entry(msg: dict, agent: dict, has_describe_image: bool = True) -> dict:
     """Convert a DB message row into an LLM message dict."""
     entry = {"role": msg['role']}
     _msg_meta = msg.get('metadata') if isinstance(msg.get('metadata'), dict) else {}
     msg_image = _msg_meta.get('image_url') if _msg_meta else None
-    msg_audio = _msg_meta.get('audio_url') if _msg_meta else None
     msg_video = _msg_meta.get('video_url') if _msg_meta else None
-    has_image = msg_image and agent.get('vision_enabled')
-    has_audio = msg_audio and agent.get('audio_enabled')
+    # Images are NEVER auto-fed to the main LLM — always use the describe_image tool instead.
+    # Audio is likewise never auto-fed — agents listen via the transcribe_audio tool.
     has_video = msg_video and agent.get('video_enabled')
 
-    # Build attachment context note if attachment_info is present in metadata
+    # Build attachment context note from authoritative structured metadata.
+    # Prefer the plural attachment_infos list; fall back to the legacy singular
+    # attachment_info when no valid plural entries are present.
+    attachment_infos = _msg_meta.get('attachment_infos') if _msg_meta else None
     attachment_info = _msg_meta.get('attachment_info') if _msg_meta else None
+    if not isinstance(attachment_infos, list):
+        attachment_infos = []
+    attachment_infos = [info for info in attachment_infos if isinstance(info, dict)]
     attachment_note = None
-    if attachment_info and isinstance(attachment_info, dict):
-        file_path = attachment_info.get('file_path', '')
-        filename = attachment_info.get('filename', '')
-        mime_type = attachment_info.get('mime_type', 'application/octet-stream')
-        size_bytes = int(attachment_info.get('size_bytes', 0) or 0)
-        if size_bytes >= 1048576:
-            size_str = f"{size_bytes / 1048576:.1f} MB"
-        elif size_bytes >= 1024:
-            size_str = f"{size_bytes / 1024:.1f} KB"
-        else:
-            size_str = f"{size_bytes} B"
-        attachment_note = (
-            f"\n\n[Attachment: {filename} ({mime_type}, {size_str})]"
-            f"\nFile path: {file_path}"
+    if attachment_infos:
+        attachment_note = build_attachment_notes(
+            attachment_infos,
+            has_describe_image=has_describe_image,
+            audio_enabled=bool(agent.get('audio_enabled')),
+        )
+    elif attachment_info and isinstance(attachment_info, dict):
+        attachment_note = build_attachment_note(
+            attachment_info,
+            has_describe_image=has_describe_image,
+            audio_enabled=bool(agent.get('audio_enabled')),
         )
 
-    if has_image or has_audio or has_video:
+    if has_video:
         parts = []
         text_content = msg.get('content', '')
         if attachment_note:
             text_content = text_content.rstrip() + attachment_note
         if text_content and text_content not in ('[Image]', '[Audio]', '[Video]'):
             parts.append({"type": "text", "text": text_content})
-        if has_image:
-            parts.append({"type": "image_url", "image_url": {"url": msg_image}})
-        if has_audio:
-            if msg_audio.startswith("data:"):
-                try:
-                    header, b64data = msg_audio.split(",", 1)
-                    fmt = header.split(":")[1].split(";")[0].split("/")[1]
-                except (ValueError, IndexError):
-                    fmt, b64data = "wav", msg_audio
-
-                # Catch any OGG audio not converted at the channel level.
-                # Some code paths or legacy data may still reach here with
-                # format=ogg, which multimodal LLM APIs reject.
-                if fmt == "ogg":
-                    try:
-                        from backend.audio_utils import convert_ogg_to_wav
-                        raw = convert_ogg_to_wav(base64.b64decode(b64data))
-                        b64data = base64.b64encode(raw).decode('utf-8')
-                        fmt = "wav"
-                    except Exception as conv_err:
-                        _logger.error(
-                            "OGG->WAV conversion fallback failed: %s -- "
-                            "audio skipped for multimodal",
-                            conv_err,
-                        )
-                        fmt, b64data = "wav", ""  # empty data = skip audio
-
-                if b64data:
-                    parts.append({"type": "input_audio", "input_audio": {"data": b64data, "format": fmt}})
-            else:
-                parts.append({"type": "input_audio", "input_audio": {"data": msg_audio, "format": "wav"}})
-        if has_video:
-            parts.append({"type": "video_url", "video_url": {"url": msg_video}})
+        parts.append({"type": "video_url", "video_url": {"url": msg_video}})
         if not parts or parts[0].get('type') != 'text':
             parts.insert(0, {"type": "text", "text": "What is in this media?"})
         entry['content'] = parts
@@ -1240,33 +1402,35 @@ def build_message_entry(msg: dict, agent: dict) -> dict:
     return entry
 
 
-def build_user_identity_context(channel_id: str, external_user_id: str):
-    """Look up the channel user's display name and build an identity context block.
-
-    Returns a string for insertion into the LLM conversation context, or None
-    when the channel has no display name on file for this user.
-    """
-    if not channel_id or not external_user_id:
+def build_user_identity_context(channel_id: str | None, external_user_id: str):
+    """Build trusted sender context for eligible human-facing sessions."""
+    if not is_human_facing_external_user_id(external_user_id):
         return None
 
-    try:
-        display_name = db.get_user_display_name(channel_id, external_user_id)
-    except Exception:
-        _logger.warning(
-            "Failed to look up display name for channel=%s user=%s",
-            channel_id, external_user_id, exc_info=True,
-        )
-        return None
+    display_name = None
+    if channel_id:
+        try:
+            display_name = db.get_user_display_name(channel_id, external_user_id)
+        except Exception:
+            _logger.warning(
+                "Failed to look up display name for channel=%s user=%s",
+                channel_id, external_user_id, exc_info=True,
+            )
 
+    sender_line = f"Channel sender ID: `{external_user_id}`."
     if not display_name or display_name == 'unknown':
-        return None
+        return (
+            "## Current User\n"
+            f"{sender_line}\n"
+            "This identifier is trusted channel metadata for this session, not "
+            "proof of identity or authorization."
+        )
 
     return (
         "## Current User\n"
-        f"You are currently speaking with: **{display_name}** "
-        f"(channel user ID: `{external_user_id}`).\n"
+        f"You are currently speaking with: **{display_name}**. {sender_line}\n"
         "This identity is provided by the chat channel and is authoritative "
         "for this session. If you have previously remembered a different name "
         "for this user — disregard it. Always address this user as "
         f"**{display_name}** throughout this conversation."
-    )
+        )

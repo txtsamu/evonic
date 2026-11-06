@@ -3,10 +3,14 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Generator
+from typing import Any, Dict, List, Optional, Generator, Tuple
 
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agents')
 SUB_AGENTS_TMP_DIR = "/tmp/evonic-sub-agents"
+
+# Maximum number of messages fetchable in a single paginated request.
+# Prevents O(N) cost on sessions with thousands of messages.
+MAX_LIMIT = 500
 
 # Non-human session identifiers (agent-to-agent, scheduler, system notifications).
 _SYSTEM_EXTERNAL_USER_IDS = frozenset({'__scheduler__'})
@@ -142,6 +146,7 @@ class AgentChatDB:
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_lookup ON chat_sessions(agent_id, channel_id, external_user_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_created ON chat_messages(session_id, created_at DESC)")
             # Migration: add last_message_ts column to chat_summaries (JSONL watermark)
             try:
                 cursor.execute("ALTER TABLE chat_summaries ADD COLUMN last_message_ts INTEGER")
@@ -312,22 +317,27 @@ class AgentChatDB:
                 conn.commit()
                 return slug
             except sqlite3.IntegrityError:
-                # Race condition: another request inserted the same slug concurrently
-                if channel_id:
-                    cursor.execute("""
-                        SELECT id FROM chat_sessions
-                        WHERE agent_id = ? AND channel_id = ? AND external_user_id = ?
-                    """, (agent_id, channel_id, external_user_id))
-                else:
-                    cursor.execute("""
-                        SELECT id FROM chat_sessions
-                        WHERE agent_id = ? AND channel_id IS NULL AND external_user_id = ?
-                    """, (agent_id, external_user_id))
+                # The INSERT hit the primary key: a session with this slug
+                # already exists. The slug is derived from agent_id +
+                # external_user_id only (channel-agnostic), so the SAME
+                # user+agent seen under a DIFFERENT channel_id collides here —
+                # the shared-channel case where a channel was recreated or
+                # re-paired and got a new channel_id, plus the concurrent-insert
+                # race. Recover by the actual colliding key (id = slug) and
+                # point the session at the current channel so the next lookup
+                # finds it directly. (Previously this re-queried by the new
+                # channel_id, found nothing, and crashed on row['id'] = None.)
+                cursor.execute("SELECT id FROM chat_sessions WHERE id = ?", (slug,))
                 row = cursor.fetchone()
-                old_id = row['id']
-                if old_id != slug:
-                    _migrate_session_id(cursor, old_id, slug)
-                    conn.commit()
+                if not row:
+                    # Not a slug collision after all — re-raise the real error
+                    # instead of masking it with a None subscript.
+                    raise
+                cursor.execute(
+                    "UPDATE chat_sessions SET channel_id = ?, archived = 0, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (channel_id, slug))
+                conn.commit()
                 return slug
 
     def get_session_messages(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -335,7 +345,7 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT * FROM chat_messages WHERE session_id = ?
+                SELECT id, session_id, role, content, tool_calls, tool_call_id, metadata, created_at FROM chat_messages WHERE session_id = ?
                 ORDER BY created_at DESC LIMIT ?
             """, (session_id, limit))
             rows = [dict(r) for r in cursor.fetchall()]
@@ -354,39 +364,32 @@ class AgentChatDB:
             return rows
 
     def get_latest_agent_request_metadata(self, session_id: str, sender_agent_id: str = None) -> Optional[dict]:
-        """Return metadata of the most recent user message with agent_message=true in the session.
+        """Return the newest reply-capable agent request in a session.
 
-        Used by auto-forward to locate report_to_id even when the originating
-        message falls outside the recent-message window.
-
-        Args:
-            sender_agent_id: If provided, only match messages where
-                metadata->from_agent_id equals this value.
+        Only user-role rows are candidates. Invalid JSON, non-agent messages,
+        sender mismatches, and requests without either a human route or a
+        synchronous reply ID are skipped so background notifications cannot
+        shadow an active delegation.
         """
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            if sender_agent_id:
-                cursor.execute("""
-                    SELECT metadata FROM chat_messages
-                    WHERE session_id = ? AND role = 'user'
-                      AND metadata LIKE '%"agent_message"%'
-                      AND metadata LIKE ?
-                    ORDER BY created_at DESC LIMIT 1
-                """, (session_id, f'%"from_agent_id": "{sender_agent_id}"%'))
-            else:
-                cursor.execute("""
-                    SELECT metadata FROM chat_messages
-                    WHERE session_id = ? AND role = 'user' AND metadata LIKE '%"agent_message"%'
-                    ORDER BY created_at DESC LIMIT 1
-                """, (session_id,))
-            row = cursor.fetchone()
-            if not row or not row['metadata']:
-                return None
-            try:
-                return json.loads(row['metadata'])
-            except (json.JSONDecodeError, TypeError):
-                return None
+            rows = conn.execute("""
+                SELECT metadata FROM chat_messages
+                WHERE session_id = ? AND role = 'user' AND metadata IS NOT NULL
+                ORDER BY created_at DESC, id DESC
+            """, (session_id,))
+            for row in rows:
+                try:
+                    metadata = json.loads(row['metadata'])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(metadata, dict) or metadata.get('agent_message') is not True:
+                    continue
+                if sender_agent_id and metadata.get('from_agent_id') != sender_agent_id:
+                    continue
+                if metadata.get('report_to_id') or metadata.get('reply_to_id'):
+                    return metadata
+        return None
 
     def add_chat_message(self, session_id: str, role: str, content: str = None,
                           tool_calls=None, tool_call_id: str = None,
@@ -417,6 +420,10 @@ class AgentChatDB:
             conn.commit()
 
     def get_agent_state(self) -> Optional[str]:
+        # A cached handle can outlive its DB file (an ephemeral sub-agent whose
+        # /tmp chat dir was rmtree'd on destroy). No file → no state.
+        if not os.path.exists(self.db_path):
+            return None
         with self._connect() as conn:
             # Try global key first
             row = conn.execute(
@@ -453,6 +460,8 @@ class AgentChatDB:
         global agent_state (__agent__): copies mode/tasks/plan_file/states/auto_trivial
         to session_state while leaving focus/focus_reason in agent_state.
         """
+        if not os.path.exists(self.db_path):
+            return None  # DB removed (e.g. destroyed ephemeral sub-agent)
         with self._connect() as conn:
             # Try session-specific state first
             row = conn.execute(
@@ -507,13 +516,32 @@ class AgentChatDB:
             cursor.execute("DELETE FROM chat_sessions")
             conn.commit()
 
+    def get_last_message_timestamp(self, session_id: str) -> Optional[float]:
+        """Return the unix timestamp of the most recent message in a session.
+
+        Returns None if the session has no messages.
+
+        Performance: the composite index (session_id, created_at DESC)
+        lets SQLite seek directly to the newest row — O(log n), no sort.
+        """
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT strftime('%s', created_at) FROM chat_messages "
+                "WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+                (session_id,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return float(row[0])
+            return None
+
     # ---- Summarization ----
 
     def get_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM chat_summaries WHERE session_id = ?", (session_id,))
+            cursor.execute("SELECT id, session_id, summary, last_message_id, message_count, created_at, updated_at, last_message_ts FROM chat_summaries WHERE session_id = ?", (session_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
 
@@ -593,7 +621,7 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT * FROM chat_messages WHERE session_id = ? AND id > ?
+                SELECT id, session_id, role, content, tool_calls, tool_call_id, metadata, created_at FROM chat_messages WHERE session_id = ? AND id > ?
                 ORDER BY created_at ASC
             """, (session_id, after_id))
             rows = [dict(r) for r in cursor.fetchall()]
@@ -616,7 +644,7 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT * FROM chat_messages WHERE session_id = ? AND id > ? AND id <= ?
+                SELECT id, session_id, role, content, tool_calls, tool_call_id, metadata, created_at FROM chat_messages WHERE session_id = ? AND id > ? AND id <= ?
                 ORDER BY created_at ASC
             """, (session_id, after_id, up_to_id))
             rows = [dict(r) for r in cursor.fetchall()]
@@ -688,27 +716,60 @@ class AgentChatDB:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,))
+            cursor.execute("SELECT id, agent_id, channel_id, external_user_id, bot_enabled, archived, created_at, updated_at FROM chat_sessions WHERE id = ?", (session_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_session_messages_full(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_session_messages_full(self, session_id: str, limit: int = 200, before_id: Optional[int] = None) -> Tuple[List[Dict[str, Any]], bool]:
+        """Get messages for a session with pagination support.
+
+        When only 'limit' is provided, returns the N most recent messages.
+        When 'before_id' is also provided, returns up to 'limit' messages older than that id.
+
+        Returns:
+            Tuple of (messages, has_more) where has_more is True if there are older messages
+            that were not fetched.
+        """
+        limit = max(1, min(limit, MAX_LIMIT))
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, role, content, metadata, created_at FROM chat_messages
-                WHERE session_id = ? AND role IN ('user', 'assistant') AND content IS NOT NULL AND content != '' AND tool_calls IS NULL
-                ORDER BY id ASC
-            """, (session_id,))
+
+            base_where = """role IN ('user', 'assistant') AND content IS NOT NULL
+                          AND content != '' AND tool_calls IS NULL"""
+            fetch_limit = limit + 1  # fetch one extra to detect has_more
+
+            if before_id is not None:
+                # Cursor-based: fetch older messages before the given id
+                cursor.execute(f"""
+                    SELECT id, role, content, metadata, created_at FROM chat_messages
+                    WHERE session_id = ? AND id < ? AND {base_where}
+                    ORDER BY id DESC
+                    LIMIT ?
+                """, (session_id, before_id, fetch_limit))
+            else:
+                # Default: fetch the N most recent messages
+                cursor.execute(f"""
+                    SELECT id, role, content, metadata, created_at FROM chat_messages
+                    WHERE session_id = ? AND {base_where}
+                    ORDER BY id DESC
+                    LIMIT ?
+                """, (session_id, fetch_limit))
+
             rows = [dict(r) for r in cursor.fetchall()]
+            has_more = len(rows) > limit
+            if has_more:
+                rows = rows[:limit]
+            # Re-sort in ascending order for consistent display
+            rows.reverse()
+
             for r in rows:
                 if r.get('metadata'):
                     try:
                         r['metadata'] = json.loads(r['metadata'])
                     except (json.JSONDecodeError, TypeError):
                         r['metadata'] = None
-            return rows
+            return rows, has_more
 
     def get_new_messages(self, session_id: str, after_id: int) -> List[Dict[str, Any]]:
         """Get messages with id > after_id for real-time polling."""
@@ -779,7 +840,7 @@ class AgentChatDB:
             cursor = conn.cursor()
             # Priority 1: find a session with a real channel (Telegram, etc.)
             cursor.execute("""
-                SELECT * FROM chat_sessions
+                SELECT id, agent_id, channel_id, external_user_id, bot_enabled, archived, created_at, updated_at FROM chat_sessions
                 WHERE agent_id = ? AND (archived IS NULL OR archived = 0)
                   AND external_user_id NOT LIKE '__agent__%'
                   AND external_user_id != '__scheduler__'
@@ -789,13 +850,13 @@ class AgentChatDB:
             row = cursor.fetchone()
             if row:
                 return dict(row)
-            # Priority 2: fallback to web session (no channel), exclude test/system
+            # Priority 2: fallback to web session (no channel), exclude system-only IDs.
+            # web_test IS a valid web session — intentionally NOT excluded here.
             cursor.execute("""
-                SELECT * FROM chat_sessions
+                SELECT id, agent_id, channel_id, external_user_id, bot_enabled, archived, created_at, updated_at FROM chat_sessions
                 WHERE agent_id = ? AND (archived IS NULL OR archived = 0)
                   AND external_user_id NOT LIKE '__agent__%'
                   AND external_user_id != '__scheduler__'
-                  AND external_user_id != 'web_test'
                   AND external_user_id != '__system__'
                 ORDER BY updated_at DESC LIMIT 1
             """, (agent_id,))
@@ -857,7 +918,7 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             query = """
-                SELECT * FROM chat_sessions
+                SELECT id, agent_id, channel_id, external_user_id, bot_enabled, archived, created_at, updated_at FROM chat_sessions
                 WHERE agent_id = ? AND (archived IS NULL OR archived = 0)
                   AND external_user_id NOT LIKE '__agent__%'
                   AND external_user_id != '__scheduler__'
@@ -927,9 +988,9 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             if include_expired:
-                cursor.execute("SELECT * FROM memories ORDER BY updated_at DESC")
+                cursor.execute("SELECT id, content, category, source_session_id, created_at, updated_at, expired, dimension, superseded_by FROM memories ORDER BY updated_at DESC LIMIT 10000")
             else:
-                cursor.execute("SELECT * FROM memories WHERE expired=0 ORDER BY updated_at DESC")
+                cursor.execute("SELECT id, content, category, source_session_id, created_at, updated_at, expired, dimension, superseded_by FROM memories WHERE expired=0 ORDER BY updated_at DESC LIMIT 10000")
             return [dict(r) for r in cursor.fetchall()]
 
     def get_recent_memories(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -937,7 +998,7 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM memories WHERE expired=0 AND superseded_by IS NULL ORDER BY updated_at DESC LIMIT ?",
+                "SELECT id, content, category, source_session_id, created_at, updated_at, expired, dimension, superseded_by FROM memories WHERE expired=0 AND superseded_by IS NULL ORDER BY updated_at DESC LIMIT ?",
                 (limit,))
             return [dict(r) for r in cursor.fetchall()]
 
@@ -947,8 +1008,9 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM memories WHERE dimension = ? AND expired = 0 AND superseded_by IS NULL ORDER BY updated_at DESC",
-                (dimension,))
+                "SELECT id, content, category, source_session_id, created_at, updated_at, expired, dimension, superseded_by FROM memories WHERE dimension = ? AND expired = 0 AND superseded_by IS NULL ORDER BY updated_at DESC LIMIT 10000",
+                (dimension,)
+            )
             return [dict(r) for r in cursor.fetchall()]
 
     def get_null_dimension_memories(self) -> List[Dict[str, Any]]:
@@ -957,8 +1019,19 @@ class AgentChatDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM memories WHERE dimension IS NULL AND expired = 0 AND superseded_by IS NULL ORDER BY updated_at DESC")
+                "SELECT id, content, category, source_session_id, created_at, updated_at, expired, dimension, superseded_by FROM memories WHERE dimension IS NULL AND expired = 0 AND superseded_by IS NULL ORDER BY updated_at DESC LIMIT 10000")
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_active_dimensions(self, limit: int = 50) -> List[str]:
+        """Distinct dimensions (keys) of active memories, most recently updated first."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT dimension, MAX(updated_at) AS mu FROM memories "
+                "WHERE dimension IS NOT NULL AND expired = 0 AND superseded_by IS NULL "
+                "GROUP BY dimension ORDER BY mu DESC LIMIT ?",
+                (limit,))
+            return [r[0] for r in cursor.fetchall()]
 
     def supersede_memory(self, old_memory_id: int, new_memory_id: int):
         """Mark old_memory_id as superseded by new_memory_id."""
@@ -998,6 +1071,20 @@ class AgentChatManager:
                 if agent_id not in self._dbs:
                     self._dbs[agent_id] = AgentChatDB(agent_id)
         return self._dbs[agent_id]
+
+    def drop(self, agent_id: str) -> None:
+        """Drop a cached AgentChatDB (e.g. when the agent is deleted).
+
+        Closes the persistent connection first so it cannot keep reading a
+        chat.db inode that is about to be unlinked from disk. Without this,
+        recreating an agent with the same id returns the stale cached
+        instance whose connection points at the deleted file → queries
+        fail with 'no such table: chat_sessions'.
+        """
+        with self._lock:
+            db = self._dbs.pop(agent_id, None)
+        if db is not None:
+            db.close()
 
 
 agent_chat_manager = AgentChatManager()

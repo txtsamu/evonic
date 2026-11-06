@@ -21,18 +21,19 @@ from cli.commands import (
     start_server, stop_server, status_server, restart_server,
     plugin_list, plugin_install, plugin_uninstall, plugin_enable, plugin_disable, plugin_new,
     plugin_reload, plugin_hotreload_enable, plugin_hotreload_disable, plugin_hotreload_status,
-    skill_list, skill_add, skill_get, skill_rm,
+    skill_list, skill_add, skill_get, skill_rm, skill_export,
     skillset_list, skillset_get, skillset_apply,
     agent_list, agent_get, agent_add, agent_enable, agent_disable, agent_remove,
+    agent_export, agent_import,
     workplace_list, workplace_get, workplace_create, workplace_update, workplace_delete,
     workplace_pairing_code, workplace_unpair, workplace_download_binary,
     workplace_status, workplace_connect, workplace_disconnect,
     model_list, model_get, model_add, model_rm,
     channel_approve,
     clear_sandbox,
-    update_server, setup_wizard, pass_setup,
+    update_server, pass_setup,
     doctor_command,
-    reconfigure_wizard,
+    evomem_install,
     backup_command, restore_command, verify_command, list_command,
 )
 
@@ -60,10 +61,14 @@ def main():
     )
 
     # --- setup ---
-    subparsers.add_parser(
+    setup_parser = subparsers.add_parser(
         "setup",
-        help="Interactive first-time setup wizard",
-        description="Configure your LLM provider, create the super agent, and set the communication style.",
+        help="First-time setup wizard",
+        description="Run the interactive first-time setup wizard to configure your super agent and default LLM model.",
+    )
+    setup_parser.add_argument(
+        "--non-interactive", action="store_true", default=False,
+        help="Skip interactive prompts and use defaults where possible",
     )
 
     # --- pass ---
@@ -73,19 +78,8 @@ def main():
         description="Set a new admin password or change an existing one for web dashboard authentication.",
     )
 
-    # --- reconfigure ---
-    reconfigure_parser = subparsers.add_parser(
-        "reconfigure",
-        help="Reconfigure an existing Evonic setup",
-        description="Change LLM provider, model, communication style, language, sandbox, and password on an already configured Evonic instance.",
-    )
-    reconfigure_parser.add_argument(
-        "--supervisor", action="store_true", default=False,
-        help="Reconfigure the supervisor daemon settings (poll interval, ports, Telegram, etc.) and save to supervisor/config.json",
-    )
-
     # --- update ---
-    update_parser = subparsers.add_parser("update", help="Check for and apply self-updates")
+    update_parser = subparsers.add_parser("update", help="Update via git pull, then run doctor --fix")
     update_parser.add_argument(
         "channel", nargs="?", default=None,
         choices=["nightly"],
@@ -129,11 +123,35 @@ def main():
     )
     doctor_parser.add_argument(
         "--fix", action="store_true", default=False,
-        help="Automatically fix detected inconsistencies (e.g. missing tools, safety components)",
+        help="Automatically fix detected inconsistencies with compact output",
+    )
+    doctor_parser.add_argument(
+        "--verbose", action="store_true", default=False,
+        help="Show every diagnostic detail (including with --fix)",
     )
     doctor_parser.add_argument(
         "--with-llm-provider", action="store_true", default=False,
         help="Include LLM provider connectivity check (slow, network-dependent)",
+    )
+
+    # --- evomem ---
+    evomem_parser = subparsers.add_parser(
+        "evomem",
+        help="Manage the evomem memory-engine binary",
+        description="Provision the evomem memory-engine binary. Available subcommands: install.",
+    )
+    evomem_subparsers = evomem_parser.add_subparsers(
+        dest="evomem_command", help="Evomem management commands"
+    )
+    evomem_install_parser = evomem_subparsers.add_parser(
+        "install",
+        help="Download and install the evomem binary (latest release)",
+        description="Download, verify, and install the evomem binary from the latest "
+                    "GitHub release. Set EVOMEM_VERSION to pin a specific tag.",
+    )
+    evomem_install_parser.add_argument(
+        "--force", action="store_true", default=False,
+        help="Reinstall even if a binary is already present",
     )
 
     # --- plugin ---
@@ -251,8 +269,8 @@ def main():
     # --- skill ---
     skill_parser = subparsers.add_parser(
         "skill",
-        help="Manage skills (list, add, get, rm)",
-        description="Manage Evonic skills. Available subcommands: list, add, get, rm.",
+        help="Manage skills (list, add, get, rm, export)",
+        description="Manage Evonic skills. Available subcommands: list, add, get, rm, export.",
     )
     skill_subparsers = skill_parser.add_subparsers(
         dest="skill_command", help="Skill management commands"
@@ -296,6 +314,28 @@ def main():
     skill_rm_parser.add_argument(
         "skill_id",
         help="Skill ID to remove",
+    )
+
+    # skill export
+    skill_export_parser = skill_subparsers.add_parser(
+        "export",
+        help="Export a skill to a zip file",
+        description="Export an installed skill (including manifest, tools, and assets) into a structured zip archive.",
+    )
+    skill_export_parser.add_argument(
+        "skill_id",
+        help="Skill ID to export",
+    )
+    skill_export_parser.add_argument(
+        "-o", "--output",
+        default=None,
+        help="Output path for the zip file (defaults to ./<skill_id>.zip in the current directory)",
+    )
+    skill_export_parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose output — list every file added to the archive",
     )
 
     # --- skillset ---
@@ -360,8 +400,8 @@ def main():
     # --- agent ---
     agent_parser = subparsers.add_parser(
         "agent",
-        help="Manage agents (list, get, add, enable, disable, remove)",
-        description="Manage Evonic agents. Available subcommands: list, get, add, enable, disable, remove.",
+        help="Manage agents (list, get, add, export, import, enable, disable, remove)",
+        description="Manage Evonic agents, including portable JSON export and import.",
     )
     agent_subparsers = agent_parser.add_subparsers(
         dest="agent_command", help="Agent management commands"
@@ -414,6 +454,37 @@ def main():
         "--skillset",
         default=None,
         help="Skillset template ID to apply (pre-configures tools and prompt)",
+    )
+
+    agent_export_parser = agent_subparsers.add_parser(
+        "export",
+        help="Export an agent as portable JSON",
+    )
+    agent_export_parser.add_argument("agent_id", help="Agent ID to export")
+    agent_export_parser.add_argument(
+        "--output", "-o", default=None,
+        help="Write JSON to this path instead of stdout",
+    )
+
+    agent_import_parser = agent_subparsers.add_parser(
+        "import",
+        help="Create an agent from portable JSON",
+    )
+    agent_import_parser.add_argument(
+        "source",
+        help="JSON file path, or - to read from stdin",
+    )
+    agent_import_parser.add_argument(
+        "--id", dest="import_agent_id", default=None,
+        help="Optional imported agent ID; defaults to a unique slug from its name",
+    )
+    agent_import_parser.add_argument(
+        "--name", dest="import_agent_name", default=None,
+        help="Optional display-name override",
+    )
+    agent_import_parser.add_argument(
+        "--yes", dest="import_confirm", action="store_true",
+        help="Confirm skipping unavailable skills and tools without prompting",
     )
 
     # agent enable
@@ -716,7 +787,8 @@ def main():
     )
     backup_parser.add_argument(
         "--encrypt", action="store_true", default=False,
-        help="Encrypt the backup with AES-256-GCM (passphrase prompted from stdin)"
+        help="(removed) Encryption of backups is no longer supported; encrypt the "
+             "archive at the file level with gpg or age instead"
     )
     backup_parser.add_argument(
         "--verify", type=str, default=None, metavar="FILE",
@@ -777,8 +849,11 @@ def main():
     plugin_cli_commands = {}
     plugin_cli_parsers = {}  # cmd_name -> parser (for help printing)
     try:
-        from backend.plugin_manager import plugin_manager
-        plugin_cli_commands = plugin_manager.get_cli_commands()
+        # Metadata-only discovery: never execute plugin handler modules here
+        # (a short-lived CLI process importing handlers can mutate shared state
+        # the live server owns, e.g. the kanban scanner schedules).
+        from backend.plugin_lifecycle import PluginManager
+        plugin_cli_commands = PluginManager(load_plugins=False).get_cli_commands()
         for cmd_name, cmd_info in plugin_cli_commands.items():
             sub = subparsers.add_parser(
                 cmd_name,
@@ -818,11 +893,10 @@ def main():
         sys.exit(0)
 
     if args.command == "setup":
-        setup_wizard()
+        from cli.commands import setup_command
+        setup_command(non_interactive=args.non_interactive)
     elif args.command == "pass":
         pass_setup()
-    elif args.command == "reconfigure":
-        reconfigure_wizard(supervisor=args.supervisor)
     elif args.command == "update":
         update_server(
             check_only=args.check,
@@ -840,7 +914,18 @@ def main():
     elif args.command == "restart":
         restart_server()
     elif args.command == "doctor":
-        doctor_command(quick=args.quick, fix=args.fix, with_llm_provider=args.with_llm_provider)
+        doctor_command(
+            quick=args.quick,
+            fix=args.fix,
+            with_llm_provider=args.with_llm_provider,
+            verbose=args.verbose,
+        )
+    elif args.command == "evomem":
+        if args.evomem_command is None:
+            evomem_parser.print_help()
+            sys.exit(0)
+        elif args.evomem_command == "install":
+            sys.exit(evomem_install(force=args.force))
     elif args.command == "plugin":
         if args.plugin_command is None:
             plugin_parser.print_help()
@@ -877,6 +962,8 @@ def main():
             skill_get(args.skill_id)
         elif args.skill_command == "rm":
             skill_rm(args.skill_id)
+        elif args.skill_command == "export":
+            skill_export(args.skill_id, output=args.output, verbose=args.verbose)
     elif args.command == "skillset":
         if args.skillset_command is None:
             skillset_parser.print_help()
@@ -908,6 +995,15 @@ def main():
                 description=args.description,
                 model=args.model,
                 skillset=args.skillset,
+            )
+        elif args.agent_command == "export":
+            agent_export(args.agent_id, output=args.output)
+        elif args.agent_command == "import":
+            agent_import(
+                args.source,
+                agent_id=args.import_agent_id,
+                name=args.import_agent_name,
+                confirm=args.import_confirm,
             )
         elif args.agent_command == "enable":
             agent_enable(args.agent_id)
@@ -967,12 +1063,17 @@ def main():
         elif args.list:
             list_command(args.list)
         else:
+            if args.encrypt:
+                print("Error: The --encrypt option has been removed.")
+                print("Encrypted backups are no longer supported by 'evonic backup'.")
+                print("Encrypt the resulting archive at the file level instead, e.g.:")
+                print("  evonic backup -o backup.tar.gz && gpg -c backup.tar.gz")
+                sys.exit(1)
             backup_command(
                 output=args.output,
                 fmt=args.format,
                 quiet=args.quiet,
                 exclude=args.exclude,
-                encrypt=args.encrypt,
             )
     elif args.command == "restore":
         restore_command(

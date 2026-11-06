@@ -25,17 +25,38 @@ class LocalWorkplaceBackend(ExecutionBackend):
     def _get_inner(self):
         if self._inner is not None:
             return self._inner
-        # Docker backend: use a stable session key so the container is reused across calls
+        try:
+            from config import SANDBOX_BACKEND
+        except ImportError:
+            SANDBOX_BACKEND = 'docker'
+        if SANDBOX_BACKEND == 'bwrap':
+            from backend.tools.lib.backends.bwrap_backend import BwrapBackend
+            self._inner = BwrapBackend(
+                session_id=f'workplace-local-{id(self)}',
+                workspace=self._workspace,
+                agent_id='workplace',
+                agent_name='workplace',
+            )
+            return self._inner
+        # Docker backend: use a stable session key so the container is reused across calls.
+        # Workplace sandboxes are owned by a single "workplace" agent and should be
+        # persistent (keyed by that agent_id) so installed packages and changes
+        # survive across sessions and across `evonic` restarts.
         from backend.tools.lib.backends.docker_backend import DockerBackend
+        try:
+            from config import SANDBOX_PERSISTENT_CONTAINER_ENABLED
+        except ImportError:
+            SANDBOX_PERSISTENT_CONTAINER_ENABLED = True
         self._inner = DockerBackend(
             session_id=f'workplace-local-{id(self)}',
             agent_id='workplace',
             workspace=self._workspace,
+            persistent=SANDBOX_PERSISTENT_CONTAINER_ENABLED,
         )
         return self._inner
 
-    def run_bash(self, script: str, timeout: int, env: dict) -> dict:
-        return self._get_inner().run_bash(script, timeout, env)
+    def run_bash(self, script: str, timeout: int, env: dict, on_output=None) -> dict:
+        return self._get_inner().run_bash(script, timeout, env, on_output=on_output)
 
     def run_python(self, code: str, timeout: int, env: dict) -> dict:
         return self._get_inner().run_python(code, timeout, env)

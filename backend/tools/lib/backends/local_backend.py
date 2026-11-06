@@ -4,7 +4,10 @@ LocalBackend — runs bash and Python directly on the host via subprocess.
 Used when sandbox_enabled=0 in agent_context. No container, no isolation.
 """
 
+import codecs
 import os
+import pwd
+import select
 import subprocess
 import time
 
@@ -60,6 +63,9 @@ class LocalBackend(ExecutionBackend):
     def _cwd(self) -> str:
         return os.path.abspath(self._workspace or SANDBOX_WORKSPACE)
 
+    def _subprocess_identity_kwargs(self) -> dict:
+        return {}
+
     @staticmethod
     def _poll_proc(proc, input_data: str, timeout: int, t0: float):
         """Poll a Popen process in 1s intervals, returning (stdout, stderr, reason).
@@ -98,17 +104,27 @@ class LocalBackend(ExecutionBackend):
                         proc.wait(timeout=2)
                     return None, None, 'timeout'
 
-    def run_bash(self, script: str, timeout: int, env: dict) -> dict:
+    def run_bash(self, script: str, timeout: int, env: dict, on_output=None) -> dict:
         run_env = dict(os.environ)
         run_env.update(env)
+        if self._run_as_user is not None:
+            try:
+                run_env['HOME'] = pwd.getpwnam(self._run_as_user).pw_dir
+            except KeyError:
+                run_env['HOME'] = f'/home/{self._run_as_user}'
         t0 = time.time()
         cmd = ['sudo', '-E', '-u', self._run_as_user, 'bash', '-s'] if self._run_as_user is not None else ['bash', '-s']
+        if on_output is not None:
+            return self._run_bash_streaming(cmd, script, timeout, run_env, t0, on_output)
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, cwd=self._cwd(), env=run_env,
+            start_new_session=True,
+            **self._subprocess_identity_kwargs(),
         )
-        process_tracker.register(self._session_id, proc, proc.pid)
+        process_tracker.register(self._session_id, proc, proc.pid,
+                                 kill_method='killpg_immediate')
         try:
             stdout, stderr, reason = self._poll_proc(proc, script, timeout, t0)
             if stdout is None:
@@ -144,9 +160,127 @@ class LocalBackend(ExecutionBackend):
             'execution_time': elapsed,
         }
 
+    def _run_bash_streaming(self, cmd, script, timeout, run_env, t0, on_output) -> dict:
+        """Run bash streaming combined stdout+stderr to on_output as it arrives.
+
+        Uses select() + os.read() so the timeout is enforced even while the
+        process is silent, and partial (newline-less) output is emitted without
+        blocking. Returns the same dict shape as run_bash, with the full
+        captured output in 'stdout' (stderr is merged into stdout while
+        streaming).
+        """
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=self._cwd(), env=run_env, start_new_session=True,
+            **self._subprocess_identity_kwargs(),
+        )
+        process_tracker.register(
+            self._session_id, proc, proc.pid, kill_method='killpg_immediate'
+        )
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        chunks = []
+        emitted = 0
+        timed_out = False
+
+        def _push(data: bytes):
+            nonlocal emitted
+            text = decoder.decode(data)
+            if not text:
+                return
+            chunks.append(text)
+            if emitted < _MAX_OUTPUT_BYTES:
+                on_output(text)
+                emitted += len(text)
+
+        try:
+            try:
+                proc.stdin.write(script.encode('utf-8'))
+                proc.stdin.close()
+            except Exception:
+                pass
+
+            deadline = t0 + timeout
+            fd = proc.stdout.fileno()
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    rlist, _, _ = select.select([fd], [], [], min(0.5, remaining))
+                except (ValueError, OSError):
+                    break
+                if rlist:
+                    try:
+                        data = os.read(fd, 65536)
+                    except OSError:
+                        break
+                    if data == b'':
+                        break  # EOF
+                    _push(data)
+                elif proc.poll() is not None:
+                    break
+            # Final drain (EOF or exit): read whatever remains without blocking.
+            while True:
+                try:
+                    rlist, _, _ = select.select([fd], [], [], 0)
+                except (ValueError, OSError):
+                    break
+                if not rlist:
+                    break
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    break
+                if data == b'':
+                    break
+                _push(data)
+        finally:
+            if timed_out:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            else:
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            process_tracker.unregister(self._session_id)
+
+        elapsed = round(time.time() - t0, 3)
+        output = truncate(''.join(chunks), _MAX_OUTPUT_BYTES)
+        if timed_out:
+            return {
+                'error': f'Execution timed out after {timeout}s',
+                'exit_code': -1,
+                'stdout': output,
+                'stderr': '',
+                'execution_time': elapsed,
+            }
+        return {
+            'stdout': output,
+            'stderr': '',
+            'exit_code': proc.returncode,
+            'execution_time': elapsed,
+        }
+
     def run_python(self, code: str, timeout: int, env: dict) -> dict:
         run_env = dict(os.environ)
         run_env.update(env)
+        if self._run_as_user is not None:
+            try:
+                run_env['HOME'] = pwd.getpwnam(self._run_as_user).pw_dir
+            except KeyError:
+                run_env['HOME'] = f'/home/{self._run_as_user}'
         existing = run_env.get('PYTHONPATH', '')
         run_env['PYTHONPATH'] = f"{_HELPERS_PARENT_DIR}{os.pathsep}{existing}".rstrip(os.pathsep)
         t0 = time.time()
@@ -155,8 +289,11 @@ class LocalBackend(ExecutionBackend):
             cmd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, cwd=self._cwd(), env=run_env,
+            start_new_session=True,
+            **self._subprocess_identity_kwargs(),
         )
-        process_tracker.register(self._session_id, proc, proc.pid)
+        process_tracker.register(self._session_id, proc, proc.pid,
+                                 kill_method='killpg')
         try:
             stdout, stderr, reason = self._poll_proc(proc, code, timeout, t0)
             if stdout is None:
@@ -206,18 +343,26 @@ class LocalBackend(ExecutionBackend):
     # user instead of the Evonic server process user.
     # ------------------------------------------------------------------
 
-    def _sudo_subprocess(self, python_code: str, timeout: int = 10) -> dict:
+    def _sudo_subprocess(self, python_code: str, timeout: int = 10,
+                         stdin_data: str = None) -> dict:
         """Run a short Python snippet as *run_as_user* via sudo.
 
         Returns ``{'ok': True, 'result': ...}`` or ``{'error': str}``.
         *result* is the decoded stdout, or the raw dict parsed from a
         JSON line printed by the snippet.
+
+        Large payloads (e.g. base64-encoded file content) must be passed
+        via *stdin_data* rather than embedded in *python_code*: each
+        execve() argument is capped at MAX_ARG_STRLEN (128 KiB), so an
+        oversized argv entry fails with OSError E2BIG ("Argument list
+        too long").
         """
         if self._run_as_user is None:
             return {'error': 'run_as_user not set'}
         try:
             proc = subprocess.run(
                 ['sudo', '-u', self._run_as_user, 'python3', '-c', python_code],
+                input=stdin_data,
                 capture_output=True, text=True, timeout=timeout,
             )
             if proc.returncode != 0:
@@ -290,11 +435,16 @@ class LocalBackend(ExecutionBackend):
                 return {'error': 'File contains non-UTF-8 characters.'}
             except Exception as e:
                 return {'error': str(e)}
+        # Content is base64-encoded with a __B64__ marker so it survives
+        # _sudo_subprocess's stdout.strip() + json.loads() untouched
+        # (JSON-looking files, leading/trailing whitespace, print's newline).
+        import base64
         code = (
-            "p=" + repr(path) + "; "
+            "import base64\n"
+            "p=" + repr(path) + "\n"
             "try:\n"
             " f=open(p,'r',encoding='utf-8',errors='replace')\n"
-            " print(f.read()); f.close()\n"
+            " print('__B64__'+base64.b64encode(f.read().encode('utf-8')).decode('ascii')); f.close()\n"
             "except PermissionError: print('__ERR__Permission denied')\n"
             "except IsADirectoryError: print('__ERR__Path is a directory')\n"
             "except UnicodeDecodeError: print('__ERR__Non-UTF-8 file')\n"
@@ -302,10 +452,12 @@ class LocalBackend(ExecutionBackend):
         )
         r = self._sudo_subprocess(code)
         if r.get('ok'):
-            content = r.get('result', '')
-            if isinstance(content, str) and content.startswith('__ERR__'):
-                return {'error': content[7:]}
-            return {'content': content}
+            result = r.get('result', '')
+            if isinstance(result, str) and result.startswith('__ERR__'):
+                return {'error': result[7:]}
+            if isinstance(result, str) and result.startswith('__B64__'):
+                return {'content': base64.b64decode(result[7:]).decode('utf-8', errors='replace')}
+            return {'error': 'Unexpected result format'}
         return {'error': r.get('error', 'Unknown error')}
 
     def write_file(self, path: str, content: str, create_dirs: bool = True) -> dict:
@@ -324,29 +476,10 @@ class LocalBackend(ExecutionBackend):
                 return {'error': f'Path is a directory, not a file: {path}'}
             except Exception as e:
                 return {'error': str(e)}
-        import base64
-        encoded = base64.b64encode(content.encode('utf-8')).decode('ascii')
-        code = (
-            "import os, base64; p=" + repr(path) + "; "
-            "cd=" + repr(create_dirs) + "; "
-            "data=base64.b64decode(" + repr(encoded) + ").decode('utf-8'); "
-            "try:\n"
-            " if cd:\n"
-            "  d=os.path.dirname(p)\n"
-            "  if d: os.makedirs(d,exist_ok=True)\n"
-            " f=open(p,'w',encoding='utf-8'); f.write(data); f.close()\n"
-            " print('__OK__')\n"
-            "except PermissionError: print('__ERR__Permission denied')\n"
-            "except IsADirectoryError: print('__ERR__Path is a directory')\n"
-            "except Exception as e: print('__ERR__'+str(e))"
-        )
-        r = self._sudo_subprocess(code)
-        if r.get('ok'):
-            result = r.get('result', '')
-            if isinstance(result, str) and result.startswith('__ERR__'):
-                return {'error': result[7:]}
-            return {'ok': True}
-        return {'error': r.get('error', 'Unknown error')}
+        # Delegate to write_file_bytes, which streams the content via stdin.
+        # Embedding the content in the sudo argv would hit the 128 KiB
+        # execve per-argument limit (E2BIG) for files larger than ~96 KiB.
+        return self.write_file_bytes(path, content.encode('utf-8'), create_dirs)
 
     def cat_file_bytes(self, path: str) -> dict:
         """Read a file as raw bytes directly from the host filesystem."""
@@ -364,10 +497,11 @@ class LocalBackend(ExecutionBackend):
                 return {'error': str(e)}
         import base64
         code = (
-            "import base64; p=" + repr(path) + "; "
+            "import base64\n"
+            "p=" + repr(path) + "\n"
             "try:\n"
             " data=open(p,'rb').read()\n"
-            " print(base64.b64encode(data).decode('ascii'))\n"
+            " print('__B64__'+base64.b64encode(data).decode('ascii'))\n"
             "except PermissionError: print('__ERR__Permission denied')\n"
             "except FileNotFoundError: print('__ERR__File not found')\n"
             "except IsADirectoryError: print('__ERR__Path is a directory')\n"
@@ -379,7 +513,8 @@ class LocalBackend(ExecutionBackend):
             if isinstance(result, str):
                 if result.startswith('__ERR__'):
                     return {'error': result[7:]}
-                return {'bytes': base64.b64decode(result)}
+                if result.startswith('__B64__'):
+                    return {'bytes': base64.b64decode(result[7:])}
             return {'error': 'Unexpected result format'}
         return {'error': r.get('error', 'Unknown error')}
 
@@ -398,7 +533,8 @@ class LocalBackend(ExecutionBackend):
             except Exception as e:
                 return {'error': str(e)}
         code = (
-            "import os; p=" + repr(path) + "; "
+            "import os\n"
+            "p=" + repr(path) + "\n"
             "try:\n"
             " os.remove(p); print('__OK__')\n"
             "except FileNotFoundError: print('__ERR__File not found')\n"
@@ -431,11 +567,16 @@ class LocalBackend(ExecutionBackend):
             except Exception as e:
                 return {'error': str(e)}
         import base64
+        # Content is streamed via stdin, NOT embedded in the python3 -c argv:
+        # each execve() argument is capped at MAX_ARG_STRLEN (128 KiB), so
+        # embedding base64 content fails with OSError E2BIG ("Argument list
+        # too long") for files larger than ~96 KiB.
         encoded = base64.b64encode(data).decode('ascii')
         code = (
-            "import os, base64; p=" + repr(path) + "; "
-            "cd=" + repr(create_dirs) + "; "
-            "data=base64.b64decode(" + repr(encoded) + "); "
+            "import os, sys, base64\n"
+            "p=" + repr(path) + "\n"
+            "cd=" + repr(create_dirs) + "\n"
+            "data=base64.b64decode(sys.stdin.read())\n"
             "try:\n"
             " if cd:\n"
             "  d=os.path.dirname(p)\n"
@@ -446,7 +587,7 @@ class LocalBackend(ExecutionBackend):
             "except IsADirectoryError: print('__ERR__Path is a directory')\n"
             "except Exception as e: print('__ERR__'+str(e))"
         )
-        r = self._sudo_subprocess(code)
+        r = self._sudo_subprocess(code, stdin_data=encoded)
         if r.get('ok'):
             result = r.get('result', '')
             if isinstance(result, str) and result.startswith('__ERR__'):
@@ -462,7 +603,8 @@ class LocalBackend(ExecutionBackend):
             except Exception as e:
                 return {'error': str(e)}
         code = (
-            "import os; p=" + repr(path) + "; "
+            "import os\n"
+            "p=" + repr(path) + "\n"
             "try:\n"
             " os.makedirs(p,exist_ok=True); print('__OK__')\n"
             "except Exception as e: print('__ERR__'+str(e))"

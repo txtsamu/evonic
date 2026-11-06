@@ -11,11 +11,19 @@ import shutil
 import secrets
 import subprocess
 import tempfile
+from zoneinfo import available_timezones as _available_timezones
 
 import requests
 
 import config
 from models.db import db
+
+# ---------------------------------------------------------------------------
+# Platform defaults
+# ---------------------------------------------------------------------------
+
+DEFAULT_PLATFORM_TIMEZONE = "UTC"
+DEFAULT_SUPER_AGENT_NAME = "Super Agent"
 
 # ---------------------------------------------------------------------------
 # Provider defaults
@@ -150,11 +158,20 @@ preferences, and communication style instructions.
 
 ## Usage
 
-- Read this file: read("notes.md")
+- Read this file: read_file(file_path="/_self/kb/notes.md")
 - Update via write_file with path /_self/kb/notes.md
 - Update immediately when the user gives a new preference
 - Prioritize notes.md over `remember` for non-factual preference information
 """
+
+def validate_timezone(name: str) -> str:
+    """Validate an IANA timezone name. Returns the name if valid, raises ValueError otherwise."""
+    if not name or not isinstance(name, str):
+        raise ValueError("IANA timezone name required")
+    if name not in _available_timezones():
+        raise ValueError(f"Not a valid IANA timezone: {name!r}")
+    return name
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -320,6 +337,67 @@ def _derive_agent_id(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Seed default system settings
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SETTINGS = [
+    # --- Appearance ---
+    ("theme", "system"),
+    # --- Models & Routing ---
+    ("vision_model_id", ""),
+    ("default_model_fallback_id", ""),
+    ("vision_fallback_model_id", ""),
+    ("vision_fallback_model_2_id", ""),
+    ("kb_organizer_model_id", ""),
+    ("task_classifier_enabled", "0"),
+    # --- Reliability ---
+    ("agent_timeout_retries", str(config.AGENT_TIMEOUT_RETRIES)),
+    ("llm_max_retries", "5"),
+    ("max_concurrent_llm_per_agent", "1"),
+    ("max_concurrent_llm_per_model", "0"),
+    ("max_concurrent_llm_global", "1"),
+    ("agent_queue_workers", str(config.AGENT_QUEUE_WORKERS)),
+    ("max_tool_iterations", str(config.AGENT_MAX_TOOL_ITERATIONS)),
+    ("max_goal_nudges", str(config.AGENT_MAX_GOAL_NUDGES)),
+    ("agent_sidebar_limit", str(config.AGENT_SIDEBAR_LIMIT)),
+    # --- Privacy & Guards ---
+    ("public_history", "0"),
+    ("long_running_guard_enabled", "1" if config.LONG_RUNNING_GUARD_ENABLED else "0"),
+    ("root_fs_scan_guard_enabled", "1" if config.ROOT_FS_SCAN_GUARD_ENABLED else "0"),
+    ("message_wrapper_enabled", "1"),
+    # --- Events ---
+    ("events_dispatch_enabled", "1"),
+    # --- Decim Safety (optional, provider-agnostic decision-model safety) ---
+    # Default off: Decim Safety is never a mandatory dependency and ordinary
+    # operation always falls back to the deterministic HMADS pipeline.
+    ("decim_safety.enabled", "0"),
+    ("decim_safety.mode", "off"),
+    ("decim_safety.request_timeout_ms", "1500"),
+    ("decim_safety.minimum_confidence", "0.90"),
+    ("decim_safety.max_payload_chars", "12000"),
+    ("decim_safety.circuit_breaker_failures", "3"),
+    ("decim_safety.circuit_breaker_cooldown_seconds", "60"),
+    ("decim_safety.record_enforce_events", "0"),
+    ("decim_safety.hmads_floor", "0"),
+    ("decim_safety.retention_days", "30"),
+]
+
+
+def _seed_default_settings():
+    """Write default system settings into app_settings where missing.
+
+    Uses db.set_setting() which is INSERT ... ON CONFLICT DO UPDATE,
+    so existing user-customised values are preserved — only absent
+    keys receive their defaults.  Idempotent; safe to call repeatedly.
+    """
+    for key, value in _DEFAULT_SETTINGS:
+        try:
+            db.set_setting(key, value)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
 
@@ -335,6 +413,7 @@ def run_setup(
     language: str = "english",
     sandbox_enabled: bool = False,
     password: str = "",
+    timezone_name: str = None,
 ) -> dict:
     """
     Execute first-time setup:
@@ -353,13 +432,13 @@ def run_setup(
     if language not in LANGUAGE_PRESETS:
         language = "english"
 
+    agent_name = (agent_name or "").strip() or DEFAULT_SUPER_AGENT_NAME
+
     # Derive agent ID if not provided
     if not agent_id:
         agent_id = _derive_agent_id(agent_name)
 
     # Validate
-    if not agent_name.strip():
-        return {"error": "Agent name is required"}
     if not re.match(r"^[a-z0-9_]+$", agent_id):
         return {
             "error": "Agent ID must be lowercase alphanumeric and underscores only (snake_case)"
@@ -379,6 +458,15 @@ def run_setup(
     resolved_base_url = (base_url or provider_cfg["base_url"]).rstrip("/")
 
     try:
+        # -1. Validate timezone before any writes
+        if timezone_name:
+            try:
+                validate_timezone(timezone_name)
+            except ValueError:
+                return {"error": f"Unknown timezone: {timezone_name}"}
+        else:
+            timezone_name = DEFAULT_PLATFORM_TIMEZONE
+
         # 0. Generate SECRET_KEY if not already set — critical for session security
         if not os.getenv("SECRET_KEY"):
             _key = secrets.token_urlsafe(48)
@@ -386,8 +474,25 @@ def run_setup(
             _update_env_var(env_path, "SECRET_KEY", _key)
             os.environ["SECRET_KEY"] = _key
 
-        # 1. Create model in DB as default
-        model_id = f"setup_{provider}"
+        # 0b. Persist timezone
+        env_path = os.path.join(config.BASE_DIR, ".env")
+        _update_env_var(env_path, "EVONIC_TIMEZONE", timezone_name)
+
+        # 1a. Ensure provider exists in providers table
+        if not db.get_provider(provider):
+            db.create_provider({
+                "id": provider,
+                "name": provider_cfg.get("label", provider),
+                "type": provider_cfg.get("type", "remote"),
+                "base_url": resolved_base_url,
+                "api_key": api_key or "",
+                "api_format": provider_cfg.get("api_format", "openai"),
+            })
+        elif api_key:
+            db.update_provider(provider, {"api_key": api_key, "base_url": resolved_base_url})
+
+        # 1b. Create model in DB as default
+        model_id = db.generate_model_id(provider, model_name)
         # Derive api_format: ollama + local → openai, ollama + remote → ollama native
         if provider == "ollama" and "ollama.com" in resolved_base_url:
             model_api_format = "ollama"
@@ -464,10 +569,17 @@ def run_setup(
             agent_id, ["bash", "runpy", "patch", "write_file", "read_file"]
         )
 
+        # 5.5 Assign default skills (core built-in skills pre-assigned for super agent)
+        db.set_agent_skills(agent_id, ["explorer"])
+
         # 6. Store settings
         db.set_setting("super_agent_id", agent_id)
         db.set_setting("agent_language", language)
         db.set_setting("sandbox_default_enabled", "1" if sandbox_enabled else "0")
+
+        # 6.5 Seed default system settings so the Settings UI and runtime
+        #      have known-good values on the very first page load.
+        _seed_default_settings()
 
         # 7. Enable all installed plugins
         for manifest_path in glob.glob(
@@ -502,6 +614,20 @@ def run_setup(
             pw_hash = generate_password_hash(password, method="pbkdf2:sha256")
             env_path = os.path.join(config.BASE_DIR, ".env")
             _update_env_var(env_path, "ADMIN_PASSWORD_HASH", pw_hash)
+
+        # Memory-engine awareness: surface whether evomem is ready or FTS5 is used.
+        try:
+            import logging
+            from backend.evomem_provision import default_binary_path
+            binary = default_binary_path()
+            ready = os.path.isfile(binary) and os.access(binary, os.X_OK)
+            logging.getLogger(__name__).info(
+                "Setup complete. Memory engine: %s",
+                "evomem (binary ready)" if ready else
+                "FTS5 fallback — evomem binary not installed; run 'evonic evomem install'",
+            )
+        except Exception:
+            pass
 
         return {"success": True, "agent_id": agent_id}
 
@@ -566,8 +692,20 @@ def run_reconfigure(
     resolved_base_url = (base_url or provider_cfg["base_url"]).rstrip("/")
 
     try:
-        # 1. Update or create model in DB as default
-        model_id = f"setup_{provider}"
+        # 1a. Ensure provider exists in providers table
+        if not db.get_provider(provider):
+            db.create_provider({
+                "id": provider,
+                "name": provider_cfg.get("label", provider),
+                "type": provider_cfg.get("type", "remote"),
+                "base_url": resolved_base_url,
+                "api_key": api_key or "",
+                "api_format": provider_cfg.get("api_format", "openai"),
+            })
+        elif api_key:
+            db.update_provider(provider, {"api_key": api_key, "base_url": resolved_base_url})
+
+        # 1b. Update or create model in DB as default
         # Derive api_format: ollama + local → openai, ollama + remote → ollama native
         if provider == "ollama" and "ollama.com" in resolved_base_url:
             model_api_format = "ollama"
@@ -576,7 +714,6 @@ def run_reconfigure(
             model_api_format = provider_cfg.get("api_format", "openai")
             model_type = provider_cfg["type"]
         model_data = {
-            "id": model_id,
             "name": f"{provider_cfg['label']} ({model_name})",
             "type": model_type,
             "provider": provider,
@@ -587,10 +724,13 @@ def run_reconfigure(
             "enabled": 1,
             "api_format": model_api_format,
         }
-        existing_model = db.get_model_by_id(model_id)
+        # Look up by new-format id first, then the legacy setup_<provider> id
+        existing_model = db.get_model_by_id(
+            f"{provider}/{model_name}"
+        ) or db.get_model_by_id(f"setup_{provider}")
         if existing_model:
             # Update preserves the user's manual thinking toggle
-            db.update_model(model_id, model_data)
+            db.update_model(existing_model["id"], model_data)
         else:
             model_data["thinking"] = 1 if provider_cfg.get("default_thinking") else 0
             db.create_model(model_data)
@@ -621,6 +761,7 @@ def run_reconfigure(
         # 5. Store settings
         db.set_setting("agent_language", language)
         db.set_setting("sandbox_default_enabled", "1" if sandbox_enabled else "0")
+        _seed_default_settings()
 
         # 6. Update admin password if provided
         if password:

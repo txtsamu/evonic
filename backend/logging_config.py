@@ -24,7 +24,8 @@ Environment variables:
                                 where patterns are fnmatch globs matched against logger names.
                                 Default: logs/agent.log:backend.agent_runtime.*,backend.agent_state;
                                          logs/channels.log:backend.channels.*;
-                                         logs/evaluator.log:evaluator.*
+                                         logs/evaluator.log:evaluator.*;
+                                         logs/baileys.log:baileys* (WhatsApp bridge stdout)
 """
 
 import fnmatch
@@ -46,7 +47,9 @@ _DEFAULT_BACKUPS = 3
 _DEFAULT_LOG_ROUTES = (
     "logs/agent.log:backend.agent_runtime.*,backend.agent_state,backend.tools.agent_messaging;"
     "logs/channels.log:backend.channels.*;"
-    "logs/evaluator.log:evaluator.*"
+    "logs/evaluator.log:evaluator.*;"
+    "logs/evomem.log:backend.agent_runtime.evomem_*;"
+    "logs/baileys.log:baileys*"
 )
 
 _configured = False

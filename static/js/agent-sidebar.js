@@ -156,28 +156,21 @@ function renderSidebar(agents) {
         if (_getUnreadSet().has(agent.id)) avatar.setAttribute('data-unread', 'true');
         avatar.setAttribute('title', agent.name);
 
-        if (agent.avatar_path) {
-            // Render custom avatar image
-            var img = document.createElement('img');
-            img.src = '/api/agents/' + encodeURIComponent(agent.id) + '/avatar?size=small';
-            img.alt = agent.name;
-            img.className = 'agent-avatar-img';
-            img.onerror = function () {
-                // Fallback to initial letter on load error
-                img.style.display = 'none';
-                var fallback = document.createElement('span');
-                fallback.textContent = agent.name.charAt(0).toUpperCase();
-                avatar.appendChild(fallback);
-                avatar.style.backgroundColor = _sidebarAvatarColor(agent.id);
-            };
-            avatar.appendChild(img);
-        } else {
-            // No custom avatar: show initial letter with colored background
+        // Always render the avatar image: the route serves the uploaded avatar, or an abstract one
+        // generated from the agent's name when none was uploaded.
+        var img = document.createElement('img');
+        img.src = '/api/agents/' + encodeURIComponent(agent.id) + '/avatar?size=small';
+        img.alt = agent.name;
+        img.className = 'agent-avatar-img';
+        img.onerror = function () {
+            // Fallback to initial letter on load error
+            img.style.display = 'none';
+            var fallback = document.createElement('span');
+            fallback.textContent = agent.name.charAt(0).toUpperCase();
+            avatar.appendChild(fallback);
             avatar.style.backgroundColor = _sidebarAvatarColor(agent.id);
-            var letter = document.createElement('span');
-            letter.textContent = agent.name.charAt(0).toUpperCase();
-            avatar.appendChild(letter);
-        }
+        };
+        avatar.appendChild(img);
 
         avatar.addEventListener('click', function () {
             // Mobile has no hover: first tap on an unread avatar shows the
@@ -228,6 +221,18 @@ function renderSidebar(agents) {
         });
 
         sidebar.appendChild(avatar);
+
+        // Page-load race: apply any busy event that arrived while this agent's
+        // avatar did not exist yet. The API snapshot (agent.busy above) is
+        // newer than buffered events, so only promote a buffered busy:true —
+        // i.e. show the spinning ring when the agent was working during load
+        // even if it has since gone idle (BUSY_HOLD_MS / resyncBusyState then
+        // reconcile it with the authoritative server state).
+        if (_pendingBusyState[agent.id] && _pendingBusyState[agent.id].busy &&
+                avatar.getAttribute('data-busy') !== 'true') {
+            updateBusyAvatar({ agent_id: agent.id, busy: true });
+        }
+        delete _pendingBusyState[agent.id];
     });
 
     // Apply saved sidebar state after all elements (including burger) are rendered
@@ -286,8 +291,6 @@ function hideTooltip() {
 
 /** Active bubble popup map: agentId -> { element, timer, hover } */
 var _activeBubbles = {};
-var _busySSE = null;
-var _busyReconnectTimer = null;
 
 /** Maximum characters to show in the bubble preview */
 var _BUBBLE_MAX_CHARS = 140;
@@ -332,17 +335,22 @@ function _stripMarkdown(text) {
         .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
         // Links
         .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-        // Bold / italic
-        .replace(/(\*\*|__)(.*?)\1/g, '$2')
-        .replace(/(\*|_)(.*?)\1/g, '$2')
         // Headings
         .replace(/^#{1,6}\s+/gm, '')
         // Blockquotes
         .replace(/^>\s?/gm, '')
         // List markers
         .replace(/^\s*([-*+]|\d+\.)\s+/gm, '')
-        // Horizontal rules
+        // Horizontal rules (before bold/italic so *** and ___ are fully stripped)
         .replace(/^(\s*[-*_]){3,}\s*$/gm, '')
+        // Bold with ** (non-greedy, handles nested italic)
+        .replace(/\*\*(.*?)\*\*/g, '$1')
+        // Bold with __ (requires word boundary to avoid matching __init__ etc.)
+        .replace(/(^|\s)__([^_]+)__(?=\s|$|[.,;:!?)])/g, '$1$2')
+        // Italic with * (rarely conflicts with identifiers)
+        .replace(/\*([^*]+)\*/g, '$1')
+        // Italic with _ (requires word boundary to avoid matching file_names)
+        .replace(/(^|\s)_([^_]+)_(?=\s|$|[.,;:!?)])/g, '$1$2')
         // Collapse whitespace — the preview is a one-line snippet
         .replace(/\s+/g, ' ')
         .trim();
@@ -526,18 +534,48 @@ function _onTurnComplete(payload) {
     showBubblePopup(payload.agent_id, payload.agent_name, payload.response, payload.session_id, payload.external_user_id);
 }
 
-/** Subscribe via RealtimeClient for real-time busy state updates and turn-complete notifications */
+/** Subscribe via shared RealtimeClient for real-time busy state updates and turn-complete notifications */
 var _busySSE = null;
 var _busyReconnectTimer = null;
-var _busyRealtimeHandlersBound = false;
+var _busyClearTimers = {};  // agent_id -> setTimeout id for minimum busy-hold debounce
+var BUSY_HOLD_MS = 300;    // minimum visible duration for the spinning ring
+
+/** Busy events received before the avatar was rendered (page-load race). */
+var _pendingBusyState = {};  // agent_id -> { busy: bool, ts: number }
 
 function updateBusyAvatar(payload) {
     if (!payload || !payload.agent_id) return;
     var avatar = document.querySelector(
         '#agent-sidebar .agent-avatar[data-agent-id="' + CSS.escape(payload.agent_id) + '"]'
     );
-    if (avatar) {
-        avatar.setAttribute('data-busy', payload.busy ? 'true' : 'false');
+    if (!avatar) {
+        // Page-load race: the sidebar is still showing skeleton placeholders,
+        // so there is no avatar to apply this event to yet. Buffer it instead
+        // of dropping it — renderSidebar() applies pending state as soon as
+        // the avatar exists. Without this, a busy event that arrives during
+        // page load is lost forever and the spinning ring never appears, even
+        // though the agent was working (inconsistent ring on refresh).
+        _pendingBusyState[payload.agent_id] = { busy: !!payload.busy, ts: Date.now() };
+        return;
+    }
+    delete _pendingBusyState[payload.agent_id];
+    if (payload.busy) {
+        // Cancel any pending clear — agent is still busy
+        if (_busyClearTimers[payload.agent_id]) {
+            clearTimeout(_busyClearTimers[payload.agent_id]);
+            delete _busyClearTimers[payload.agent_id];
+        }
+        avatar.setAttribute('data-busy', 'true');
+    } else {
+        // Cancel any previous pending clear for this agent
+        if (_busyClearTimers[payload.agent_id]) {
+            clearTimeout(_busyClearTimers[payload.agent_id]);
+        }
+        // Delay clearing to ensure the spinning ring is visible (minimum BUSY_HOLD_MS)
+        _busyClearTimers[payload.agent_id] = setTimeout(function () {
+            delete _busyClearTimers[payload.agent_id];
+            avatar.setAttribute('data-busy', 'false');
+        }, BUSY_HOLD_MS);
     }
 }
 
@@ -546,26 +584,23 @@ function dispatchBusyChanged(payload) {
 }
 
 function subscribeBusySSE() {
-    if (typeof RealtimeClient === 'undefined') {
+    if (typeof getSharedRealtime === 'undefined') {
         if (_busySSE) return;
         try {
-            var es = new EventSource('/api/agents/status/stream');
-            _busySSE = es;
-            es.addEventListener('agent_busy_changed', function (e) {
+            _busySSE = new EventSource('/api/agents/status/stream');
+            _busySSE.addEventListener('agent_busy_changed', function (e) {
                 try {
-                    var payload = JSON.parse(e.data);
-                    updateBusyAvatar(payload);
-                    dispatchBusyChanged(payload);
+                    updateBusyAvatar(JSON.parse(e.data));
                 } catch (_) {}
             });
-            es.addEventListener('agent_turn_complete', function (e) {
+            _busySSE.addEventListener('agent_turn_complete', function (e) {
                 try {
                     _onTurnComplete(JSON.parse(e.data));
                 } catch (_) {}
             });
-            es.addEventListener('error', function () {
-                es.close();
-                if (_busySSE === es) _busySSE = null;
+            _busySSE.addEventListener('error', function () {
+                _busySSE.close();
+                _busySSE = null;
                 resyncBusyState();
                 if (_busyReconnectTimer) clearTimeout(_busyReconnectTimer);
                 _busyReconnectTimer = setTimeout(function () {
@@ -580,18 +615,14 @@ function subscribeBusySSE() {
         return;
     }
 
-    var rt = window._evRealtime = window._evRealtime || new RealtimeClient({
-        channels: 'status'
+    var rt = getSharedRealtime();
+    // Backward compat: pages that poll for window._evRealtime (e.g. agent_detail.html)
+    window._evRealtime = rt;
+    rt.on('status', 'agent_busy_changed', function (payload) {
+        updateBusyAvatar(payload);
+        dispatchBusyChanged(payload);
     });
-    if (!_busyRealtimeHandlersBound) {
-        rt.on('status', 'agent_busy_changed', function (payload) {
-            updateBusyAvatar(payload);
-            dispatchBusyChanged(payload);
-        });
-        rt.on('status', 'agent_turn_complete', _onTurnComplete);
-        _busyRealtimeHandlersBound = true;
-    }
-    rt.start();
+    rt.on('status', 'agent_turn_complete', _onTurnComplete);
 }
 
 function resyncBusyState() {
@@ -602,6 +633,13 @@ function resyncBusyState() {
                 var agentId = avatar.getAttribute('data-agent-id');
                 var busy = !!(data.busy || {})[agentId];
                 avatar.setAttribute('data-busy', busy ? 'true' : 'false');
+                // The authoritative server snapshot wins: cancel any stale
+                // hold-clear timer so it cannot flip a confirmed-busy avatar
+                // back to idle (stale BUSY_HOLD_MS debounce race).
+                if (busy && _busyClearTimers[agentId]) {
+                    clearTimeout(_busyClearTimers[agentId]);
+                    delete _busyClearTimers[agentId];
+                }
             });
             document.dispatchEvent(new CustomEvent('evonic:agent-busy-resync', { detail: data.busy || {} }));
         })
@@ -619,11 +657,10 @@ function closeBusyRealtime() {
         } catch (_) {}
         _busySSE = null;
     }
-    if (window._evRealtime) {
-        window._evRealtime.stop();
-    }
 }
 
+// Close the fallback EventSource on navigation (no-ops on the shared-RT
+// path, which manages its own lifecycle via getSharedRealtime's handler).
 window.addEventListener('pagehide', closeBusyRealtime);
 window.addEventListener('beforeunload', closeBusyRealtime);
 window.addEventListener('pageshow', function () {
@@ -652,6 +689,13 @@ function _applySidebarState() {
     if (!sidebar) return;
     var burger = document.getElementById('sidebar-toggle-btn');
 
+    // Desktop has no toggle button, so a collapsed state saved earlier must not hide the sidebar for good.
+    if (window.innerWidth >= 1024) {
+        sidebar.classList.remove('collapsed');
+        if (burger) burger.classList.remove('collapsed');
+        return;
+    }
+
     var collapsed;
     try {
         var saved = localStorage.getItem('evonic-sidebar-collapsed');
@@ -671,6 +715,11 @@ function _applySidebarState() {
     }
 }
 
+// Crossing into desktop width re-opens the sidebar (there is no toggle to do it there)
+window.addEventListener('resize', function () {
+    if (window.innerWidth >= 1024) _applySidebarState();
+});
+
 // Update selected ring when browser navigates back/forward (soft-switch uses pushState)
 window.addEventListener('popstate', _updateSelectedAvatar);
 
@@ -679,6 +728,8 @@ function initSidebar() {
     var sidebar = document.getElementById('agent-sidebar');
     if (!sidebar) return;
 
-    fetchSidebarAgents();
+    fetchSidebarAgents().then(function () {
+        resyncBusyState();
+    });
     subscribeBusySSE();
 }

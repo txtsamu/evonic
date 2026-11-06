@@ -116,7 +116,7 @@ class TestSessionMessages:
         # IDs should be strictly increasing
         assert id1 < id2 < id3
 
-        msgs = db.get_session_messages_full(sid, agent_id=agent_id)
+        msgs, _ = db.get_session_messages_full(sid, agent_id=agent_id)
         contents = [m['content'] for m in msgs]
         assert contents == ['msg1', 'msg2', 'msg3']
 
@@ -137,7 +137,7 @@ class TestSessionMessages:
         db.add_chat_message(sid, 'assistant', 'hello', agent_id=agent_id,
                             metadata={'timeline': [{'type': 'thinking', 'content': 'hmm'}]})
 
-        msgs = db.get_session_messages_full(sid, agent_id=agent_id)
+        msgs, _ = db.get_session_messages_full(sid, agent_id=agent_id)
         assert len(msgs) == 2
         asst = [m for m in msgs if m['role'] == 'assistant'][0]
         assert asst['metadata']['timeline'][0]['content'] == 'hmm'
@@ -157,6 +157,112 @@ class TestSessionMessages:
         # Poll after id3 should return nothing
         new = db.get_new_messages(sid, id3, agent_id=agent_id)
         assert len(new) == 0
+
+
+class TestAgentRequestMetadata:
+    def test_intervening_tool_and_assistant_messages_do_not_affect_lookup(self, agent_id, chat_db):
+        sid = db.get_or_create_session(agent_id, '__agent__sender')
+        expected = {
+            'agent_message': True,
+            'from_agent_id': 'sender',
+            'report_to_id': 'user-1',
+        }
+        db.add_chat_message(sid, 'user', 'delegate', metadata=expected, agent_id=agent_id)
+        for i in range(25):
+            db.add_chat_message(sid, 'assistant', f'call {i}', agent_id=agent_id)
+            db.add_chat_message(sid, 'tool', f'result {i}', agent_id=agent_id)
+
+        assert db.get_latest_agent_request_metadata(
+            sid, agent_id=agent_id, sender_agent_id='sender',
+        ) == expected
+
+    def test_newer_unroutable_request_does_not_shadow_routable_delegation(self, agent_id, chat_db):
+        sid = db.get_or_create_session(agent_id, '__agent__sender')
+        expected = {
+            'agent_message': True,
+            'from_agent_id': 'sender',
+            'report_to_id': 'user-1',
+        }
+        db.add_chat_message(sid, 'user', 'delegate', metadata=expected, agent_id=agent_id)
+        db.add_chat_message(sid, 'user', 'background notification', metadata={
+            'agent_message': True,
+            'from_agent_id': 'sender',
+        }, agent_id=agent_id)
+
+        assert db.get_latest_agent_request_metadata(
+            sid, agent_id=agent_id, sender_agent_id='sender',
+        ) == expected
+
+    def test_newer_waitable_request_is_returned_without_human_route(self, agent_id, chat_db):
+        sid = db.get_or_create_session(agent_id, '__agent__sender')
+        db.add_chat_message(sid, 'user', 'old delegation', metadata={
+            'agent_message': True,
+            'from_agent_id': 'sender',
+            'report_to_id': 'user-1',
+        }, agent_id=agent_id)
+        expected = {
+            'agent_message': True,
+            'from_agent_id': 'sender',
+            'reply_to_id': 'reply-1',
+        }
+        db.add_chat_message(sid, 'user', 'sync delegation', metadata=expected,
+                            agent_id=agent_id)
+
+        assert db.get_latest_agent_request_metadata(
+            sid, agent_id=agent_id, sender_agent_id='sender',
+        ) == expected
+
+    def test_sender_isolation_and_compact_json(self, agent_id, chat_db):
+        sid = db.get_or_create_session(agent_id, '__agent__sender')
+        expected = {
+            'agent_message': True,
+            'from_agent_id': 'sender',
+            'report_to_id': 'user-1',
+        }
+        db.add_chat_message(sid, 'user', 'other sender', metadata={
+            'agent_message': True,
+            'from_agent_id': 'other',
+            'report_to_id': 'wrong-user',
+        }, agent_id=agent_id)
+        with chat_db._connect() as conn:
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                (sid, 'compact', json.dumps(expected, separators=(',', ':'))),
+            )
+
+        assert db.get_latest_agent_request_metadata(
+            sid, agent_id=agent_id, sender_agent_id='sender',
+        ) == expected
+        assert db.get_latest_agent_request_metadata(
+            sid, agent_id=agent_id, sender_agent_id='missing',
+        ) is None
+
+    def test_invalid_and_non_agent_metadata_are_skipped(self, agent_id, chat_db):
+        sid = db.get_or_create_session(agent_id, '__agent__sender')
+        expected = {
+            'agent_message': True,
+            'from_agent_id': 'sender',
+            'report_to_id': 'user-1',
+        }
+        db.add_chat_message(sid, 'user', 'delegate', metadata=expected, agent_id=agent_id)
+        db.add_chat_message(sid, 'assistant', 'not a request', metadata={
+            'agent_message': True,
+            'from_agent_id': 'sender',
+            'report_to_id': 'wrong-assistant-route',
+        }, agent_id=agent_id)
+        db.add_chat_message(sid, 'user', 'ordinary user', metadata={
+            'from_agent_id': 'sender',
+            'report_to_id': 'wrong-non-agent-route',
+        }, agent_id=agent_id)
+        with chat_db._connect() as conn:
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                (sid, 'malformed', '{not-json'),
+            )
+
+        assert db.get_latest_agent_request_metadata(
+            sid, agent_id=agent_id, sender_agent_id='sender',
+        ) == expected
 
 
 class TestSessionDelete:
@@ -208,7 +314,7 @@ class TestSessionDelete:
         assert len(msgs) == 0
 
         # get_session_messages_full also empty
-        msgs_full = db.get_session_messages_full(sid2, agent_id=agent_id)
+        msgs_full, _ = db.get_session_messages_full(sid2, agent_id=agent_id)
         assert len(msgs_full) == 0
 
     def test_delete_without_agent_id(self, agent_id, chat_db):
@@ -325,3 +431,44 @@ class TestGetAllSessions:
 
         sessions, total = db.get_all_sessions(search='Test Agent')
         assert total >= 1
+
+    def test_lists_subagent_session_stored_in_parent_chat_db(self, chat_db, agent_id):
+        subagent_id = f'{agent_id}_sub_1'
+        session_id = db.get_or_create_session(
+            subagent_id, 'subagent_user', db_agent_id=agent_id,
+        )
+        db.add_chat_message(
+            session_id, 'user', 'delegated task', agent_id=subagent_id,
+            db_agent_id=agent_id,
+        )
+
+        sessions, _ = db.get_all_sessions(exclude_test=False)
+        session = next(s for s in sessions if s['id'] == session_id)
+        assert session['agent_id'] == subagent_id
+        assert session['last_message'] == 'delegated task'
+
+
+class TestAgentCommandDiscoveryAPI:
+    def test_returns_sorted_commands_available_to_agent(self, agent_id, chat_db):
+        from app import app
+
+        with app.test_client() as client:
+            _auth(client)
+            response = client.get(f'/api/agents/{agent_id}/commands')
+
+        assert response.status_code == 200
+        commands = response.get_json()['commands']
+        names = [command['name'] for command in commands]
+        assert names == sorted(names)
+        assert 'help' in names
+        assert 'restart' not in names
+        assert all({'name', 'description', 'accepts_args', 'parameters'}.issubset(set(command)) for command in commands)
+
+    def test_returns_404_for_unknown_agent(self, agent_id, chat_db):
+        from app import app
+
+        with app.test_client() as client:
+            _auth(client)
+            response = client.get('/api/agents/missing_agent/commands')
+
+        assert response.status_code == 404

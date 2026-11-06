@@ -155,7 +155,8 @@ class TestKanbanStateHandler:
         from backend.agent_state import AgentState
         ms = AgentState(mode='execute')
         task_id = (data or {}).get('task_id', 'task-1')
-        fake_task = {'id': task_id, 'status': task_status}
+        # Activation requires an assignee (see kanban: require assignee before task start).
+        fake_task = {'id': task_id, 'status': task_status, 'assignee': agent_id}
         autopilot_value = '1' if autopilot else '0'
         with mock.patch('plugins.kanban.db.kanban_db') as mock_db, \
              mock.patch('models.db.db') as mock_db2, \
@@ -247,14 +248,27 @@ class TestKanbanStateHandler:
         result = self._call('kanban:activate', {})
         assert result['result'] == 'error'
 
-    def test_activate_allowed_when_db_raises(self):
-        """DB unavailable → allow activation (fail open)."""
+    def test_activate_blocked_when_dep_check_raises(self):
+        """Dependency check failure → block activation (fail closed)."""
         from backend.agent_state import AgentState
         ms = AgentState(mode='execute')
         with mock.patch('plugins.kanban.db.kanban_db') as mock_db, \
              mock.patch('models.db.db') as mock_db2:
             mock_db.get.side_effect = Exception('db unavailable')
             mock_db.get_unmet_dependencies.side_effect = Exception('db unavailable')
+            mock_db2.get_setting.return_value = '1'  # autopilot=ON
+            result = self._h._state_handler('agent1', 'sess1', ms, 'kanban:activate', {'task_id': 'task-1'})
+        assert result['result'] == 'error'
+        assert 'dependency check failed' in result['message']
+
+    def test_activate_allowed_when_task_lookup_raises(self):
+        """Deps OK but task-validation DB lookup fails → allow activation (fail open)."""
+        from backend.agent_state import AgentState
+        ms = AgentState(mode='execute')
+        with mock.patch('plugins.kanban.db.kanban_db') as mock_db, \
+             mock.patch('models.db.db') as mock_db2:
+            mock_db.get_unmet_dependencies.return_value = []
+            mock_db.get.side_effect = Exception('db unavailable')
             mock_db2.get_setting.return_value = '1'  # autopilot=ON
             result = self._h._state_handler('agent1', 'sess1', ms, 'kanban:activate', {'task_id': 'task-1'})
         assert result['result'] == 'success'

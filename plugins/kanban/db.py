@@ -20,6 +20,9 @@ _shared_data = os.path.join(BASE_DIR, 'shared', 'data')
 _data_root = _shared_data if os.path.isdir(_shared_data) else os.path.join(BASE_DIR, 'data')
 PLUGIN_DB_DIR = os.path.join(_data_root, 'db', 'plugins')
 DB_PATH = os.path.join(PLUGIN_DB_DIR, 'kanban.db')
+# Directory where uploaded task attachment files are stored on disk.
+# Lives next to the plugin DB so it survives plugin reinstall.
+ATTACHMENTS_DIR = os.path.join(_data_root, 'uploads', 'kanban')
 TASKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tasks.json')
 
 
@@ -31,12 +34,14 @@ class KanbanDB:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._init_tables()
+        self._migrate_created_by()
         self._migrate_columns()
         self._migrate_remove_free_pick()
         self._migrate_archived_at()
         self._migrate_paused_at()
         self._migrate_started_at()
         self._migrate_task_dependencies()
+        self._migrate_attachments()
         self._migrate_from_json()
 
     @contextmanager
@@ -66,6 +71,7 @@ class KanbanDB:
                     status      TEXT NOT NULL DEFAULT 'todo',
                     priority    TEXT NOT NULL DEFAULT 'low',
                     assignee    TEXT,
+                    created_by  TEXT,
                     completed_at TEXT,
                     started_at  TEXT,
                     created_at  TEXT NOT NULL,
@@ -139,6 +145,7 @@ class KanbanDB:
                     status      TEXT NOT NULL DEFAULT 'todo',
                     priority    TEXT NOT NULL DEFAULT 'low',
                     assignee    TEXT,
+                    created_by  TEXT,
                     completed_at TEXT,
                     created_at  TEXT NOT NULL,
                     updated_at  TEXT NOT NULL
@@ -146,13 +153,20 @@ class KanbanDB:
             """)
             conn.execute("""
                 INSERT INTO tasks_new (id, title, description, status, priority,
-                                       assignee, completed_at, created_at, updated_at)
+                                       assignee, created_by, completed_at, created_at, updated_at)
                 SELECT id, title, description, status, priority,
-                       assignee, completed_at, created_at, updated_at
+                       assignee, created_by, completed_at, created_at, updated_at
                 FROM tasks
             """)
             conn.execute("DROP TABLE tasks")
             conn.execute("ALTER TABLE tasks_new RENAME TO tasks")
+
+    def _migrate_created_by(self):
+        """Add created_by column if it doesn't exist."""
+        with self._connect() as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            if 'created_by' not in cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN created_by TEXT")
 
     def _migrate_archived_at(self):
         """Add archived_at column if it doesn't exist."""
@@ -188,6 +202,39 @@ class KanbanDB:
                     FOREIGN KEY (depends_on) REFERENCES tasks(id) ON DELETE CASCADE
                 )
             """)
+
+    def _migrate_attachments(self):
+        """Create attachments table if it doesn't exist.
+
+        Each row references a task and points to a stored file on disk under
+        the plugin's uploads directory. The stored filename is generated
+        server-side (uuid prefix) so it is safe to use on any filesystem.
+        """
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id     INTEGER NOT NULL,
+                    comment_id  INTEGER,
+                    filename    TEXT NOT NULL,
+                    stored_name TEXT NOT NULL,
+                    mime_type   TEXT,
+                    size        INTEGER,
+                    uploaded_by TEXT,
+                    created_at  TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+                    FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE
+                )
+            """)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(attachments)").fetchall()}
+            if 'comment_id' not in cols:
+                conn.execute("ALTER TABLE attachments ADD COLUMN comment_id INTEGER")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_attachments_task_id ON attachments(task_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_attachments_comment_id ON attachments(comment_id)"
+            )
 
     # ── Dependencies ─────────────────────────────────────────────────────────
 
@@ -296,6 +343,76 @@ class KanbanDB:
             result.setdefault(row[0], []).append(row[1])
         return result
 
+    # ── Attachments ─────────────────────────────────────────────────────────
+
+    def add_attachment(self, task_id: str, filename: str, stored_name: str,
+                       mime_type: str = None, size: int = None,
+                       uploaded_by: str = None, comment_id: int = None) -> Optional[dict]:
+        """Record a file attachment for a task or task comment."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO attachments (task_id, comment_id, filename, stored_name, mime_type, size, uploaded_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, comment_id, filename, stored_name, mime_type, size, uploaded_by, _now()),
+            )
+            new_id = cur.lastrowid
+        return self.get_attachment(new_id)
+
+    def get_attachment(self, attachment_id: int) -> Optional[dict]:
+        """Return a single attachment by ID, or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?", (attachment_id,)
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def get_attachments(self, task_id: str) -> list:
+        """Return all attachments for a task, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM attachments WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_attachments_for_comment(self, comment_id: int) -> list:
+        """Return all attachments belonging to one comment, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM attachments WHERE comment_id = ? ORDER BY id ASC",
+                (comment_id,),
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def delete_attachment(self, attachment_id: int) -> Optional[dict]:
+        """Delete an attachment row. Returns the deleted row (for file cleanup) or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?", (attachment_id,)
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM attachments WHERE id = ?", (attachment_id,))
+        return self._row_to_dict(row)
+
+    def delete_attachments_for_comment(self, comment_id: int) -> list:
+        """Delete comment attachment rows and return them for file cleanup."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM attachments WHERE comment_id = ?", (comment_id,)
+            ).fetchall()
+            conn.execute("DELETE FROM attachments WHERE comment_id = ?", (comment_id,))
+        return [self._row_to_dict(r) for r in rows]
+
+    def delete_attachments_for_task(self, task_id: str) -> list:
+        """Delete all attachment rows for a task. Returns the deleted rows for file cleanup."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM attachments WHERE task_id = ?", (task_id,)
+            ).fetchall()
+            conn.execute("DELETE FROM attachments WHERE task_id = ?", (task_id,))
+        return [self._row_to_dict(r) for r in rows]
+
     def _migrate_from_json(self):
         """Import tasks.json into DB on first run, then rename it."""
         if not os.path.isfile(TASKS_FILE):
@@ -358,13 +475,13 @@ class KanbanDB:
         with self._connect() as conn:
             cur = conn.execute("""
                 INSERT INTO tasks
-                (title, description, status, priority, assignee,
+                (title, description, status, priority, assignee, created_by,
                  completed_at, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 task['title'], task.get('description', ''),
                 task.get('status', 'todo'), task.get('priority', 'low'),
-                task.get('assignee'),
+                task.get('assignee'), task.get('created_by'),
                 task.get('completed_at'), task['created_at'], task['updated_at'],
             ))
             new_id = cur.lastrowid
@@ -488,6 +605,22 @@ class KanbanDB:
             'comments': [dict(r) for r in rows],
             'total': total,
         }
+
+    def get_comment(self, comment_id: int) -> Optional[dict]:
+        """Get a single comment by ID, or None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM comments WHERE id = ?",
+                (comment_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_comment(self, comment_id: int) -> bool:
+        """Delete a comment by ID. Returns True if deleted, False if not found."""
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
+            return cursor.rowcount > 0
+
 
     # ─── Activity Log ──────────────────────────────────────────────────────────
 

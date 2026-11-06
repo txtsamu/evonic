@@ -663,6 +663,67 @@ def test_sql_approval_info():
     print("✅ test_sql_approval_info passed")
 
 
+def test_root_filesystem_scan_detected():
+    """Test that 'find /' and 'tree /' are detected as dangerous (auto-rejected).
+
+    Root scan detection lives in the standalone check_root_filesystem_scan()
+    (an independent performance guard bash.py runs regardless of safety flags),
+    not the pipeline — so it is asserted directly here.
+    """
+    from backend.tools.lib.heuristic_safety import check_root_filesystem_scan
+    positive_cases = [
+        "find /",
+        "find / -name '*.env'",
+        "find / -type f",
+        "tree /",
+        "tree / -L 2",
+        "tree / --du",
+    ]
+    for code in positive_cases:
+        result = check_root_filesystem_scan(code)
+        assert result is not None, f"Expected a match for '{code}', got None"
+        assert result['level'] == 'dangerous', \
+            f"Expected 'dangerous' for '{code}', got '{result['level']}' (score={result['score']})"
+        assert 'root_filesystem_scan' in result.get('blocked_patterns', []), \
+            f"Expected 'root_filesystem_scan' in blocked_patterns for '{code}', got {result.get('blocked_patterns')}"
+
+    print("✅ test_root_filesystem_scan_detected passed")
+
+
+def test_root_filesystem_scan_no_false_positive():
+    """Test that non-root find/tree commands are NOT flagged."""
+    from backend.tools.lib.heuristic_safety import check_root_filesystem_scan
+    negative_cases = [
+        "find /tmp",
+        "find /workspace -name '*.py'",
+        "find ~/.config",
+        "tree /tmp",
+        "tree /workspace",
+        "tree ~/project",
+        "find .",
+        "find",
+        "tree",
+        "tree .",
+    ]
+    for code in negative_cases:
+        result = check_root_filesystem_scan(code)
+        assert result is None, \
+            f"Expected None (not flagged) for '{code}', got {result}"
+
+    print("✅ test_root_filesystem_scan_no_false_positive passed")
+
+
+def test_root_filesystem_scan_auto_rejected():
+    """Test that a root filesystem scan is auto-rejected, not sent for approval."""
+    from backend.tools.lib.heuristic_safety import check_root_filesystem_scan
+    result = check_root_filesystem_scan("find / -name '*.env'")
+    assert result is not None
+    assert result['requires_approval'] == False, f"Expected requires_approval=False, got {result}"
+    assert 'approval_info' not in result, f"Expected no approval_info, got {result}"
+
+    print("✅ test_root_filesystem_scan_auto_rejected passed")
+
+
 
 
 if __name__ == '__main__':
@@ -714,6 +775,9 @@ if __name__ == '__main__':
         test_sql_false_positive_case_insensitive,
         test_sql_with_complex_identifiers,
         test_sql_approval_info,
+        test_root_filesystem_scan_detected,
+        test_root_filesystem_scan_no_false_positive,
+        test_root_filesystem_scan_auto_rejected,
     ]
     
     passed = 0

@@ -60,7 +60,7 @@ check_prereqs() {
     step "Step 1/6: Checking prerequisites"
 
     missing=""
-    for cmd in git python3 pip3; do
+    for cmd in git python3; do
         if command -v "$cmd" >/dev/null 2>&1; then
             ok "$cmd found"
         else
@@ -82,6 +82,12 @@ check_prereqs() {
         die "Python 3.9+ is required. Found: $(python3 --version 2>&1)"
     fi
     ok "Python version $(python3 --version 2>&1) meets minimum requirement (3.9+)"
+
+    # The installer needs the venv module (with ensurepip), not a system pip3.
+    if ! python3 -c 'import venv, ensurepip' 2>/dev/null; then
+        die "Python 'venv' module is missing. Install it (e.g. sudo apt install python3-venv) and re-run."
+    fi
+    ok "Python venv module available"
 }
 
 # --- Fix remote fetch config so branches and tags are tracked ---
@@ -90,7 +96,6 @@ check_prereqs() {
 # breaks `git fetch`, `git pull`, and the supervisor auto-updater.
 # Reconfigure to fetch all branches + tags so the repo stays alive.
 fix_remote_fetch() {
-    local rc
     rc=$(git -C "$EVONIC_HOME" config remote.origin.fetch 2>/dev/null)
     case "$rc" in
         *refs/tags/*:refs/tags/*)  # locked to a single tag -- fix it
@@ -152,21 +157,40 @@ clone_repo() {
     fi
     fix_remote_fetch
 
-    # Ensure we're on the main branch so users can git pull manually
-    git -C "$EVONIC_HOME" checkout main 2>/dev/null || \
-        git -C "$EVONIC_HOME" checkout -b main origin/main 2>/dev/null || \
-        warn "Could not switch to main branch."
+    # Ensure we have local tracking branches for main and dev
+    # (shallow tag clones leave us in detached HEAD with no local branches)
+    for branch in main dev; do
+        git -C "$EVONIC_HOME" checkout "$branch" 2>/dev/null || \
+            git -C "$EVONIC_HOME" checkout -b "$branch" "origin/$branch" 2>/dev/null || \
+            warn "Could not create local $branch branch."
+    done
 }
 # ── Step 3: Create Python virtual environment ────────────────────────────────
 create_venv() {
     step "Step 3/6: Creating Python virtual environment"
 
+    # Check whether a usable venv already exists (must have both python and pip)
     if [ -f "$VENV_DIR/bin/python" ] || [ -f "$VENV_DIR/bin/python3" ]; then
-        ok "Virtual environment already exists — skipping"
-        return
+        py="$VENV_DIR/bin/python"
+        [ -x "$py" ] || py="$VENV_DIR/bin/python3"
+        if "$py" -m pip --version >/dev/null 2>&1; then
+            ok "Virtual environment already exists — skipping"
+            return
+        fi
+        warn "Virtual environment exists but pip is missing — recreating..."
+        rm -rf "$VENV_DIR"
     fi
 
-    python3 -m venv "$VENV_DIR"
+    python3 -m venv "$VENV_DIR" || die "Virtual environment creation failed. Install the venv module (e.g. sudo apt install python3-venv) and re-run."
+
+    # Some distros / Python 3.12+ create the venv without bootstrapping pip.
+    py="$VENV_DIR/bin/python"
+    [ -x "$py" ] || py="$VENV_DIR/bin/python3"
+
+    if ! "$py" -m pip --version >/dev/null 2>&1; then
+        "$py" -m ensurepip --upgrade >/dev/null 2>&1 || \
+            die "Virtual environment has no pip. Install the venv module (e.g. sudo apt install python3-venv) and re-run."
+    fi
     ok "Virtual environment created at $VENV_DIR"
 }
 
@@ -174,14 +198,20 @@ create_venv() {
 install_deps() {
     step "Step 4/6: Installing Python dependencies"
 
-    pip="$VENV_DIR/bin/pip"
-    if [ ! -f "$pip" ]; then
-        pip="$VENV_DIR/bin/pip3"
-    fi
+    py="$VENV_DIR/bin/python"
+    [ -x "$py" ] || py="$VENV_DIR/bin/python3"
 
-    "$pip" install --upgrade pip --quiet
-    "$pip" install -r "$EVONIC_HOME/requirements.txt"
+    "$py" -m pip install --upgrade pip --quiet
+    "$py" -m pip install -r "$EVONIC_HOME/requirements.txt"
     ok "Dependencies installed"
+
+    # Provision the evomem memory-engine binary (best-effort: unsupported
+    # platforms or network issues fall back to FTS5, so never fail the install).
+    if (cd "$EVONIC_HOME" && "$py" -m backend.evomem_provision) >/dev/null 2>&1; then
+        ok "Evomem memory engine installed"
+    else
+        warn "Evomem binary not installed (unsupported platform or network issue); using FTS5 fallback"
+    fi
 }
 
 # ── Step 5: Create CLI wrapper script ────────────────────────────────────────
@@ -198,6 +228,8 @@ EVONIC_HOME="\${EVONIC_HOME:-$EVONIC_HOME}"
 # Activate venv and run
 if [ -f "\$EVONIC_HOME/.venv/bin/activate" ]; then
     . "\$EVONIC_HOME/.venv/bin/activate"
+elif [ -f "\$EVONIC_HOME/venv/bin/activate" ]; then
+    . "\$EVONIC_HOME/venv/bin/activate"
 fi
 
 cd "\$EVONIC_HOME"

@@ -1,9 +1,6 @@
 """Routes for the system update UI and API."""
 
-import json
-import queue
-
-from flask import Blueprint, Response, jsonify, render_template, request, stream_with_context
+from flask import Blueprint, jsonify, render_template, request, redirect
 
 from backend import update_manager
 
@@ -67,43 +64,7 @@ def api_update_restart():
 def api_update_stream():
     """SSE endpoint for real-time update progress.
     DEPRECATED: Use unified GET /api/realtime/stream?channels=update instead."""
-    import logging as _log_depr
-    _log_depr.getLogger(__name__).warning(
-        "DEPRECATED endpoint /api/system/update/stream used — "
-        "migrate to /api/realtime/stream?channels=update")
-    # Release the thread-local DB connection — this SSE thread is long-lived.
-    from models.db import db
-    db.close()
-
-    q = update_manager.register_listener()
-
-    def generate():
-        try:
-            # Send initial status immediately
-            status = update_manager.get_status()
-            yield f"event: status\ndata: {json.dumps(status)}\n\n"
-
-            while True:
-                try:
-                    snapshot = q.get(timeout=30)
-                except queue.Empty:
-                    yield ": heartbeat\n\n"
-                    continue
-
-                yield f"event: status\ndata: {json.dumps(snapshot)}\n\n"
-
-                # If terminal state, send done event and close
-                if snapshot.get('status') in ('success', 'failed'):
-                    yield f"event: done\ndata: {json.dumps({'status': snapshot['status']})}\n\n"
-        finally:
-            update_manager.unregister_listener(q)
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no',
-            'Connection': 'keep-alive',
-        },
+    return redirect(
+        '/api/realtime/stream?channels=update&legacy=update&snapshot=1',
+        code=307,
     )

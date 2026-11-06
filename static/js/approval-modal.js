@@ -81,6 +81,38 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// Render `code` as escaped HTML with the dangerous spans wrapped in <mark> so the
+// reviewer can immediately see *where* the risk is. `highlights` are {start,end}
+// character offsets (from the backend safety pipeline) into `code`. Overlapping
+// spans are merged. Exposed globally so the chat timeline card reuses it verbatim.
+function evHighlightCode(code, highlights) {
+    code = String(code == null ? '' : code);
+    if (!highlights || !highlights.length) return escapeHtml(code);
+    // Sort + merge overlapping/adjacent spans, clamped to the code bounds.
+    const spans = highlights
+        .map(function(h) { return {start: Math.max(0, h.start | 0), end: Math.min(code.length, h.end | 0)}; })
+        .filter(function(s) { return s.end > s.start; })
+        .sort(function(a, b) { return a.start - b.start; });
+    if (!spans.length) return escapeHtml(code);
+    const merged = [spans[0]];
+    for (let i = 1; i < spans.length; i++) {
+        const last = merged[merged.length - 1];
+        if (spans[i].start <= last.end) last.end = Math.max(last.end, spans[i].end);
+        else merged.push(spans[i]);
+    }
+    let html = '';
+    let cursor = 0;
+    const MARK = '<mark class="ev-code-hl" style="background:#f59e0b;color:#111827;border-radius:2px;padding:0 1px;">';
+    for (const s of merged) {
+        if (s.start > cursor) html += escapeHtml(code.slice(cursor, s.start));
+        html += MARK + escapeHtml(code.slice(s.start, s.end)) + '</mark>';
+        cursor = s.end;
+    }
+    if (cursor < code.length) html += escapeHtml(code.slice(cursor));
+    return html;
+}
+window.evHighlightCode = evHighlightCode;
+
 function ensureModal() {
     if (_modalRoot) return;
     const frag = document.createElement('div');
@@ -110,6 +142,12 @@ function closeModal() {
 
 function openModal() {
     ensureModal();
+    const header = document.getElementById('ev-approval-agent');
+    if (window.EvonicNotify && !header.parentNode.querySelector('[data-ev-notify-prompt]')) {
+        const prompt = window.EvonicNotify.promptElement(
+            'mt-1 text-xs text-indigo-600 dark:text-indigo-400 hover:underline');
+        if (prompt) header.after(prompt);
+    }
     _open = true;
     _modalRoot.classList.remove('hidden');
     requestAnimationFrame(function() {
@@ -161,7 +199,19 @@ function populateModal(data) {
     const codeBlock = document.getElementById('ev-approval-code-block');
     if (codeSnippet) {
         codeBlock.classList.remove('hidden');
-        document.getElementById('ev-approval-code').textContent = String(codeSnippet);
+        const codeEl = document.getElementById('ev-approval-code');
+        codeEl.innerHTML = evHighlightCode(codeSnippet, info.highlights);
+        // Center the first dangerous span within the scrollable <pre> only — avoid
+        // scrollIntoView, which could scroll the outer modal/page instead.
+        requestAnimationFrame(function() {
+            const mark = codeEl.querySelector('.ev-code-hl');
+            const pre = codeEl.parentElement;
+            if (mark && pre) {
+                const preRect = pre.getBoundingClientRect();
+                const markRect = mark.getBoundingClientRect();
+                pre.scrollTop += (markRect.top - preRect.top) - pre.clientHeight / 2 + markRect.height / 2;
+            }
+        });
     } else {
         codeBlock.classList.add('hidden');
     }
@@ -252,11 +302,135 @@ document.addEventListener('evonic:approval-resolved', function(e) {
     var _enabled = false;
     var _realtimeHandlersBound = false;
 
+    // --- Polling safety-net -------------------------------------------------
+    // SSE 'approval_required' delivery is best-effort: a single dropped event
+    // (ring overflow, producer race, transient stall) leaves the modal missing
+    // for the whole 300s the agent blocks. This poll guarantees the modal shows
+    // regardless of SSE. It runs only while the tab is visible AND at least one
+    // agent is busy (an approval-blocked agent stays busy for its whole turn),
+    // so it costs nothing when the workspace is idle.
+    var POLL_INTERVAL_MS = 3000;   // pending-approval poll cadence while busy
+    var BUSY_REFRESH_MS = 9000;    // server busy-state refresh cadence (SSE-independent)
+    var _pollTimer = null;
+    var _busyAgents = {};          // agent_id -> true
+    var _lastBusyRefresh = 0;
+
+    function _anyBusy() {
+        for (var k in _busyAgents) { if (_busyAgents[k]) return true; }
+        return false;
+    }
+
+    // Refresh busy state from the server. This is the robustness anchor: busy
+    // detection must NOT depend on the 'status' SSE channel, because the exact
+    // failure this poll guards against (SSE not delivering) also drops the
+    // agent_busy_changed events. Polling /api/agents/busy on a slow cadence means
+    // we still learn an agent is busy — and then start polling for its approval —
+    // even when SSE is fully dead. Returns a promise so the tick can chain on it.
+    function _refreshBusy() {
+        _lastBusyRefresh = Date.now();
+        return fetch('/api/agents/busy', { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                _busyAgents = {};
+                if (d && d.busy) {
+                    Object.keys(d.busy).forEach(function (aid) { _busyAgents[aid] = true; });
+                }
+            })
+            .catch(function () {});
+    }
+
+    function _fetchPending() {
+        return fetch('/api/approvals/pending', { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (!d) return;
+                var pend = d.pending || [];
+                var ids = {};
+                pend.forEach(function (p) { if (p.approval_id) ids[p.approval_id] = p; });
+                // Close a modal whose approval is no longer pending — covers a
+                // missed 'approval_resolved' event and server-side timeout.
+                if (_open && _currentData && _currentData.approval_id &&
+                    !ids[_currentData.approval_id]) {
+                    closeModal();
+                    return;
+                }
+                // Open the modal for a pending approval that isn't shown yet —
+                // covers a missed 'approval_required' event.
+                if (!_open && pend.length > 0) {
+                    _currentData = pend[0];
+                    populateModal(pend[0]);
+                    openModal();
+                }
+            })
+            .catch(function () {});
+    }
+
+    // Timer tick. Two cadences:
+    //  • Slow (BUSY_REFRESH_MS): an SSE-independent safety sweep — refresh busy
+    //    state AND check pending approvals UNCONDITIONALLY. This is what makes the
+    //    net truly robust: an approval is caught even if SSE is dead and even if
+    //    the agent's busy flag lapsed (e.g. a long turn whose 600s busy-TTL
+    //    expired while it sat blocked on the approval).
+    //  • Fast (POLL_INTERVAL_MS): while an agent is busy or a modal is open, poll
+    //    pending so the modal appears/closes within ~3s.
+    // Idle + visible costs two tiny in-memory reads every ~9s; nothing when hidden.
+    function _pollPending() {
+        if (document.visibilityState !== 'visible') return;
+        if ((Date.now() - _lastBusyRefresh) >= BUSY_REFRESH_MS) {
+            _refreshBusy().then(_fetchPending);
+            return;
+        }
+        if (_anyBusy() || _open) _fetchPending();
+    }
+
+    function _startPoll() {
+        if (_pollTimer) return;
+        _refreshBusy();
+        _pollTimer = setInterval(_pollPending, POLL_INTERVAL_MS);
+    }
+
+    function _stopPoll() {
+        if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+    }
+
+    function _bindBusyTracking(rt) {
+        // Track agent busy/idle from the shared 'status' channel so the poll
+        // only fires while a turn is in progress.
+        rt.on('status', 'agent_busy_changed', function (data) {
+            if (!data || !data.agent_id) return;
+            if (data.busy) _busyAgents[data.agent_id] = true;
+            else delete _busyAgents[data.agent_id];
+        });
+    }
+
     function _connectSSE() {
         if (!_enabled) return;
         if (_sse) return;
 
-        // Use RealtimeClient if available
+        // Use shared RealtimeClient if available (consolidated singleton)
+        if (typeof getSharedRealtime !== 'undefined') {
+            var rt = getSharedRealtime();
+            if (!_realtimeHandlersBound) {
+                rt.on('approvals', 'approval_required', function(data) {
+                    if (!data.approval_id) return;
+                    _currentData = data;
+                    populateModal(data);
+                    openModal();
+                });
+                rt.on('approvals', 'approval_resolved', function(data) {
+                    if (_currentData && data.approval_id === _currentData.approval_id) {
+                        closeModal();
+                    }
+                });
+                _bindBusyTracking(rt);
+                _realtimeHandlersBound = true;
+            }
+            // Shared connection — lifecycle managed by getSharedRealtime()
+            _sse = { close: function() { /* shared */ } };
+            return;
+        }
+
+        // Fallback: standalone RealtimeClient
         if (typeof RealtimeClient !== 'undefined') {
             var rt = window._evApprovalRT = window._evApprovalRT || new RealtimeClient({
                 channels: 'approvals'
@@ -319,12 +493,14 @@ document.addEventListener('evonic:approval-resolved', function(e) {
 
     function _startSSE() {
         _enabled = true;
+        _startPoll();   // pull-based safety-net, independent of the SSE connection
         if (_sse) return;
         _connectSSE();
     }
 
     function _closeSSE() {
         _enabled = false;
+        _stopPoll();
         if (_reconnectTimer) {
             clearTimeout(_reconnectTimer);
             _reconnectTimer = null;
@@ -345,6 +521,7 @@ document.addEventListener('evonic:approval-resolved', function(e) {
     document.addEventListener('visibilitychange', function() {
         if (document.visibilityState === 'visible') {
             _startSSE();
+            _refreshBusy();   // refresh busy state after being backgrounded
         }
     });
     window.addEventListener('pagehide', _closeSSE);

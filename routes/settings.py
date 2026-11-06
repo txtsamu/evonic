@@ -1,11 +1,16 @@
+import json
 import logging
+import math
 import os
+import queue
 import re
 from typing import Dict, Any
 
-from flask import Blueprint, render_template, jsonify, request
+from flask import Blueprint, render_template, jsonify, request, Response, stream_with_context
 
+from backend.audit_logger import audit
 import config
+from models.boolean import FALSE_VALUES, TRUE_VALUES
 from models.db import db
 
 _logger = logging.getLogger(__name__)
@@ -15,6 +20,15 @@ settings_bp = Blueprint('settings', __name__)
 _SENSITIVE_MODEL_KEYS = frozenset({'api_key'})
 
 
+def _audit_setting_change(key, old_val, new_val):
+    """Log a setting change if old and new values differ."""
+    ip = request.remote_addr or ''
+    old_str = str(old_val)[:500] if old_val is not None else ''
+    new_str = str(new_val)[:500]
+    if old_str != new_str:
+        audit.log_setting_change(user_id='admin', key=key, old_value=old_str, new_value=new_str, ip=ip)
+
+
 def _sanitize_model(model: Dict[str, Any]) -> Dict[str, Any]:
     """Strip sensitive fields (api_key) from a model dict before API response."""
     for key in _SENSITIVE_MODEL_KEYS:
@@ -22,10 +36,53 @@ def _sanitize_model(model: Dict[str, Any]) -> Dict[str, Any]:
     return model
 
 
+def _coerce_boolean(value: Any) -> bool:
+    """Convert an API boolean value, rejecting ambiguous input."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUE_VALUES:
+            return True
+        if normalized in FALSE_VALUES:
+            return False
+    raise ValueError('must be a boolean')
+
+
+def _decim_settings_public(settings) -> Dict[str, Any]:
+    """Serialize provider-neutral Decim Safety settings (never transport data)."""
+    return {
+        'enabled': settings.enabled,
+        'mode': settings.mode,
+        'model_id': settings.model_id,
+        'request_timeout_ms': settings.request_timeout_ms,
+        'minimum_confidence': settings.minimum_confidence,
+        'max_payload_chars': settings.max_payload_chars,
+        'circuit_breaker_failures': settings.circuit_breaker_failures,
+        'circuit_breaker_cooldown_seconds': settings.circuit_breaker_cooldown_seconds,
+        'record_enforce_events': settings.record_enforce_events,
+        'hmads_floor': getattr(settings, 'hmads_floor', False),
+        'retention_days': settings.retention_days,
+    }
+
+
 @settings_bp.route('/system')
 def settings():
     """System page - manage tests"""
     return render_template('settings.html')
+
+
+@settings_bp.route('/system/safety')
+def safety_page():
+    """Consolidated Safety administration page (General / HMADS / DMSS).
+
+    Single entry point under System > Safety: the General tab explains the
+    HMADS-only vs DMSS-enabled policy choice, the HMADS tab hosts the
+    deterministic safety-rules CRUD, and the DMSS tab hosts the Decim Safety
+    dashboard. Legacy routes (/system#hmads, /system/decim-safety) redirect
+    here.
+    """
+    return render_template('safety.html')
 
 
 @settings_bp.route('/system/models')
@@ -255,9 +312,34 @@ def api_list_tools():
     from evaluator.test_manager import test_manager
     from backend.skills_manager import skills_manager
     from backend.tools import tool_registry
-    # Built-in tools always appear first
-    tools = tool_registry.get_builtin_tool_defs()
+    from backend.tools.agent_messaging import get_agent_messaging_tool_defs
+
+    agent_context = None
+    agent_id = request.args.get('agent_id')
+    if agent_id:
+        agent = db.get_agent(agent_id)
+        if not agent:
+            return jsonify({'error': 'Agent not found'}), 404
+        agent_context = {
+            'id': agent['id'],
+            'enable_cmp': bool(agent.get('enable_cmp')) and bool(agent.get('enable_agent_state')),
+            'always_execute': bool(agent.get('always_execute')),
+            'workplace_switch_enabled': bool(agent.get('workplace_switch_enabled')),
+        }
+
+    # Built-ins are filtered by the selected agent's feature settings when supplied.
+    tools = tool_registry.get_builtin_tool_defs(agent_context)
     tools += test_manager.list_tools()
+    # Append agent messaging tools (auto-loaded when agent_messaging_enabled)
+    for tool_def in get_agent_messaging_tool_defs():
+        func = tool_def.get('function', {})
+        tools.append({
+            'id': func.get('name', ''),
+            'name': func.get('name', ''),
+            'description': func.get('description', ''),
+            'function': func,
+            '_auto_loaded': True,
+        })
     # Append ALL skill tool definitions (no dedup — namespaced IDs disambiguate)
     for skill_def in skills_manager.get_all_skill_tool_defs():
         func = skill_def.get('function', {})
@@ -267,6 +349,17 @@ def api_list_tools():
             'description': func.get('description', ''),
             'function': func,
             '_skill_id': skill_def.get('_skill_id', ''),
+        })
+    # Append plugin tool definitions (namespaced: plugin:plugin_id:fn_name)
+    from backend.plugin_manager import plugin_manager
+    for plugin_def in plugin_manager.get_all_plugin_tool_defs():
+        func = plugin_def.get('function', {})
+        tools.append({
+            'id': plugin_def.get('id', ''),
+            'name': func.get('name', ''),
+            'description': func.get('description', ''),
+            'function': func,
+            '_plugin_id': plugin_def.get('_plugin_id', ''),
         })
     return jsonify({'tools': tools})
 
@@ -289,6 +382,21 @@ def api_get_tool(tool_id):
                     'function': func,
                     '_skill_id': skill_def.get('_skill_id', ''),
                     'no_mock': skill_def.get('no_mock', False),
+                }
+                break
+    if not tool and tool_id.startswith('plugin:'):
+        # Look up plugin tool from plugin_manager
+        from backend.plugin_manager import plugin_manager
+        for plugin_def in plugin_manager.get_all_plugin_tool_defs():
+            if plugin_def.get('id') == tool_id:
+                func = plugin_def.get('function', {})
+                tool = {
+                    'id': plugin_def.get('id', ''),
+                    'name': func.get('name', ''),
+                    'description': func.get('description', ''),
+                    'function': func,
+                    '_plugin_id': plugin_def.get('_plugin_id', ''),
+                    'no_mock': plugin_def.get('no_mock', False),
                 }
                 break
     if not tool:
@@ -354,6 +462,18 @@ def api_get_tool_backend(tool_id):
             return jsonify({'error': 'Invalid skill tool ID'}), 400
         _, skill_id, fn_name = parts
         backend_path = skills_manager.find_tool_backend_path(fn_name, skill_id=skill_id)
+        if backend_path and os.path.isfile(backend_path):
+            with open(backend_path, 'r', encoding='utf-8') as f:
+                return jsonify({'code': f.read(), 'exists': True})
+        return jsonify({'code': '', 'exists': False})
+
+    if tool_id.startswith('plugin:'):
+        from backend.plugin_manager import plugin_manager
+        parts = tool_id.split(':', 2)
+        if len(parts) != 3:
+            return jsonify({'error': 'Invalid plugin tool ID'}), 400
+        _, plugin_id, fn_name = parts
+        backend_path, _pid = plugin_manager.find_plugin_tool_backend(fn_name, plugin_id=plugin_id)
         if backend_path and os.path.isfile(backend_path):
             with open(backend_path, 'r', encoding='utf-8') as f:
                 return jsonify({'code': f.read(), 'exists': True})
@@ -486,10 +606,41 @@ def api_two_pass_enabled():
     if request.method == 'PUT':
         data = request.get_json() or {}
         enabled = '1' if data.get('enabled', False) else '0'
+        old_val = db.get_setting('two_pass_enabled', default)
         db.set_setting('two_pass_enabled', enabled)
+        _audit_setting_change('two_pass_enabled', old_val, enabled)
         return jsonify({'success': True, 'enabled': enabled == '1'})
     val = db.get_setting('two_pass_enabled', default)
     return jsonify({'enabled': val == '1'})
+
+
+@settings_bp.route('/api/settings/two-factor-auth', methods=['GET', 'PUT'])
+def api_two_factor_auth():
+    """Get or update TOTP enforcement, respecting the environment override."""
+    from backend import totp
+
+    effective, overridden = totp.get_enabled_state()
+    configured = totp.is_configured()
+    stored = db.get_setting('two_factor_auth_enabled', '0') == '1'
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        try:
+            enabled = _coerce_boolean(data.get('enabled'))
+        except ValueError:
+            return jsonify({'success': False, 'error': 'enabled must be a boolean'}), 400
+        old_val = db.get_setting('two_factor_auth_enabled', '0')
+        new_val = '1' if enabled else '0'
+        db.set_setting('two_factor_auth_enabled', new_val)
+        _audit_setting_change('two_factor_auth_enabled', old_val, new_val)
+        stored = enabled
+        effective, overridden = totp.get_enabled_state()
+    return jsonify({
+        'success': True,
+        'enabled': effective,
+        'stored_enabled': stored,
+        'env_override': overridden,
+        'configured': configured,
+    })
 
 
 @settings_bp.route('/api/settings/public-history', methods=['GET', 'PUT'])
@@ -499,7 +650,9 @@ def api_public_history():
     if request.method == 'PUT':
         data = request.get_json()
         enabled = '1' if data.get('enabled', False) else '0'
+        old_val = db.get_setting('public_history', '0')
         db.set_setting('public_history', enabled)
+        _audit_setting_change('public_history', old_val, enabled)
         return jsonify({'success': True, 'enabled': enabled == '1'})
     val = db.get_setting('public_history', '0')
     return jsonify({'enabled': val == '1'})
@@ -511,8 +664,83 @@ def api_long_running_guard():
     from models.db import db
     data = request.get_json()
     enabled = '1' if data.get('enabled', True) else '0'
+    old_val = db.get_setting('long_running_guard_enabled', '1' if config.LONG_RUNNING_GUARD_ENABLED else '0')
     db.set_setting('long_running_guard_enabled', enabled)
+    _audit_setting_change('long_running_guard_enabled', old_val, enabled)
     return jsonify({'success': True, 'enabled': enabled == '1'})
+
+
+@settings_bp.route('/api/settings/root-fs-scan-guard', methods=['GET', 'PUT'])
+def api_root_fs_scan_guard():
+    """Toggle the root filesystem scan guard (`find /`, `tree /` approval prompt)."""
+    from models.db import db
+    default = '1' if config.ROOT_FS_SCAN_GUARD_ENABLED else '0'
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        enabled = '1' if data.get('enabled', True) else '0'
+        old_val = db.get_setting('root_fs_scan_guard_enabled', default)
+        db.set_setting('root_fs_scan_guard_enabled', enabled)
+        _audit_setting_change('root_fs_scan_guard_enabled', old_val, enabled)
+        return jsonify({'success': True, 'enabled': enabled == '1'})
+    val = db.get_setting('root_fs_scan_guard_enabled', default)
+    return jsonify({'enabled': val == '1'})
+
+
+@settings_bp.route('/api/settings/decim-safety', methods=['GET', 'PUT'])
+def api_decim_safety_settings():
+    """Read or update Decim Safety settings.
+
+    ``model_id`` must reference an enabled decision model whose provider speaks
+    a protocol DMSS supports; an empty string clears the selection.
+    """
+    from models.db import db
+    from backend.tools.lib.decim_safety import (
+        DMSS_ADAPTER_KEYS, load_decim_settings, validate_decim_settings, save_decim_settings,
+    )
+
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        current = load_decim_settings()
+        model_id = current.model_id
+        if 'model_id' in data:
+            submitted = data.get('model_id')
+            if not isinstance(submitted, str):
+                return jsonify({'success': False, 'error': 'model_id must be a string'}), 400
+            model_id = submitted.strip()
+            if model_id:
+                model = db.get_model_by_id(model_id)
+                if not model or model.get('type') != 'decision':
+                    return jsonify({'success': False, 'error': 'model_id must reference a decision model'}), 400
+                route = db.resolve_model_route(model['id'])
+                if route is None or route.provider.adapter_key.value not in DMSS_ADAPTER_KEYS:
+                    return jsonify({'success': False, 'error': "the model's provider must use a protocol DMSS supports"}), 400
+                model_id = model['id']
+        merged = {
+            'enabled': data.get('enabled', current.enabled),
+            'mode': data.get('mode', current.mode),
+            'model_id': model_id,
+            'request_timeout_ms': data.get('request_timeout_ms', current.request_timeout_ms),
+            'minimum_confidence': data.get('minimum_confidence', current.minimum_confidence),
+            'max_payload_chars': data.get('max_payload_chars', current.max_payload_chars),
+            'circuit_breaker_failures': data.get('circuit_breaker_failures', current.circuit_breaker_failures),
+            'circuit_breaker_cooldown_seconds': data.get('circuit_breaker_cooldown_seconds', current.circuit_breaker_cooldown_seconds),
+            'record_enforce_events': data.get('record_enforce_events', current.record_enforce_events),
+            'hmads_floor': data.get('hmads_floor', getattr(current, 'hmads_floor', False)),
+            'retention_days': data.get('retention_days', current.retention_days),
+        }
+        try:
+            validated = validate_decim_settings(merged)
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
+        old = {key: getattr(current, key) for key in merged}
+        save_decim_settings(validated)
+        for key in merged:
+            before = old[key]
+            after = getattr(validated, key)
+            _audit_setting_change(f'decim_safety.{key}', before, after)
+        return jsonify({'success': True, 'settings': _decim_settings_public(validated)})
+
+    return jsonify({'settings': _decim_settings_public(load_decim_settings())})
 
 
 @settings_bp.route('/api/settings/message-wrapper', methods=['PUT'])
@@ -521,7 +749,9 @@ def api_message_wrapper():
     from models.db import db
     data = request.get_json()
     enabled = '1' if data.get('enabled', True) else '0'
+    old_val = db.get_setting('message_wrapper_enabled', '1')
     db.set_setting('message_wrapper_enabled', enabled)
+    _audit_setting_change('message_wrapper_enabled', old_val, enabled)
     return jsonify({'success': True, 'enabled': enabled == '1'})
 
 
@@ -629,6 +859,21 @@ def api_max_tool_iterations():
     return jsonify({'value': int(val)})
 
 
+@settings_bp.route('/api/settings/max-goal-nudges', methods=['GET', 'PUT'])
+def api_max_goal_nudges():
+    """Get or set the maximum goal-continuation nudges per active `/goal` (0-50)."""
+    from backend.active_goal import normalize_max_goal_nudges
+    from models.db import db
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        raw_value = data.get('value', config.AGENT_MAX_GOAL_NUDGES)
+        value = normalize_max_goal_nudges(raw_value)
+        db.set_setting('max_goal_nudges', str(value))
+        return jsonify({'success': True, 'value': value})
+    val = db.get_setting('max_goal_nudges', str(config.AGENT_MAX_GOAL_NUDGES))
+    return jsonify({'value': normalize_max_goal_nudges(val)})
+
+
 @settings_bp.route('/api/settings/events-dispatch', methods=['GET', 'PUT'])
 def api_events_dispatch():
     """Get or set the global events dispatch toggle."""
@@ -636,7 +881,9 @@ def api_events_dispatch():
     if request.method == 'PUT':
         data = request.get_json()
         enabled = '1' if data.get('enabled', True) else '0'
+        old_val = db.get_setting('events_dispatch_enabled', '1')
         db.set_setting('events_dispatch_enabled', enabled)
+        _audit_setting_change('events_dispatch_enabled', old_val, enabled)
         return jsonify({'success': True, 'enabled': enabled == '1'})
     val = db.get_setting('events_dispatch_enabled', '1')
     return jsonify({'enabled': val == '1'})
@@ -651,7 +898,9 @@ def api_theme():
         theme = data.get('theme', 'system')
         if theme not in ('light', 'dark', 'system'):
             theme = 'system'
+        old_val = db.get_setting('theme', 'system')
         db.set_setting('theme', theme)
+        _audit_setting_change('theme', old_val, theme)
         return jsonify({'success': True, 'theme': theme})
     val = db.get_setting('theme', 'system')
     return jsonify({'theme': val})
@@ -670,8 +919,14 @@ def api_task_classifier():
             model = db.get_model_by_id(model_id)
             if not model:
                 return jsonify({'success': False, 'error': 'Model not found'}), 404
+            model_id = model['id']  # canonicalize legacy ids
         db.set_setting('task_classifier_enabled', enabled)
         db.set_setting('task_classifier_model_id', model_id)
+        old_enabled = db.get_setting('task_classifier_enabled', default_enabled)
+        old_model_id = db.get_setting('task_classifier_model_id', '')
+        _audit_setting_change('task_classifier_enabled', old_enabled, enabled)
+        if old_model_id != model_id:
+            _audit_setting_change('task_classifier_model_id', old_model_id, model_id)
         return jsonify({
             'success': True,
             'enabled': enabled == '1',
@@ -683,6 +938,28 @@ def api_task_classifier():
         'enabled': enabled == '1',
         'model_id': model_id or None,
     })
+
+
+@settings_bp.route('/api/settings/cmp-model', methods=['GET', 'PUT'])
+def api_cmp_model():
+    """Get or set the model used by CMP (Context Memory Path): path-change
+    boundary detection and path card summarization. Empty = fall back to
+    the Task Classifier model, then the default model."""
+    from models.db import db
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        model_id = data.get('model_id', '') or ''
+        if model_id:
+            model = db.get_model_by_id(model_id)
+            if not model:
+                return jsonify({'success': False, 'error': 'Model not found'}), 404
+            model_id = model['id']  # canonicalize legacy ids
+        old_model_id = db.get_setting('cmp_model_id', '')
+        db.set_setting('cmp_model_id', model_id)
+        if old_model_id != model_id:
+            _audit_setting_change('cmp_model_id', old_model_id, model_id)
+        return jsonify({'success': True, 'model_id': model_id or None})
+    return jsonify({'model_id': db.get_setting('cmp_model_id', '') or None})
 
 
 # ---- Default Model operations ----
@@ -707,12 +984,17 @@ def api_set_default_model():
     model = db.get_model_by_id(model_id)
     if not model:
         return jsonify({'success': False, 'error': 'Model not found'}), 404
+    if model.get('type') == 'decision':
+        return jsonify({'success': False, 'error': 'a decision model cannot be the default chat model'}), 400
     
     try:
+        old_model = db.get_default_model()
+        old_id = old_model.get('id', '') if old_model else ''
         with db._connect() as conn:
             conn.execute("UPDATE llm_models SET is_default = 0")
-            conn.execute("UPDATE llm_models SET is_default = 1 WHERE id = ?", (model_id,))
+            conn.execute("UPDATE llm_models SET is_default = 1 WHERE id = ?", (model['id'],))
             conn.commit()
+        _audit_setting_change('default_model', old_id, model['id'])
         return jsonify({'success': True, 'model': _sanitize_model(db.get_default_model())})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -727,6 +1009,8 @@ def api_get_general_settings():
         'public_history': db.get_setting('public_history', '0') == '1',
         'long_running_guard_enabled': db.get_setting('long_running_guard_enabled',
                                                      '1' if config.LONG_RUNNING_GUARD_ENABLED else '0') == '1',
+        'root_fs_scan_guard_enabled': db.get_setting('root_fs_scan_guard_enabled',
+                                                     '1' if config.ROOT_FS_SCAN_GUARD_ENABLED else '0') == '1',
         'message_wrapper_enabled': db.get_setting('message_wrapper_enabled', '1') == '1',
         'agent_timeout_retries': int(db.get_setting('agent_timeout_retries', str(config.AGENT_TIMEOUT_RETRIES))),
         'llm_max_retries': int(db.get_setting('llm_max_retries', '5')),
@@ -735,8 +1019,35 @@ def api_get_general_settings():
         'max_concurrent_llm_global': int(db.get_setting('max_concurrent_llm_global', '1')),
         'agent_queue_workers': int(db.get_setting('agent_queue_workers', str(config.AGENT_QUEUE_WORKERS))),
         'max_tool_iterations': int(db.get_setting('max_tool_iterations', str(config.AGENT_MAX_TOOL_ITERATIONS))),
+        'max_goal_nudges': int(db.get_setting('max_goal_nudges', str(config.AGENT_MAX_GOAL_NUDGES))),
         'agent_sidebar_limit': int(db.get_setting('agent_sidebar_limit', str(config.AGENT_SIDEBAR_LIMIT))),
         'theme': db.get_setting('theme', 'system'),
+        'default_model_fallback_id': db.get_setting('default_model_fallback_id', ''),
+        'vision_model_id': db.get_setting('vision_model_id', ''),
+        'vision_fallback_model_id': db.get_setting('vision_fallback_model_id', ''),
+        'vision_fallback_model_2_id': db.get_setting('vision_fallback_model_2_id', ''),
+        'kb_organizer_model_id': db.get_setting('kb_organizer_model_id', ''),
+        'kb_organizer_nightly_time': db.get_setting(
+            'kb_organizer_nightly_time',
+            os.getenv('EVOMEM_KB_ORGANIZER_NIGHTLY_TIME', '03:00'),
+        ),
+        # ── WhatsApp Safe Delivery (global) ──
+        'whatsapp_safe_delivery_enabled': db.get_setting('whatsapp_safe_delivery_enabled',
+                                                         '1' if config.WHATSAPP_SAFE_DELIVERY_ENABLED else '0') == '1',
+        'whatsapp_pool_window_seconds': float(db.get_setting('whatsapp_pool_window_seconds',
+                                                             str(config.WHATSAPP_POOL_WINDOW_SECONDS))),
+        'whatsapp_min_send_interval_seconds': float(db.get_setting('whatsapp_min_send_interval_seconds',
+                                                                    str(config.WHATSAPP_MIN_SEND_INTERVAL_SECONDS))),
+        'whatsapp_typing_chars_per_second': float(db.get_setting('whatsapp_typing_chars_per_second',
+                                                                  str(config.WHATSAPP_TYPING_CHARS_PER_SECOND))),
+        'whatsapp_max_typing_delay_seconds': float(db.get_setting('whatsapp_max_typing_delay_seconds',
+                                                                   str(config.WHATSAPP_MAX_TYPING_DELAY_SECONDS))),
+        'whatsapp_delay_jitter_ratio': float(db.get_setting('whatsapp_delay_jitter_ratio',
+                                                            str(config.WHATSAPP_DELAY_JITTER_RATIO))),
+        'whatsapp_max_outbound_per_minute': int(db.get_setting('whatsapp_max_outbound_per_minute',
+                                                               str(config.WHATSAPP_MAX_OUTBOUND_PER_MINUTE))),
+        'whatsapp_natural_formatting_enabled': db.get_setting('whatsapp_natural_formatting_enabled',
+                                                               '1' if config.WHATSAPP_NATURAL_FORMATTING_ENABLED else '0') == '1',
     })
 
 
@@ -842,6 +1153,16 @@ def api_batch_save():
         except (ValueError, TypeError) as e:
             errors.append(f'max_tool_iterations: {e}')
 
+    # Max Goal Nudges
+    if 'max_goal_nudges' in settings:
+        try:
+            from backend.active_goal import normalize_max_goal_nudges
+            value = normalize_max_goal_nudges(settings['max_goal_nudges'])
+            db.set_setting('max_goal_nudges', str(value))
+            results['max_goal_nudges'] = value
+        except (ValueError, TypeError) as e:
+            errors.append(f'max_goal_nudges: {e}')
+
     # Agent Sidebar Limit
     if 'agent_sidebar_limit' in settings:
         try:
@@ -869,6 +1190,18 @@ def api_batch_save():
         except (ValueError, TypeError) as e:
             errors.append(f'long_running_guard_enabled: {e}')
 
+    # Root Filesystem Scan Guard
+    if 'root_fs_scan_guard_enabled' in settings:
+        try:
+            enabled = '1' if settings['root_fs_scan_guard_enabled'] else '0'
+            old_val = db.get_setting('root_fs_scan_guard_enabled',
+                                     '1' if config.ROOT_FS_SCAN_GUARD_ENABLED else '0')
+            db.set_setting('root_fs_scan_guard_enabled', enabled)
+            _audit_setting_change('root_fs_scan_guard_enabled', old_val, enabled)
+            results['root_fs_scan_guard_enabled'] = enabled == '1'
+        except (ValueError, TypeError) as e:
+            errors.append(f'root_fs_scan_guard_enabled: {e}')
+
     # Message Wrapper
     if 'message_wrapper_enabled' in settings:
         try:
@@ -878,19 +1211,136 @@ def api_batch_save():
         except (ValueError, TypeError) as e:
             errors.append(f'message_wrapper_enabled: {e}')
 
+    # ── WhatsApp Safe Delivery (global) ──
+    _whatsapp_bool_keys = ('whatsapp_safe_delivery_enabled', 'whatsapp_natural_formatting_enabled')
+    for key in _whatsapp_bool_keys:
+        if key in settings:
+            try:
+                enabled = '1' if _coerce_boolean(settings[key]) else '0'
+                db.set_setting(key, enabled)
+                results[key] = enabled == '1'
+            except (ValueError, TypeError) as e:
+                errors.append(f'{key}: {e}')
+
+    _whatsapp_float_keys = (
+        ('whatsapp_pool_window_seconds', 0.1, 30.0),
+        ('whatsapp_min_send_interval_seconds', 0.1, 60.0),
+        ('whatsapp_typing_chars_per_second', 1.0, 100.0),
+        ('whatsapp_max_typing_delay_seconds', 1.0, 120.0),
+        ('whatsapp_delay_jitter_ratio', 0.0, 0.5),
+    )
+    for key, lo, hi in _whatsapp_float_keys:
+        if key in settings:
+            try:
+                value = float(settings[key])
+                if not math.isfinite(value):
+                    raise ValueError('must be a finite number')
+                value = max(lo, min(hi, value))
+                db.set_setting(key, str(value))
+                results[key] = value
+            except (ValueError, TypeError) as e:
+                errors.append(f'{key}: {e}')
+
+    if 'whatsapp_max_outbound_per_minute' in settings:
+        try:
+            value = max(1, min(600, int(settings['whatsapp_max_outbound_per_minute'])))
+            db.set_setting('whatsapp_max_outbound_per_minute', str(value))
+            results['whatsapp_max_outbound_per_minute'] = value
+        except (ValueError, TypeError) as e:
+            errors.append(f'whatsapp_max_outbound_per_minute: {e}')
+
     # Default Model
     if 'default_model_id' in settings:
         model_id = settings['default_model_id']
         if model_id:
             model = db.get_model_by_id(model_id)
-            if model:
+            if model and model.get('type') == 'decision':
+                errors.append('default_model_id: a decision model cannot be the default chat model')
+            elif model:
                 with db._connect() as conn:
                     conn.execute("UPDATE llm_models SET is_default = 0")
-                    conn.execute("UPDATE llm_models SET is_default = 1 WHERE id = ?", (model_id,))
+                    conn.execute("UPDATE llm_models SET is_default = 1 WHERE id = ?", (model['id'],))
                     conn.commit()
-                results['default_model_id'] = model_id
+                results['default_model_id'] = model['id']
             else:
                 errors.append('default_model_id: Model not found')
+
+    # Global default-model fallback. An empty value disables the fallback.
+    if 'default_model_fallback_id' in settings:
+        model_id = settings['default_model_fallback_id'] or ''
+        if model_id:
+            model = db.get_model_by_id(model_id)
+            if model:
+                db.set_setting('default_model_fallback_id', model['id'])
+                results['default_model_fallback_id'] = model['id']
+            else:
+                errors.append('default_model_fallback_id: Model not found')
+        else:
+            db.set_setting('default_model_fallback_id', '')
+            results['default_model_fallback_id'] = ''
+
+    # Vision routing chain (primary + two fallbacks)
+    vision_setting_keys = (
+        'vision_model_id',
+        'vision_fallback_model_id',
+        'vision_fallback_model_2_id',
+    )
+    if any(key in settings for key in vision_setting_keys):
+        vision_ids = {
+            key: settings.get(key, db.get_setting(key, ''))
+            for key in vision_setting_keys
+        }
+        duplicate_vision_ids = {
+            model_id for model_id in vision_ids.values() if model_id
+            and list(vision_ids.values()).count(model_id) > 1
+        }
+        for key in vision_setting_keys:
+            if key not in settings:
+                continue
+            model_id = vision_ids[key]
+            if model_id in duplicate_vision_ids:
+                errors.append(f'{key}: Must differ from the other configured vision models')
+                continue
+            if model_id:
+                model = db.get_model_by_id(model_id)
+                if model and model.get('vision_supported'):
+                    db.set_setting(key, model['id'])
+                    results[key] = model['id']
+                elif model:
+                    errors.append(f'{key}: Model does not support vision')
+                else:
+                    errors.append(f'{key}: Model not found')
+            else:
+                db.set_setting(key, '')
+                results[key] = ''
+
+    # KB Organizer Model — global default for the KB organizer background sub-agent
+    if 'kb_organizer_model_id' in settings:
+        kb_organizer_model_id = settings['kb_organizer_model_id']
+        if kb_organizer_model_id:
+            model = db.get_model_by_id(kb_organizer_model_id)
+            if model:
+                db.set_setting('kb_organizer_model_id', model['id'])
+                results['kb_organizer_model_id'] = model['id']
+            else:
+                errors.append('kb_organizer_model_id: Model not found')
+        else:
+            # Allow clearing the setting (falls back to env / agent default)
+            db.set_setting('kb_organizer_model_id', '')
+            results['kb_organizer_model_id'] = ''
+
+    # KB Organizer nightly schedule — global time for the Vault Janitor.
+    if 'kb_organizer_nightly_time' in settings:
+        value = str(settings['kb_organizer_nightly_time']).strip()
+        try:
+            from backend.scheduler import scheduler
+            scheduler.refresh_kb_organizer_schedule(value)
+            old_value = db.get_setting('kb_organizer_nightly_time', '')
+            db.set_setting('kb_organizer_nightly_time', value)
+            _audit_setting_change('kb_organizer_nightly_time', old_value, value)
+            results['kb_organizer_nightly_time'] = value
+        except ValueError as e:
+            errors.append(f'kb_organizer_nightly_time: {e}')
 
     if errors:
         return jsonify({
@@ -902,3 +1352,539 @@ def api_batch_save():
 
     return jsonify({'success': True, 'results': results})
 
+
+# ---- User Management (Admin) ----
+
+
+@settings_bp.route('/api/settings/users', methods=['GET'])
+def api_list_users():
+    """List users with search, status filter, sort, status counts and per-user contacts/agents/tags.
+
+    Query params:
+        filter: all | approved | blocked | pending  (default: all)
+        q: free-text search over name, id, notes and contact values
+        sort: active | name | newest  (default: active)
+        limit: int (default: 50, max 200)
+        offset: int (default: 0)
+    """
+    status_filter = request.args.get('filter', 'all')
+    query = (request.args.get('q') or '').strip()
+    sort = request.args.get('sort', 'active')
+    limit = max(1, min(int(request.args.get('limit', 50)), 200))
+    offset = max(int(request.args.get('offset', 0)), 0)
+
+    order_by = {
+        'active': 'u.last_active_at DESC NULLS LAST',
+        'name': 'u.name COLLATE NOCASE ASC',
+        'newest': 'u.created_at DESC',
+    }.get(sort, 'u.last_active_at DESC NULLS LAST')
+
+    base_conditions = ['u.deleted_at IS NULL']
+    base_params = []
+    if query:
+        like = '%' + query + '%'
+        base_conditions.append(
+            "(u.name LIKE ? OR u.id LIKE ? OR u.notes LIKE ? OR EXISTS ("
+            "SELECT 1 FROM user_contacts c WHERE c.user_id = u.id AND c.deleted_at IS NULL "
+            "AND (c.value LIKE ? OR c.external_user_id LIKE ?)))")
+        base_params.extend([like] * 5)
+
+    conditions = list(base_conditions)
+    if status_filter == 'approved':
+        conditions.append('u.is_approved = 1 AND u.blocked_at IS NULL')
+    elif status_filter == 'blocked':
+        conditions.append('u.is_approved = 2')
+    elif status_filter == 'pending':
+        conditions.append('(u.is_approved = 0 OR u.is_approved IS NULL)')
+
+    where = ' AND '.join(conditions)
+    base_where = ' AND '.join(base_conditions)
+
+    with db._connect() as conn:
+        conn.row_factory = db._row_factory
+        cursor = conn.cursor()
+
+        cursor.execute(f"""
+            SELECT u.*,
+                   (SELECT COUNT(*) FROM user_audit_log WHERE user_id = u.id AND action IN ('blocked', 'unblocked')) as audit_count
+            FROM users u
+            WHERE {where}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+        """, base_params + [limit, offset])
+        users = [dict(r) for r in cursor.fetchall()]
+
+        cursor.execute(f'SELECT COUNT(*) FROM users u WHERE {where}', base_params)
+        total = cursor.fetchone()[0]
+
+        # Counts per status for the filter chips (same search, ignoring the status filter)
+        cursor.execute(f"""
+            SELECT COUNT(*) AS all_count,
+                   COALESCE(SUM(CASE WHEN u.is_approved = 1 AND u.blocked_at IS NULL THEN 1 ELSE 0 END), 0) AS approved,
+                   COALESCE(SUM(CASE WHEN u.is_approved = 0 OR u.is_approved IS NULL THEN 1 ELSE 0 END), 0) AS pending,
+                   COALESCE(SUM(CASE WHEN u.is_approved = 2 THEN 1 ELSE 0 END), 0) AS blocked
+            FROM users u WHERE {base_where}
+        """, base_params)
+        row = cursor.fetchone()
+        counts = {'all': row['all_count'], 'approved': row['approved'],
+                  'pending': row['pending'], 'blocked': row['blocked']}
+
+        # Enrich this page with contacts / agents / tags (three small queries, not N+1)
+        for u in users:
+            u['contacts'], u['agents'], u['tags'] = [], [], []
+        if users:
+            by_id = {u['id']: u for u in users}
+            marks = ','.join('?' for _ in users)
+            ids = list(by_id)
+            cursor.execute(
+                "SELECT user_id, channel_type, value, external_user_id, is_primary FROM user_contacts "
+                "WHERE deleted_at IS NULL AND user_id IN (" + marks + ") ORDER BY is_primary DESC, id ASC", ids)
+            for r in cursor.fetchall():
+                by_id[r['user_id']]['contacts'].append({
+                    'channel_type': r['channel_type'], 'value': r['value'],
+                    'external_user_id': r['external_user_id'], 'is_primary': bool(r['is_primary'])})
+            cursor.execute(
+                "SELECT ua.user_id, ua.agent_id, a.name AS agent_name FROM user_agents ua "
+                "LEFT JOIN agents a ON a.id = ua.agent_id "
+                "WHERE ua.removed_at IS NULL AND ua.user_id IN (" + marks + ")", ids)
+            for r in cursor.fetchall():
+                by_id[r['user_id']]['agents'].append({'id': r['agent_id'], 'name': r['agent_name'] or r['agent_id']})
+            cursor.execute(
+                "SELECT user_id, tag FROM user_tags WHERE removed_at IS NULL AND user_id IN (" + marks + ")", ids)
+            for r in cursor.fetchall():
+                by_id[r['user_id']]['tags'].append(r['tag'])
+
+    return jsonify({'users': users, 'total': total, 'counts': counts, 'limit': limit, 'offset': offset})
+
+
+@settings_bp.route('/api/settings/users/<user_id>/approve', methods=['POST'])
+def api_approve_user(user_id):
+    """Approve a pending user (a blocked user is unblocked instead)."""
+    user = db.get_user(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    if user.get('is_approved') == 2:
+        ok = db.unblock_user(user_id, actor_type='admin', actor_id='web_admin')
+    else:
+        ok = db.update_user(user_id, {'is_approved': 1}, actor_type='admin', actor_id='web_admin')
+    if ok:
+        audit.log_user_management(user_id='admin', target_user=user_id, action='approve', ip=request.remote_addr or '')
+        return jsonify({'success': True, 'user_id': user_id})
+    return jsonify({'error': 'Could not approve user'}), 400
+
+
+@settings_bp.route('/api/settings/users/<user_id>', methods=['PUT'])
+def api_update_user(user_id):
+    """Edit a user's display name and notes."""
+    data = request.get_json() or {}
+    updates = {}
+    if 'name' in data:
+        name = str(data.get('name') or '').strip()
+        if not name:
+            return jsonify({'error': 'Name cannot be empty'}), 400
+        updates['name'] = name[:200]
+    if 'notes' in data:
+        updates['notes'] = str(data.get('notes') or '')[:5000]
+    if not updates:
+        return jsonify({'error': 'Nothing to update'}), 400
+    if not db.get_user(user_id):
+        return jsonify({'error': 'User not found'}), 404
+    if db.update_user(user_id, updates, actor_type='admin', actor_id='web_admin'):
+        return jsonify({'success': True, 'user_id': user_id})
+    return jsonify({'error': 'Could not update user'}), 400
+
+
+@settings_bp.route('/api/settings/users/<user_id>', methods=['DELETE'])
+def api_delete_user(user_id):
+    """Soft-delete a user (hidden from the list; history kept)."""
+    if db.soft_delete_user(user_id, actor_type='admin', actor_id='web_admin'):
+        audit.log_user_management(user_id='admin', target_user=user_id, action='delete', ip=request.remote_addr or '')
+        return jsonify({'success': True, 'user_id': user_id})
+    return jsonify({'error': 'User not found'}), 404
+
+
+@settings_bp.route('/api/admin/blocked-users', methods=['GET'])
+def api_blocked_users():
+    """List all blocked users (dedicated endpoint)."""
+    with db._connect() as conn:
+        conn.row_factory = db._row_factory
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT u.*,
+                   (SELECT created_at FROM user_audit_log
+                    WHERE user_id = u.id AND action = 'blocked'
+                    ORDER BY created_at DESC LIMIT 1) as blocked_at_audit,
+                   (SELECT actor_id FROM user_audit_log
+                    WHERE user_id = u.id AND action = 'blocked'
+                    ORDER BY created_at DESC LIMIT 1) as blocked_by
+            FROM users u
+            WHERE u.is_approved = 2 AND u.deleted_at IS NULL
+            ORDER BY u.blocked_at DESC
+        """)
+        users = [dict(r) for r in cursor.fetchall()]
+
+    return jsonify({'users': users, 'total': len(users)})
+
+
+@settings_bp.route('/api/settings/users/<user_id>/block', methods=['POST'])
+def api_block_user(user_id):
+    """Block a user by ID."""
+    data = request.get_json() or {}
+    reason = data.get('reason', '')
+    ok = db.block_user(user_id, reason=reason, actor_type='admin', actor_id='web_admin')
+    if ok:
+        audit.log_user_management(user_id='admin', target_user=user_id, action='block', ip=request.remote_addr or '', detail=reason)
+        return jsonify({'success': True, 'user_id': user_id})
+    return jsonify({'error': 'User not found or already blocked'}), 404
+
+
+@settings_bp.route('/api/settings/users/<user_id>/unblock', methods=['POST'])
+def api_unblock_user(user_id):
+    """Unblock a user by ID."""
+    ok = db.unblock_user(user_id, actor_type='admin', actor_id='web_admin')
+    if ok:
+        audit.log_user_management(user_id='admin', target_user=user_id, action='unblock', ip=request.remote_addr or '')
+        return jsonify({'success': True, 'user_id': user_id})
+    return jsonify({'error': 'User not found or not blocked'}), 404
+
+
+@settings_bp.route('/api/settings/users/<user_id>/audit', methods=['GET'])
+def api_user_audit(user_id):
+    """Get audit log for a specific user."""
+    logs = db.get_audit_log(user_id=user_id)
+    return jsonify({'user_id': user_id, 'audit_logs': logs})
+
+
+
+# ==================== Shared Channels (System Settings → Shared Channel) ====================
+# Shared channels serve multiple agents from one connection (agent_id IS NULL);
+# inbound senders are routed per-user/group via config.routes and unknown
+# senders land in shared_channel_inbox for capture-and-assign.
+
+_SHARED_INBOX_RETENTION_KEY = 'shared_channel_inbox_retention_hours'
+_SHARED_INBOX_RETENTION_DEFAULT_HOURS = 24
+_SHARED_INBOX_RETENTION_MIN_HOURS = 1
+_SHARED_INBOX_RETENTION_MAX_HOURS = 24 * 365
+
+
+def _shared_inbox_retention_hours() -> int:
+    """Return the configured inbox retention, falling back safely to 24 hours."""
+    try:
+        value = int(db.get_setting(
+            _SHARED_INBOX_RETENTION_KEY,
+            str(_SHARED_INBOX_RETENTION_DEFAULT_HOURS),
+        ))
+        return max(_SHARED_INBOX_RETENTION_MIN_HOURS,
+                   min(_SHARED_INBOX_RETENTION_MAX_HOURS, value))
+    except (TypeError, ValueError):
+        return _SHARED_INBOX_RETENTION_DEFAULT_HOURS
+
+
+_SHARED_ACCESS_MODES = {'assigned_only', 'unrestricted'}
+
+
+def _validate_shared_access_config(channel, data):
+    """Return validated access settings, or an API error response tuple."""
+    config = dict(channel.get('config') or {})
+    mode = data.get('access_mode', config.get('access_mode', 'assigned_only'))
+    default_agent_id = data.get(
+        'default_agent_id', config.get('default_agent_id') or '')
+    if mode not in _SHARED_ACCESS_MODES:
+        return None, (jsonify({
+            'error': 'access_mode must be assigned_only or unrestricted'}), 400)
+    if mode == 'unrestricted':
+        agent = db.get_agent(default_agent_id)
+        if not agent or not agent.get('enabled'):
+            return None, (jsonify({
+                'error': 'default_agent_id must identify an enabled agent'}), 400)
+    return {'access_mode': mode, 'default_agent_id': default_agent_id}, None
+
+def _shared_channel_or_404(channel_id):
+    channel = db.get_channel(channel_id)
+    if not channel or channel.get('agent_id') is not None:
+        return None
+    return channel
+
+
+@settings_bp.route('/api/shared-channels/settings', methods=['GET'])
+def api_get_shared_channel_settings():
+    """Return global settings that apply to every shared channel."""
+    return jsonify({
+        'unassigned_sender_retention_hours': _shared_inbox_retention_hours(),
+    })
+
+
+@settings_bp.route('/api/shared-channels/settings', methods=['PUT'])
+def api_update_shared_channel_settings():
+    """Persist validated global unassigned-sender retention."""
+    data = request.get_json() or {}
+    if 'unassigned_sender_retention_hours' not in data:
+        return jsonify({'error': 'unassigned_sender_retention_hours is required'}), 400
+    try:
+        hours = int(data['unassigned_sender_retention_hours'])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'unassigned_sender_retention_hours must be an integer'}), 400
+    if not _SHARED_INBOX_RETENTION_MIN_HOURS <= hours <= _SHARED_INBOX_RETENTION_MAX_HOURS:
+        return jsonify({'error': 'unassigned_sender_retention_hours must be between 1 and 8760'}), 400
+    old_value = db.get_setting(
+        _SHARED_INBOX_RETENTION_KEY, str(_SHARED_INBOX_RETENTION_DEFAULT_HOURS))
+    db.set_setting(_SHARED_INBOX_RETENTION_KEY, str(hours))
+    _audit_setting_change(_SHARED_INBOX_RETENTION_KEY, old_value, hours)
+    db.cleanup_expired_inbox_entries(hours)
+    return jsonify({'success': True, 'unassigned_sender_retention_hours': hours})
+
+
+@settings_bp.route('/api/shared-channels', methods=['GET'])
+def api_list_shared_channels():
+    from backend.channels.registry import channel_manager
+    db.cleanup_expired_inbox_entries(_shared_inbox_retention_hours())
+    channels = db.get_shared_channels()
+    for ch in channels:
+        ch['running'] = channel_manager.is_running(ch['id'])
+        ch['bridge_status'] = None
+        ch['inbox_count'] = len(db.get_inbox(ch['id']))
+        if ch['running']:
+            instance = channel_manager.get_channel_instance(ch['id'])
+            if instance:
+                try:
+                    ch['bridge_status'] = instance.get_bridge_status().get('status')
+                except Exception:
+                    pass
+    return jsonify({'channels': channels})
+
+
+@settings_bp.route('/api/shared-channels', methods=['POST'])
+def api_create_shared_channel():
+    from backend.channels.registry import channel_manager
+    data = request.get_json() or {}
+    name = (data.get('name') or 'Shared WhatsApp').strip()
+    # UNIQUE(agent_id, name) treats NULLs as distinct — enforce app-side
+    if any(c.get('name') == name for c in db.get_shared_channels()):
+        return jsonify({'error': f"Shared channel '{name}' already exists"}), 409
+    chan_id = db.create_channel({
+        'agent_id': None,
+        'type': 'whatsapp_shared',
+        'name': name,
+        'config': {'mode': 'open', 'access_mode': 'assigned_only',
+                   'default_agent_id': '', 'routes': {}},
+    })
+    try:
+        channel_manager.start_channel(chan_id)
+    except Exception as e:
+        _logger.error("Auto-start failed for shared channel %s: %s", chan_id, e)
+    channel = db.get_channel(chan_id)
+    channel['running'] = channel_manager.is_running(chan_id)
+    audit.log_setting_change(user_id='admin', key='shared_channel.create',
+                             old_value='', new_value=name, ip=request.remote_addr or '')
+    return jsonify({'success': True, 'channel': channel})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>', methods=['PUT'])
+def api_update_shared_channel(channel_id):
+    from backend.channels.registry import channel_manager
+    channel = _shared_channel_or_404(channel_id)
+    if not channel:
+        return jsonify({'error': 'Shared channel not found'}), 404
+    data = request.get_json() or {}
+    access, error = _validate_shared_access_config(channel, data)
+    if error:
+        return error
+    updates = {k: v for k, v in data.items() if k in ('name', 'enabled')}
+    if 'access_mode' in data or 'default_agent_id' in data:
+        config = dict(channel.get('config') or {})
+        config.update(access)
+        updates['config'] = config
+    if updates:
+        db.update_channel(channel_id, updates)
+    if 'enabled' in data:
+        try:
+            if data['enabled']:
+                channel_manager.start_channel(channel_id)
+            else:
+                channel_manager.stop_channel(channel_id)
+        except Exception as e:
+            _logger.error("Toggle failed for shared channel %s: %s", channel_id, e)
+    return jsonify({'success': True, 'running': channel_manager.is_running(channel_id)})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>', methods=['DELETE'])
+def api_delete_shared_channel(channel_id):
+    from backend.channels.registry import channel_manager
+    channel = _shared_channel_or_404(channel_id)
+    if not channel:
+        return jsonify({'error': 'Shared channel not found'}), 404
+    try:
+        channel_manager.stop_channel(channel_id)
+    except Exception:
+        pass
+    db.delete_channel(channel_id)
+    audit.log_setting_change(user_id='admin', key='shared_channel.delete',
+                             old_value=channel.get('name') or channel_id, new_value='',
+                             ip=request.remote_addr or '')
+    return jsonify({'success': True})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>/qr', methods=['GET'])
+def api_shared_channel_qr(channel_id):
+    from backend.channels.registry import channel_manager
+    from backend.channels.whatsapp import WhatsAppChannel
+    instance = channel_manager.get_channel_instance(channel_id)
+    if not isinstance(instance, WhatsAppChannel):
+        return jsonify({'error': 'Shared channel not running'}), 404
+    return jsonify(instance.get_qr())
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>/bridge-status', methods=['GET'])
+def api_shared_channel_bridge_status(channel_id):
+    from backend.channels.registry import channel_manager
+    from backend.channels.whatsapp import WhatsAppChannel
+    instance = channel_manager.get_channel_instance(channel_id)
+    if not isinstance(instance, WhatsAppChannel):
+        return jsonify({'status': 'not_running'})
+    return jsonify(instance.get_bridge_status())
+
+
+def _add_shared_route(channel, user_id, agent_id, display_name='', alt_user_id=''):
+    """Write route entries (and optional annotation) into the channel config.
+    Routes both identifier namespaces when the alternate is known."""
+    config = channel.get('config') or {}
+    routes = config.get('routes') or {}
+    routes[user_id] = agent_id
+    if alt_user_id:
+        routes[alt_user_id] = agent_id
+    config['routes'] = routes
+    if display_name:
+        names = config.get('user_names') or {}
+        names[user_id] = display_name
+        if alt_user_id:
+            names[alt_user_id] = display_name
+        config['user_names'] = names
+    db.update_channel(channel['id'], {'config': config})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>/routes', methods=['POST'])
+def api_add_shared_route(channel_id):
+    channel = _shared_channel_or_404(channel_id)
+    if not channel:
+        return jsonify({'error': 'Shared channel not found'}), 404
+    data = request.get_json() or {}
+    user_id = re.sub(r'[+\s-]', '', str(data.get('user_id') or ''))
+    agent_id = data.get('agent_id') or ''
+    if not user_id or not user_id.isdigit():
+        return jsonify({'error': 'user_id must be digits (phone number or group ID)'}), 400
+    if not db.get_agent(agent_id):
+        return jsonify({'error': 'Agent not found'}), 404
+    _add_shared_route(channel, user_id, agent_id, data.get('name') or '')
+    return jsonify({'success': True})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>/routes/<user_id>', methods=['DELETE'])
+def api_delete_shared_route(channel_id, user_id):
+    channel = _shared_channel_or_404(channel_id)
+    if not channel:
+        return jsonify({'error': 'Shared channel not found'}), 404
+    config = channel.get('config') or {}
+    routes = config.get('routes') or {}
+    if user_id not in routes:
+        return jsonify({'error': 'Route not found'}), 404
+    del routes[user_id]
+    config['routes'] = routes
+
+    # Names annotate active routes only. Remove the selected name plus any
+    # historical/orphaned metadata so stale contacts cannot reappear later.
+    names = config.get('user_names')
+    if isinstance(names, dict):
+        config['user_names'] = {
+            route_id: display_name
+            for route_id, display_name in names.items()
+            if route_id in routes
+        }
+
+    db.update_channel(channel_id, {'config': config})
+    return jsonify({'success': True})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>/inbox', methods=['GET'])
+def api_shared_channel_inbox(channel_id):
+    if not _shared_channel_or_404(channel_id):
+        return jsonify({'error': 'Shared channel not found'}), 404
+    db.cleanup_expired_inbox_entries(_shared_inbox_retention_hours())
+    return jsonify({'inbox': db.get_inbox(channel_id)})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>/inbox/<entry_id>/assign', methods=['POST'])
+def api_assign_inbox_entry(channel_id, entry_id):
+    channel = _shared_channel_or_404(channel_id)
+    if not channel:
+        return jsonify({'error': 'Shared channel not found'}), 404
+    entry = db.get_inbox_entry(entry_id)
+    if not entry or entry.get('channel_id') != channel_id:
+        return jsonify({'error': 'Inbox entry not found'}), 404
+    data = request.get_json() or {}
+    agent_id = data.get('agent_id') or ''
+    if not db.get_agent(agent_id):
+        return jsonify({'error': 'Agent not found'}), 404
+    display_name = data.get('name') or entry.get('push_name') or ''
+    _add_shared_route(channel, entry['external_user_id'], agent_id,
+                      display_name, entry.get('alt_user_id') or '')
+    db.delete_inbox_entry(entry_id)
+    return jsonify({'success': True})
+
+
+@settings_bp.route('/api/shared-channels/<channel_id>/inbox/<entry_id>', methods=['DELETE'])
+def api_dismiss_inbox_entry(channel_id, entry_id):
+    if not _shared_channel_or_404(channel_id):
+        return jsonify({'error': 'Shared channel not found'}), 404
+    if not db.delete_inbox_entry(entry_id):
+        return jsonify({'error': 'Inbox entry not found'}), 404
+    return jsonify({'success': True})
+
+
+# ---------------------------------------------------------------------------
+# Debug Listener — SSE endpoint for real-time WhatsApp inbound monitoring
+# ---------------------------------------------------------------------------
+
+@settings_bp.route('/api/shared-channels/debug/listen', methods=['GET'])
+def api_shared_channel_debug_listen():
+    """SSE endpoint: push all whatsapp_inbound events to the client in real-time."""
+    from backend.event_stream import event_stream
+
+    q = queue.Queue(maxsize=500)
+
+    def handler(data):
+        try:
+            q.put_nowait(('whatsapp_inbound', data, None))
+        except queue.Full:
+            pass  # drop oldest; queue bounded at 500
+
+    event_stream.on('whatsapp_inbound', handler)
+
+    def generate():
+        # Send initial connected event so the client knows it's live
+        yield (
+            f"event: connected\n"
+            f"data: {json.dumps({'type': 'connected', 'message': 'Listening for WhatsApp inbound messages...'})}\n\n"
+        )
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=30)
+                except queue.Empty:
+                    yield ": heartbeat\n\n"
+                    continue
+                sse_event, payload, _seq = item
+                yield f"event: {sse_event}\ndata: {json.dumps(payload)}\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            event_stream.off('whatsapp_inbound', handler)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )
